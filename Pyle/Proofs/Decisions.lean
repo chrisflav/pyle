@@ -212,7 +212,7 @@ theorem challengeDecision_none (value : ByteArray) (purpose : ChallengePurpose) 
 
 /-- A challenge issued to a user admits only that user's credentials. -/
 theorem Challenge.admits_user {ch : Challenge} {u v : UserId} (hu : ch.user = some u)
-    (h : ch.admits v = true) : (u == v) = true := by
+    (h : ch.admits v = true) : u = v := by
   simpa [Challenge.admits, hu] using h
 
 end Proofs

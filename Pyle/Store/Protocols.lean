@@ -259,12 +259,11 @@ def deviceDecision (row : Option DeviceRow) (clientId : String) (now : Nat) :
       | "pending", _, _ => if r.lastPoll + r.interval > now then .slowDown else .pending
       | _, _, _ => .expired
 
-/-- Poll with a device code on behalf of `clientId` (RFC 8628 §3.5), as
-`Store.pollDeviceCode` does, with two differences: only a code issued to
-`clientId` is touched, so a poll by another client changes and destroys
-nothing; and polling too fast grows the code's interval by five seconds, as
-§3.5 asks of `slow_down`.  `none` when the code exists but belongs to another
-client.
+/-- Poll with a device code on behalf of `clientId` (RFC 8628 §3.5).  Only a
+code issued to `clientId` is touched, so a poll by another client changes and
+destroys nothing; polling too fast grows the code's interval by five seconds,
+as §3.5 asks of `slow_down`.  `none` when the code exists but belongs to
+another client.
 
 One `BEGIN IMMEDIATE` transaction reads the row, lets `deviceDecision`
 decide, and carries the decision out: a collected authorization is deleted in

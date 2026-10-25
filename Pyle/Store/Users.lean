@@ -21,7 +21,7 @@ namespace Store
 structure UserId where
   /-- The integer key. -/
   val : Int
-  deriving BEq, Repr, Inhabited, Hashable
+  deriving DecidableEq, Repr, Inhabited, Hashable
 
 instance : ToString UserId := ⟨fun u => toString u.val⟩
 instance : Coe UserId Value := ⟨fun u => .int u.val⟩

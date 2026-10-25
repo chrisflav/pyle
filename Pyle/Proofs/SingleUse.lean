@@ -24,9 +24,12 @@ What the server does with a row it is handed is not modelled: that is decided
 by the functions of `Pyle.Proofs.Decisions`, which are the code path.
 
 Both machines assume what no proof can give: that values handed out are never
-handed out again.  Each is 32 random bytes, stored as its SHA-256; the models
-refuse to add a key that has ever been added, which is the assumption that
-the random source does not repeat itself and SHA-256 has no collisions.
+handed out again.  Each is 32 bytes from the system's random source.  A
+challenge is stored as it is; a code, refresh token, device code, invitation
+or forward-authentication code is stored as its SHA-256.  The models refuse to
+add a key that has ever been added, which is the assumption that 32 random
+bytes do not repeat — and, for the hashed values, that SHA-256 has no
+collisions among them.
 -/
 
 namespace Pyle
@@ -41,18 +44,22 @@ as a ghost, not a column — every key ever added.
 or one `BEGIN IMMEDIATE` transaction under the store's lock (`Store.run`,
 `Store.atomically`), and so happens atomically, in some order:
 
-* `add` is the `INSERT` of `Store.addChallenge`, `Store.addCode`,
-  `Store.addForwardAuthCode`, `Store.addInvitation` or
-  `Store.addDeviceCode`; a key added once is never added again (see the
-  module documentation);
+* `add` is the `INSERT` of `Store.addChallengeCapped` (`challenges`),
+  `Store.addCode` (`codes`), `Store.addForwardAuthCode`
+  (`forward_auth_codes`), `Store.addInvitation` (`invitations`) or
+  `Store.addDeviceCode` (`device_codes`); a key added once is never added
+  again (see the module documentation);
 * `take k (fun _ => true)` is the `DELETE … WHERE … = ? RETURNING …` of
-  `Store.consumeChallenge` (`challenges`), `Store.consumeCode` (`codes`),
-  `Store.consumeForwardAuthCode` (`forward_auth_codes`) and
-  `Store.consumeInvitation` (`invitations`), which deletes the row and hands
-  it back whatever is then decided about it;
+  `Store.consumeChallenge` (`challenges`), `Store.consumeCode` (`codes`) and
+  `Store.consumeForwardAuthCode` (`forward_auth_codes`), which deletes the
+  row and hands it back whatever is then decided about it;
 * `take k p` with `p` the rows `Store.deviceDecision` collects is
   `Store.pollDeviceCodeFor`: one `BEGIN IMMEDIATE` transaction that reads the
   `device_codes` row and deletes it if it is collected;
+* `take k p` with `p` "live, its name and handle free and the credential id
+  unused" is `Store.redeemInvitation`: one `BEGIN IMMEDIATE` transaction
+  that reads the `invitations` row, checks it, and deletes it only if every
+  check passes (the account it then creates is not modelled);
 * `update` is a statement that changes a row in place without deleting it:
   approving or denying a device code, or recording a poll;
 * `purge` is a `DELETE … WHERE expires <= ?`, which removes rows and returns
@@ -279,9 +286,11 @@ that raises is rolled back whole:
   `Store.refreshDecision` — the function itself — and carries the decision
   out;
 * `revoke` is the family revocation shared by `Store.rotateRefreshToken`,
-  `Store.revokeRefreshFamily`, `Store.revokeClientFamilies` and the trigger
-  `sessions_end_families` of migration 4: delete the family's tokens and
-  record it in `revoked_families` with `INSERT OR IGNORE`;
+  `Store.revokeRefreshFamily`, `Store.revokeUserClientFamilies`,
+  `Store.addRefreshFamily` (for a family whose session has already ended)
+  and the trigger `sessions_end_families` of migration 4: delete the
+  family's tokens and record it in `revoked_families` with
+  `INSERT OR IGNORE`;
 * `purge` deletes tokens; nothing ever deletes from `revoked_families`.
 
 Every insert into `refresh_tokens` is refused by the trigger

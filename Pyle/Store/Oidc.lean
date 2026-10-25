@@ -15,9 +15,10 @@ invitation — is stored as its SHA-256 and consumed atomically:
   and stores its successor, or revokes its whole family when the token
   presented was already used (§5.1), as `refreshDecision` decides; a revoked
   family is recorded, and the schema refuses any token added to one;
-* a device code by one `DELETE … RETURNING` that only matches once it has been
-  approved;
-* an invitation by one `DELETE … RETURNING`.
+* a device code by `Store.pollDeviceCodeFor`, one transaction that reads it
+  and deletes it once it has been decided, as `deviceDecision` decides;
+* an invitation by `Store.redeemInvitation`, one transaction that reads it,
+  checks it, and deletes it as it creates the account.
 
 The binding checks (client, redirect URI, PKCE) belong to the OIDC modules;
 the store returns the bound fields so that they can be checked, and makes sure
@@ -343,34 +344,6 @@ inductive DevicePoll where
   | denied
   /-- No such code, or it has expired. -/
   | expired
-
-/-- Poll with a device code.  An approved or denied authorization is deleted by
-the poll that sees it, in one `DELETE … RETURNING`, so a device code yields
-tokens at most once. -/
-def Store.pollDeviceCode (s : Store) (deviceCodeHash : SecretHash) (now : Nat) :
-    IO DevicePoll := s.atomically fun c => do
-  let decided ← queryOne c
-    "DELETE FROM device_codes \
-      WHERE device_code_hash = ? AND status IN ('approved', 'denied') AND expires > ? \
-      RETURNING status, client_id, scope, user_id, amr, auth_time"
-    #[deviceCodeHash, now] fun st =>
-      return (← colText st 0, ← colText st 1, ← colText st 2, ← colOpt colInt st 3,
-        ← colList st 4, ← colOpt colNat st 5)
-  match decided with
-  | some ("approved", clientId, scope, some user, amr, some authTime) =>
-    return .approved clientId scope ⟨user⟩ amr authTime
-  | some _ => return .denied
-  | none =>
-    let pending ← queryOne c
-      "SELECT interval, last_poll FROM device_codes \
-        WHERE device_code_hash = ? AND status = 'pending' AND expires > ?"
-      #[deviceCodeHash, now] fun st => return (← colNat st 0, ← colNat st 1)
-    match pending with
-    | none => return .expired
-    | some (interval, lastPoll) =>
-      discard <| exec c "UPDATE device_codes SET last_poll = ? WHERE device_code_hash = ?"
-        #[now, deviceCodeHash]
-      if lastPoll + interval > now then return .slowDown else return .pending
 
 /-- Remove expired device authorizations; how many. -/
 def Store.purgeDeviceCodes (s : Store) (now : Nat) : IO Nat := s.run fun c =>

@@ -369,6 +369,14 @@ def checkTotp (ctx : Ctx) (user : UserId) (code : String) : IO (Except TotpRefus
     return .error (.wrong (← ctx.store.recordTotpFailure user now))
   | none => return .error (.wrong (← ctx.store.recordTotpFailure user now))
 
+/-- Whether a recovery code is one of the user's unspent ones, without
+spending it: for checking it before a factor whose failures count (TOTP), so
+that a guess at the code cannot be used to lock TOTP. -/
+def recoveryCodeValid (ctx : Ctx) (user : UserId) (code : String) : IO Bool := do
+  if !Factor.RecoveryCode.wellFormed code then return false
+  ctx.store.hasRecoveryCode user
+    (Factor.RecoveryCode.digest (SignIn.Secrets.recoveryKey ctx.rootKey) code)
+
 /-- Check a recovery code for a user, spending it (§3).  A code is good once. -/
 def checkRecovery (ctx : Ctx) (user : UserId) (code : String) : IO (Option Factor) := do
   if !Factor.RecoveryCode.wellFormed code then return none

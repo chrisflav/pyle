@@ -15,7 +15,7 @@ weakness in one use says nothing about another:
 | `pyle totp v1` | sealing TOTP secrets, with the user id as associated data |
 | `pyle recovery-code v1` | the HMAC under which recovery codes are stored |
 | `pyle invitation-handle v1` | the WebAuthn user handle of an invited account |
-| `pyle decoy-credential v1` | the credential ids offered for unknown names |
+| `pyle decoy-credential v1` | the padding credential ids of a named sign-in |
 
 The associated data of a sealed TOTP secret is the user's row id in decimal,
 so a sealed secret copied into another user's row no longer opens.  A secret
@@ -92,11 +92,22 @@ the challenge means nothing has to be remembered between the two requests. -/
 def invitationHandle (rootKey challenge : ByteArray) : ByteArray :=
   LeanBiscuit.Hmac.sha256 (invitationHandleKey rootKey) challenge
 
-/-- The credential id offered for a name that has no credentials: the same
-for the same name every time, so that asking twice does not tell an unknown
-name from a known one by a change in the answer. -/
-def decoyCredentialId (rootKey : ByteArray) (name : String) : ByteArray :=
-  (LeanBiscuit.Hmac.sha256 (decoyKey rootKey) name.toUTF8).extract 0 16
+/-- The lengths a padding credential id may have.  Authenticators choose
+their own ids, and these are the lengths common ones use (16 bytes for many
+security keys, 32 and 64 for platform passkeys), so a padding id does not
+stand out by its length. -/
+def paddingIdLengths : List Nat := [16, 32, 48, 64]
+
+/-- The `i`-th padding credential id for a name: an HMAC of the name and `i`,
+of a length chosen by the HMAC too.  The same for the same name and `i` every
+time, so asking twice does not tell a padded answer from a real one by a
+change in it. -/
+def paddingCredentialId (rootKey : ByteArray) (name : String) (i : Nat) : ByteArray :=
+  let k := decoyKey rootKey
+  let block (j : Nat) := LeanBiscuit.Hmac.sha256 k (s!"{i}:{j}:".toUTF8 ++ name.toUTF8)
+  let first := block 0
+  let len := paddingIdLengths.getD ((first.get! 0).toNat % paddingIdLengths.length) 16
+  ((List.range 3).foldl (fun acc j => acc ++ block (j + 1)) first).extract 0 len
 
 end Secrets
 end SignIn

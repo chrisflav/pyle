@@ -86,7 +86,9 @@ def beginInvitation : Handler := fun ctx r =>
   limited ctx r .invitationUsed none fun lim attempt => do
     let some (_, inv) ← invitationOf ctx r | return noInvitation
     lim.succeed attempt
-    let ch ← newChallenge ctx .register none
+    let ch ← match ← newChallenge ctx r .register none with
+      | .ok ch => pure ch
+      | .error rep => return rep
     let handle := Secrets.invitationHandle ctx.rootKey ch
     return .json (creationOptions ctx ch handle inv.userName [] "required" "required")
 

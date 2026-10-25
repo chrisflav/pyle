@@ -37,6 +37,43 @@ def Store.findPassword (s : Store) (user : UserId) : IO (Option String) := s.run
 def Store.removePassword (s : Store) (user : UserId) : IO Bool := s.run fun c => do
   return (← exec c "DELETE FROM passwords WHERE user_id = ?" #[user]) > 0
 
+/-! ## Capped challenges -/
+
+/-- Whether a challenge was recorded. -/
+inductive ChallengeAdmission where
+  /-- It was. -/
+  | added
+  /-- The client already has as many challenges pending as it may. -/
+  | clientFull
+  /-- The table already has as many challenges pending as it may. -/
+  | full
+  deriving BEq, Repr
+
+/-- Record a challenge asked for by `client` (an address, or its /64), unless
+that client already has `perClient` challenges pending at `now`, or there are
+`total` pending overall.  The counts and the insert are one transaction. -/
+def Store.addChallengeCapped (s : Store) (ch : Challenge) (client : String)
+    (perClient total now : Nat) : IO ChallengeAdmission := s.atomically fun c => do
+  let all ← queryOne c "SELECT COUNT(*) FROM challenges WHERE expires > ?" #[now] (colNat · 0)
+  if all.getD 0 ≥ total then return .full
+  let mine ← queryOne c
+    "SELECT COUNT(*) FROM challenges WHERE client_address = ? AND expires > ?" #[client, now]
+    (colNat · 0)
+  if mine.getD 0 ≥ perClient then return .clientFull
+  discard <| exec c
+    "INSERT INTO challenges (challenge, purpose, user_id, expires, client_address) \
+      VALUES (?, ?, ?, ?, ?)"
+    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, client]
+  return .added
+
+/-- Whether an unspent recovery code with this digest exists, without
+spending it. -/
+def Store.hasRecoveryCode (s : Store) (user : UserId) (digest : ByteArray) : IO Bool :=
+  s.run fun c => do
+    return (← queryOne c
+      "SELECT 1 FROM recovery_codes WHERE user_id = ? AND digest = ? AND spent_at IS NULL"
+      #[user, digest] (colInt · 0)).isSome
+
 /-! ## Invitations -/
 
 /-- Read an invitation row: `user_name, groups, created_by, created, expires`. -/

@@ -74,7 +74,9 @@ def idOf (j : Json) : Except Reply ByteArray :=
 def registerBegin : Handler := fun ctx r => withStepUp ctx r fun s _ => do
   let u ← userOf ctx s
   let creds ← ctx.store.listCredentials u.id
-  let ch ← newChallenge ctx .register (some u.id)
+  let ch ← match ← newChallenge ctx r .register (some u.id) with
+    | .ok ch => pure ch
+    | .error rep => return rep
   return .json (creationOptions ctx ch u.handle u.name
     (creds.toList.map fun c => descriptor c.id c.transports) "preferred" "preferred")
 

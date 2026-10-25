@@ -55,22 +55,29 @@ documentation). -/
 def safeReturn (s : String) : Option String :=
   if s.length ≤ maxReturnLength && returnPath s.toList then some s else none
 
-/-- What `returnPath` accepts: `/`, then neither `/` nor `\`. -/
+/-- What `returnPath` accepts: `/`, then neither `/` nor `\`, and nothing but
+`returnChar`s. -/
 theorem returnPath_spec {cs : List Char} (h : returnPath cs = true) :
-    ∃ rest, cs = '/' :: rest ∧ rest.head? ≠ some '/' ∧ rest.head? ≠ some '\\' := by
+    ∃ rest, cs = '/' :: rest ∧ rest.head? ≠ some '/' ∧ rest.head? ≠ some '\\' ∧
+      ∀ c ∈ rest, returnChar c = true := by
   unfold returnPath at h
   split at h
-  · exact ⟨[], rfl, by simp, by simp⟩
+  · exact ⟨[], rfl, by simp, by simp, by simp⟩
   · rename_i c rest
     simp only [Bool.and_eq_true, bne_iff_ne, ne_eq] at h
-    exact ⟨c :: rest, rfl, by simpa using h.1.1.1, by simpa using h.1.1.2⟩
+    refine ⟨c :: rest, rfl, by simpa using h.1.1.1, by simpa using h.1.1.2, ?_⟩
+    intro x hx
+    rcases List.mem_cons.mp hx with rfl | hx
+    · exact h.1.2
+    · exact List.all_eq_true.mp h.2 x hx
   · cases h
 
 /-- What `safeReturn` accepts: the address as given, starting with `/` and
-not with `//` or `/\`. -/
+not with `//` or `/\`, with no space, backslash or control character
+anywhere. -/
 theorem safeReturn_spec {s t : String} (h : safeReturn s = some t) :
     t = s ∧ ∃ rest, s.toList = '/' :: rest ∧ rest.head? ≠ some '/' ∧
-      rest.head? ≠ some '\\' := by
+      rest.head? ≠ some '\\' ∧ ∀ c ∈ rest, returnChar c = true := by
   unfold safeReturn at h
   split at h
   · rename_i hc
@@ -118,12 +125,34 @@ def b64 (b : ByteArray) : String := Encoding.Base64Url.encode b
 /-- How long a ceremony may take, in seconds; the challenge expires then. -/
 def challengeSeconds : Nat := 300
 
-/-- Issue a challenge for a ceremony. -/
-def newChallenge (ctx : Ctx) (purpose : ChallengePurpose) (user : Option UserId) :
-    IO ByteArray := do
+/-- `429` with `Retry-After`. -/
+def rateLimited (wait : Nat) : Reply :=
+  (Reply.error .tooManyRequests "rate_limited" s!"try again in {wait} seconds").withHeader
+    "Retry-After" (toString wait)
+
+/-- How many challenges one client address (an IPv6 client's /64) may have
+pending: each lives `challengeSeconds`, so this bounds how fast one address
+can begin ceremonies it does not finish. -/
+def maxPendingPerClient : Nat := 20
+
+/-- How many challenges may be pending overall. -/
+def maxPendingChallenges : Nat := 10000
+
+/-- Issue a challenge for a ceremony asked for by the request `r`, or the
+reply refusing it: `429` when the client has `maxPendingPerClient` pending,
+`503` when the table is at `maxPendingChallenges`.  A challenge that is
+finished is deleted, so only begins without finishes count. -/
+def newChallenge (ctx : Ctx) (r : Req) (purpose : ChallengePurpose) (user : Option UserId)
+    (perClient : Nat := maxPendingPerClient) (total : Nat := maxPendingChallenges) :
+    IO (Except Reply ByteArray) := do
   let value ← Crypto.randomBytes 32
-  ctx.store.addChallenge { value, purpose, user, expires := (← ctx.clock) + challengeSeconds }
-  return value
+  let now ← ctx.clock
+  match ← ctx.store.addChallengeCapped { value, purpose, user, expires := now + challengeSeconds }
+      (addressPrefix r.clientAddress) perClient total now with
+  | .added => return .ok value
+  | .clientFull => return .error (rateLimited challengeSeconds)
+  | .full =>
+    return .error (Reply.error .serviceUnavailable "unavailable" "too many sign-ins are pending")
 
 /-- A `PublicKeyCredentialDescriptor` for a credential. -/
 def descriptor (id : ByteArray) (transports : List String) : Json :=
@@ -163,11 +192,6 @@ def badRequest (description : String) : Reply :=
 /-- `401`, for a factor that did not check out.  It says no more than that. -/
 def authenticationFailed : Reply :=
   Reply.error .unauthorized "authentication_failed" "the sign-in did not succeed"
-
-/-- `429` with `Retry-After`. -/
-def rateLimited (wait : Nat) : Reply :=
-  (Reply.error .tooManyRequests "rate_limited" s!"try again in {wait} seconds").withHeader
-    "Retry-After" (toString wait)
 
 /-- `401`, for an endpoint that needs a session. -/
 def signInRequired : Reply :=

@@ -50,7 +50,8 @@ two factors), `attestationRoots` (DER or PEM files of trust anchors for
 `packed` attestation; none) and `aaguidAllowList` (the authenticator models
 that may be registered, as AAGUIDs; any by default — when set, it needs
 `attestationRoots`, and only authenticators with a verified attestation chain
-and a listed AAGUID can be registered).  Relative paths are relative to the
+and a listed AAGUID can be registered — which rules out synced platform
+passkeys, since those do not send attestation).  Relative paths are relative to the
 configuration file.  Unknown keys are an error.
 
 ```sh
@@ -121,7 +122,8 @@ Errors are `{"error", "error_description"}`: `401 authentication_failed` (which
 factor was wrong is not said), `401 second_factor_required`, `401
 sign_in_required`, `403 step_up_required`, `429 rate_limited` with
 `Retry-After`.  Every endpoint that checks a factor is rate limited per client
-address (and per account where one is named), and every attempt is in the
-audit log.
+address and per account, and every attempt is in the audit log.  A client
+address (an IPv6 client's /64) may have at most twenty WebAuthn ceremonies
+begun and not finished at once (`429`), and the server ten thousand (`503`).
 
 OpenID Connect follows (DESIGN.md §11).

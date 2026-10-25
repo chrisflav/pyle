@@ -222,7 +222,9 @@ def sessionFor (ctx : Ctx) (user : Store.User) : IO (String × SoftKey) := do
 /-- A `StrongAuthentication` for a soft key, through `Policy.checkAssertion`
 and a challenge issued the way the endpoints issue one. -/
 def strongFor (ctx : Ctx) (k : SoftKey) : IO Policy.StrongAuthentication := do
-  let ch ← SignIn.newChallenge ctx .authenticate none
+  let ch ← match ← SignIn.newChallenge ctx (Req.mk' .post "/") .authenticate none with
+    | .ok ch => pure ch
+    | .error _ => throw (.userError "strongFor: no challenge")
   let cred ← k.assert (SignIn.requestOptions ctx ch [] "required")
   let resp ← IO.ofExcept (SignIn.parseAssertion cred)
   match ← Policy.checkAssertion ctx .authenticate resp with
@@ -257,6 +259,12 @@ def returnTests : IO Unit := do
       "evil.example", "/a b", "/a\nb", "javascript:alert(1)", "/\\/evil", "\\\\evil",
       "/a\\b", "/" ++ String.ofList (List.replicate 2048 'a')] do
     checkEq s!"refused: {bad.quote}" (SignIn.safeReturn bad) none
+  for c in ['"', '<', '~', '%', '?', '#'] do
+    let t := "/a" ++ c.toString
+    check s!"printable {c} is allowed after the slash" (SignIn.safeReturn t == some t)
+  for c in [' ', '\t', '\\', '\x7f', 'é'] do
+    let t := "/a" ++ c.toString
+    check s!"but not {c.toNat}" (SignIn.safeReturn t).isNone
 
 /-- Passkeys: the discoverable flow. -/
 def passkeyTests : IO Unit := withCtx fun ctx clock => do
@@ -378,7 +386,7 @@ def secondFactorTests : IO Unit := withCtx fun ctx clock => do
     "discouraged"
   let allowIds := ((opts.getObjValAs? (Array Json) "allowCredentials").toOption.getD #[]).toList
     |>.map (jstr · "id")
-  checkEq "and lists the account's credentials" allowIds [b64u k.id]
+  checkEq "and lists the account's credentials first" (allowIds.take 1) [b64u k.id]
   let alone ← postJson ctx "/signin/webauthn/finish"
     (Json.mkObj [("credential", ← k.assert opts (withHandle := false))])
   checkEq "a security key without user verification alone gets no session"
@@ -403,14 +411,29 @@ def secondFactorTests : IO Unit := withCtx fun ctx clock => do
     (Json.mkObj [("credential", ← k.assert (replyJson b3) (withHandle := false)),
       ("totp", totpAt secret now)])
   checkEq "a TOTP code is good once" reused.status.toCode 401
-  -- Unknown names get a decoy, the same every time.
+  -- A known and an unknown name get answers of the same shape.
   let d1 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "nobody")])
   let d2 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "nobody")])
-  let ids (r : Reply) := ((replyJson r).getObjValAs? (Array Json) "allowCredentials").toOption
-    |>.map fun a => a.toList.map (jstr · "id")
-  check "an unknown name gets one credential id" ((ids d1).map (·.length) == some 1)
-  checkEq "the same one each time" (ids d1) (ids d2)
+  let known ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
+  let descs (r : Reply) : List Json :=
+    ((replyJson r).getObjValAs? (Array Json) "allowCredentials").toOption.getD #[] |>.toList
+  let keys (d : Json) : List String := match d with
+    | .obj kvs => kvs.toArray.toList.map (·.1)
+    | _ => []
+  let lengths (r : Reply) : List Nat :=
+    (descs r).map fun d => ((Base64Url.decode (jstr d "id")).map (·.size)).getD 0
+  checkEq "an unknown name gets as many descriptors as a known one"
+    ((descs d1).length, (descs known).length) (SignIn.namedAllowCount, SignIn.namedAllowCount)
+  checkEq "with the same keys and no transports"
+    (((descs d1) ++ (descs known)).map keys).eraseDups [["id", "type"]]
+  check "and ids of lengths drawn from the same set"
+    ((lengths d1 ++ lengths known).all (SignIn.Secrets.paddingIdLengths.contains ·))
+  checkEq "the same answer each time" ((descs d1).map (jstr · "id"))
+    ((descs d2).map (jstr · "id"))
   checkEq "answering 200 like a known name" d1.status.toCode 200
+  let many := (List.range 40).map fun i =>
+    (SignIn.Secrets.paddingCredentialId ctx.rootKey s!"name{i}" (i % 8)).size
+  check "padding ids come in more than one length" (many.eraseDups.length > 1)
 
 /-- Codes without a security key. -/
 def codeTests : IO Unit :=
@@ -620,6 +643,109 @@ def establishTests : IO Unit := withCtx fun ctx _ => do
   checkEq "a step-up with another user's authentication is refused"
     ((← Policy.stepUp ctx ks sa).isNone) true
 
+/-- Second factors that come with an assertion count against the account. -/
+def assertionAccountLimitTests : IO Unit :=
+    withSignInCtx (fun c => { c with allowPasswords := true }) fun ctx _ => do
+  group "signin: second factors with an assertion are limited per account"
+  let mo ← ctx.store.addUser "mo" [] 1
+  let k ← SoftKey.new (uv := false)
+  enrol ctx mo k
+  ctx.store.setPassword mo.id (← Factor.Password.hash "correct horse battery") 1
+  let mut statuses := #[]
+  for i in [0:12] do
+    let client := s!"203.0.113.{100 + i}"
+    let b ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "mo")]) (client := client)
+    let r ← postJson ctx "/signin/webauthn/finish"
+      (Json.mkObj [("credential", ← k.assert (replyJson b) (withHandle := false)),
+        ("password", "wrong password")]) (client := client)
+    statuses := statuses.push r.status.toCode
+  check "twelve wrong passwords from twelve addresses meet 429s"
+    (statuses.contains 429 && statuses.back? == some 429) s!"{statuses}"
+  check "after at most four tries" ((statuses.toList.take 4).all (· == 401))
+  check "and the refusals are audited" ((← auditSummary ctx).contains ("sign-in", "refused"))
+
+/-- Guessing a recovery code does not lock someone's TOTP. -/
+def totpLockTests : IO Unit := withCtx fun ctx clock => do
+  group "signin: TOTP is tried only after the other factor"
+  let nia ← ctx.store.addUser "nia" [] 1
+  let secret ← giveTotp ctx nia
+  let ctx := { ctx with limiter := ← RateLimiter.new (policy := { freeFailures := 100 }) }
+  let wrong := if totpAt secret (← clock.get) == "000000" then "111111" else "000000"
+  for i in [0:8] do
+    discard <| postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
+      ("recovery", "AAAAA-AAAAA"), ("totp", wrong)]) (client := s!"198.18.0.{i}")
+  let rec_ ← ctx.store.findTotp nia.id
+  checkEq "wrong recovery codes do not count as TOTP failures"
+    (rec_.map fun t => (t.failures, t.lockedUntil)) (some (0, 0))
+  let codes ← Factor.RecoveryCode.generate
+  ctx.store.setRecoveryCodes nia.id
+    (codes.map (Factor.RecoveryCode.digest (SignIn.Secrets.recoveryKey ctx.rootKey)))
+  let bad ← postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
+    ("recovery", codes.headD ""), ("totp", wrong)])
+  checkEq "a right recovery code with a wrong TOTP code is refused" bad.status.toCode 401
+  checkEq "without spending the recovery code" (← ctx.store.unspentRecoveryCodes nia.id) 10
+  checkEq "and that TOTP failure counts" ((← ctx.store.findTotp nia.id).map (·.failures)) (some 1)
+  let ok ← postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
+    ("recovery", codes.headD ""), ("totp", totpAt secret (← clock.get))])
+  checkEq "both right sign in" ok.status.toCode 200
+  checkEq "spending the code" (← ctx.store.unspentRecoveryCodes nia.id) 9
+
+/-- What is audited, and when the limiter is told of success. -/
+def concludeTests : IO Unit := withCtx fun ctx _ => do
+  group "signin: audit after the session exists"
+  let oz ← ctx.store.addUser "oz" [] 1
+  let (ozId, ozKey) ← sessionFor ctx oz
+  let pat ← ctx.store.addUser "pat" [] 1
+  let (patId, _) ← sessionFor ctx pat
+  -- Oz begins a step-up, and the finish arrives with pat's cookie.
+  let b ← postJson ctx "/signin/stepup/begin" emptyObj (some ozId)
+  let before ← Audit.entries ctx.store
+  let r ← postJson ctx "/signin/stepup/finish"
+    (Json.mkObj [("credential", ← ozKey.assert (replyJson b))]) (some patId)
+  checkEq "a step-up with another user's session is refused" r.status.toCode 401
+  let after := (← Audit.entries ctx.store).toList.drop before.size
+  checkEq "and audited as a failure, not a success"
+    (after.map fun e => (e.event, e.outcome, e.detail))
+    [("step-up", "failure", "no session to step up")]
+  check "pat's session is untouched" ((← Session.current ctx (withCookie patId)).isSome)
+  -- Signing in as oz from a browser with pat's session ends pat's.
+  let r2 ← signInVia ctx ozKey (some patId)
+  checkEq "signing in replaces the session the browser had" r2.status.toCode 200
+  let log ← Audit.entries ctx.store
+  check "and the ended session is audited"
+    (log.any fun e => e.event == "sign-out" && e.userName == some "pat" &&
+      e.detail == "replaced by a new sign-in")
+
+/-- Begin endpoints are limited by pending challenges. -/
+def beginLimitTests : IO Unit := withCtx fun ctx _ => do
+  group "signin: pending challenges are capped"
+  let mut codes := #[]
+  for _ in [0:SignIn.maxPendingPerClient + 1] do
+    codes := codes.push (← postJson ctx "/signin/webauthn/begin" emptyObj
+      (client := "192.0.2.77")).status.toCode
+  checkEq "an address may have twenty challenges pending"
+    (codes.toList.take SignIn.maxPendingPerClient |>.all (· == 200), codes.back?)
+    (true, some 429)
+  let named ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "x")])
+    (client := "192.0.2.77")
+  checkEq "named begins count too" named.status.toCode 429
+  let url ← SignIn.createInvitation ctx.store ctx.config.issuer "quinn" [] 3600 (← ctx.clock)
+  let inv ← postJson ctx ((url.drop ctx.config.issuer.length).toString ++ "/begin") emptyObj
+    (client := "192.0.2.77")
+  checkEq "and invitation begins" inv.status.toCode 429
+  let v6a ← (List.range SignIn.maxPendingPerClient).mapM fun i =>
+    postJson ctx "/signin/webauthn/begin" emptyObj (client := s!"2001:db8::{i + 1}")
+  check "an IPv6 /64 counts as one address" (v6a.all (·.status.toCode == 200))
+  checkEq "so another host in it is refused"
+    (← postJson ctx "/signin/webauthn/begin" emptyObj (client := "2001:db8::ffff")).status.toCode
+    429
+  let other ← postJson ctx "/signin/webauthn/begin" emptyObj (client := "192.0.2.78")
+  checkEq "another address is not affected" other.status.toCode 200
+  match ← SignIn.newChallenge ctx (Req.mk' .post "/" (clientAddress := "192.0.2.79"))
+      .authenticate none (total := 10) with
+  | .error rep => checkEq "a full table answers 503" rep.status.toCode 503
+  | .ok _ => check "a full table answers 503" false
+
 /-- The sign-in tests. -/
 def signInTests : IO Unit := do
   returnTests
@@ -632,5 +758,9 @@ def signInTests : IO Unit := do
   stepUpTests
   redirectTests
   establishTests
+  assertionAccountLimitTests
+  totpLockTests
+  concludeTests
+  beginLimitTests
 
 end PyleTests

@@ -69,6 +69,10 @@ structure Entry where
   failures : Nat
   /-- When the last one was. -/
   lastFailure : Nat
+  /-- Which recorded failure the entry is: a number the limiter never hands
+  out twice, so that an attempt can tell whether the entry is still the one it
+  left, even if another has since left one with the same count and time. -/
+  stamp : Nat := 0
   deriving Repr, Inhabited, BEq
 
 /-- The delay a key with `e` must wait after its last failure: zero within the
@@ -126,6 +130,8 @@ structure State where
   entries : Std.HashMap Key Entry := {}
   /-- When forgotten entries were last swept. -/
   lastSweep : Nat := 0
+  /-- The stamp the next recorded failure gets; it only increases. -/
+  nextStamp : Nat := 1
 
 /-- Drop forgotten entries, if a sweep is due; and if the table is full,
 the oldest quarter of what remains. -/
@@ -133,7 +139,7 @@ def State.prune (p : Policy) (st : State) (now : Nat) : State := Id.run do
   let mut st := st
   if st.lastSweep + p.sweepInterval ≤ now || st.entries.size ≥ p.maxEntries then
     let live := st.entries.filter fun _ e => e.lastFailure + p.forgetAfter > now
-    st := { entries := live, lastSweep := now }
+    st := { st with entries := live, lastSweep := now }
   if st.entries.size ≥ p.maxEntries then
     let byAge := st.entries.toArray.qsort (fun a b => a.2.lastFailure < b.2.lastFailure)
     let drop := max 1 (st.entries.size / 4)
@@ -146,7 +152,8 @@ def State.fail (p : Policy) (st : State) (k : Key) (now : Nat) : State :=
   let failures := match st.entries.get? k with
     | some e => if e.lastFailure + p.forgetAfter ≤ now then 1 else e.failures + 1
     | none => 1
-  { st with entries := st.entries.insert k { failures, lastFailure := now } }
+  let e := { failures, lastFailure := now, stamp := st.nextStamp }
+  { st with entries := st.entries.insert k e, nextStamp := st.nextStamp + 1 }
 
 /-- The limiter: the policy, and the state.  Every change is one
 `IO.Ref.modifyGet`, which is atomic. -/
@@ -169,8 +176,8 @@ structure Attempt where
   client : Key
   /-- The client key's entry before the provisional failure, if it had one. -/
   clientBefore : Option Entry := none
-  /-- The client key's entry the provisional failure left. -/
-  clientAfter : Option Entry := none
+  /-- The stamp of the client key's entry the provisional failure left. -/
+  clientStamp : Nat := 0
 
 /-- Ask to make an attempt.  If any key of the request must still wait, the
 longest wait in seconds, and nothing is recorded.  Otherwise a failure is
@@ -190,13 +197,13 @@ def RateLimiter.tryAcquire (rl : RateLimiter) (account : Option String) (client 
       let before := st.entries.get? ck
       let st := keys.foldl (init := st) fun st k => st.fail p k now
       (.ok { account := account.map Key.account, client := ck, clientBefore := before,
-             clientAfter := st.entries.get? ck }, st)
+             clientStamp := (st.entries.get? ck).elim 0 (·.stamp) }, st)
 
 /-- An attempt succeeded: clear the account's count, and take back the
 provisional failure from the address, leaving its earlier ones.  If the
-address's entry is still the one the attempt left, it goes back to what it was
-before, time included; if another attempt has been counted since, only the
-count is taken back. -/
+address's entry is still the one the attempt left — the same stamp, not merely
+the same count and time — it goes back to what it was before, time included;
+if another attempt has been counted since, only the count is taken back. -/
 def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
   rl.state.modify fun st =>
     let entries := match a.account with
@@ -204,7 +211,7 @@ def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
       | none => st.entries
     let entries := match entries.get? a.client with
       | some e =>
-        if a.clientAfter == some e then
+        if e.stamp == a.clientStamp then
           match a.clientBefore with
           | some b => entries.insert a.client b
           | none => entries.erase a.client

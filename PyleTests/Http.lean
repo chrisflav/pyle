@@ -108,10 +108,12 @@ def securityTests : IO Unit := do
 def rateLimitTests : IO Unit := do
   group "http: rate limiting"
   let p : Policy := { freeFailures := 3, baseDelay := 1, maxDelay := 60, forgetAfter := 600 }
-  checkEq "free failures cost nothing" ((List.range 4).map fun n => p.delay ⟨n, 0⟩) [0, 0, 0, 0]
-  checkEq "then the delay doubles" ((List.range 4).map fun n => p.delay ⟨n + 4, 0⟩) [1, 2, 4, 8]
-  checkEq "up to the cap" (p.delay ⟨100, 0⟩) 60
-  checkEq "a forgotten key waits for nothing" (p.wait ⟨100, 0⟩ 600) 0
+  let entry (failures : Nat) : Entry := { failures, lastFailure := 0 }
+  checkEq "free failures cost nothing" ((List.range 4).map fun n => p.delay (entry n)) [0, 0, 0, 0]
+  checkEq "then the delay doubles" ((List.range 4).map fun n => p.delay (entry (n + 4)))
+    [1, 2, 4, 8]
+  checkEq "up to the cap" (p.delay (entry 100)) 60
+  checkEq "a forgotten key waits for nothing" (p.wait (entry 100) 600) 0
   let rl ← RateLimiter.new p
   let acquire (a : Option String) (c : String) (now : Nat) : IO (Option Nat) := do
     match ← rl.tryAcquire a c now with
@@ -146,6 +148,23 @@ def rateLimitTests : IO Unit := do
       fun e => (e.failures, e.lastFailure)) (some (4, 1000))
   checkEq "so it does not restart the delay"
     ((← rl7.tryAcquire (some "frank") "4.4.4.4" 1060) matches .ok _) true
+  -- Alone on an address, a success leaves nothing behind.
+  let rl8 ← RateLimiter.new p
+  if let .ok a ← rl8.tryAcquire (some "gina") "3.3.3.3" 1000 then rl8.succeed a
+  checkEq "a lone success leaves no entry"
+    ((← rl8.state.get).entries.get? (Key.client "3.3.3.3") |>.isSome) false
+  -- Attempts that overlap: c and a begin, c succeeds, d begins in the same
+  -- second as a, and a succeeds.  The entry then has a's count and time but
+  -- is d's, so a takes back only its count and d's failure keeps its time.
+  let rl9 ← RateLimiter.new p
+  let .ok c ← rl9.tryAcquire none "3.3.3.4" 1000 | check "c goes ahead" false
+  let .ok a ← rl9.tryAcquire none "3.3.3.4" 1010 | check "a goes ahead" false
+  rl9.succeed c
+  discard <| rl9.tryAcquire none "3.3.3.4" 1010
+  rl9.succeed a
+  checkEq "an overlapping success takes back only its own failure"
+    ((← rl9.state.get).entries.get? (Key.client "3.3.3.4") |>.map
+      fun e => (e.failures, e.lastFailure)) (some (1, 1010))
   -- Check and record are one step: a burst gets exactly the free attempts.
   let rl3 ← RateLimiter.new p
   checkEq "sixteen concurrent attempts: four go ahead"

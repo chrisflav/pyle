@@ -136,6 +136,16 @@ def rateLimitTests : IO Unit := do
     ((← rl2.tryAcquire (some "dave") "6.6.6.6" 1000) matches .ok _) true
   checkEq "and takes back only its own failure from the address"
     ((← rl2.state.get).entries.get? (Key.client "5.5.5.5") |>.map (·.failures)) (some 2)
+  -- A success is not a failure: with four failures on an address, a success
+  -- a minute later leaves the next attempt free to go ahead at once.
+  let rl7 ← RateLimiter.new p
+  for _ in [0:4] do discard <| rl7.tryAcquire none "4.4.4.4" 1000
+  if let .ok a ← rl7.tryAcquire (some "frank") "4.4.4.4" 1060 then rl7.succeed a
+  checkEq "a success leaves the address's last failure where it was"
+    ((← rl7.state.get).entries.get? (Key.client "4.4.4.4") |>.map
+      fun e => (e.failures, e.lastFailure)) (some (4, 1000))
+  checkEq "so it does not restart the delay"
+    ((← rl7.tryAcquire (some "frank") "4.4.4.4" 1060) matches .ok _) true
   -- Check and record are one step: a burst gets exactly the free attempts.
   let rl3 ← RateLimiter.new p
   checkEq "sixteen concurrent attempts: four go ahead"

@@ -22,7 +22,11 @@ a burst of concurrent guesses cannot all pass the check before any of them is
 counted.  The failure is provisional: `succeed` takes it back from the address
 and clears the account's count — it was the account's owner — but leaves the
 address's earlier failures, which would otherwise let an attacker with one
-working account reset their own address between guesses.
+working account reset their own address between guesses.  Taking it back
+restores the time of the address's last real failure too, when nothing else
+has been recorded against it since: a success is not a failure, and must
+neither start the back-off delay again for the next attempt nor keep earlier
+failures from being forgotten.
 
 **Memory is bounded.**  Keys have a fixed size — the first 16 bytes of the
 SHA-256 of the normalised account name or address — so a long name costs no
@@ -65,7 +69,7 @@ structure Entry where
   failures : Nat
   /-- When the last one was. -/
   lastFailure : Nat
-  deriving Repr, Inhabited
+  deriving Repr, Inhabited, BEq
 
 /-- The delay a key with `e` must wait after its last failure: zero within the
 free failures, then `baseDelay * 2^k`, capped at `maxDelay`. -/
@@ -163,6 +167,10 @@ structure Attempt where
   account : Option Key
   /-- The client key. -/
   client : Key
+  /-- The client key's entry before the provisional failure, if it had one. -/
+  clientBefore : Option Entry := none
+  /-- The client key's entry the provisional failure left. -/
+  clientAfter : Option Entry := none
 
 /-- Ask to make an attempt.  If any key of the request must still wait, the
 longest wait in seconds, and nothing is recorded.  Otherwise a failure is
@@ -178,11 +186,17 @@ def RateLimiter.tryAcquire (rl : RateLimiter) (account : Option String) (client 
       max w ((st.entries.get? k).elim 0 (p.wait · now))
     if wait > 0 then (.error wait, st)
     else
+      let ck := Key.client client
+      let before := st.entries.get? ck
       let st := keys.foldl (init := st) fun st k => st.fail p k now
-      (.ok { account := account.map Key.account, client := Key.client client }, st)
+      (.ok { account := account.map Key.account, client := ck, clientBefore := before,
+             clientAfter := st.entries.get? ck }, st)
 
 /-- An attempt succeeded: clear the account's count, and take back the
-provisional failure from the address, leaving its earlier ones. -/
+provisional failure from the address, leaving its earlier ones.  If the
+address's entry is still the one the attempt left, it goes back to what it was
+before, time included; if another attempt has been counted since, only the
+count is taken back. -/
 def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
   rl.state.modify fun st =>
     let entries := match a.account with
@@ -190,7 +204,11 @@ def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
       | none => st.entries
     let entries := match entries.get? a.client with
       | some e =>
-        if e.failures ≤ 1 then entries.erase a.client
+        if a.clientAfter == some e then
+          match a.clientBefore with
+          | some b => entries.insert a.client b
+          | none => entries.erase a.client
+        else if e.failures ≤ 1 then entries.erase a.client
         else entries.insert a.client { e with failures := e.failures - 1 }
       | none => entries
     { st with entries }

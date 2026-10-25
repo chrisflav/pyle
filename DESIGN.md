@@ -1,7 +1,7 @@
-# pyloros
+# pyle
 
-*πυλωρός, the gatekeeper.*  The kleidouchos holds the key; the pyloros stands
-at the gate and decides who comes through it.
+*πύλη, the gate.*  kleis is the key that opens one door for one purpose; the
+pylē is where you are first asked who you are.
 
 An identity provider, written in Lean 4 so that the parts of it a mistake would
 be expensive in can be stated and proved.  People sign in to it once, with a
@@ -9,16 +9,16 @@ passkey or a security key, and the services behind it — orchestra, taxis,
 diff-reviewer, and anything that speaks OpenID Connect — learn *who* is
 asking without each of them keeping a password table.
 
-pyloros and kleis answer two different questions and are meant to be used
+pyle and kleis answer two different questions and are meant to be used
 together:
 
 | | asks | about |
 | --- | --- | --- |
-| **pyloros** | who is this? | a person, or an agent acting for one |
+| **pyle** | who is this? | a person, or an agent acting for one |
 | **kleis** | may this bearer spend that credential on this request? | a token held for an outside service |
 
 kleis today takes the bearer's identity as given: an owner names it by hand in
-`kleis token issue --bearer ci@build-07`.  pyloros is where that name comes
+`kleis token issue --bearer ci@build-07`.  pyle is where that name comes
 from (§5.4).
 
 ## The parties
@@ -26,14 +26,14 @@ from (§5.4).
 - The **user** holds authenticators: passkeys, security keys, an authenticator
   app.  They never hold a password that a service can see.
 - A **relying service** (orchestra, taxis, diff-reviewer, Forgejo, Grafana)
-  sends the user to pyloros and gets back a statement about them, signed.
+  sends the user to pyle and gets back a statement about them, signed.
 - A **reverse proxy** stands in for services that cannot do this themselves,
-  asking pyloros on every request whether the session is good (§5.3).
-- **kleis** accepts tokens pyloros has attested, so a grant can name a person
+  asking pyle on every request whether the session is good (§5.3).
+- **kleis** accepts tokens pyle has attested, so a grant can name a person
   rather than a string the owner typed.
 
 ```
- user (browser)            service                 pyloros
+ user (browser)            service                 pyle
    │  GET /                   │                        │
    ├─────────────────────────▶│                        │
    │  302 /authorize?…&code_challenge=…                │
@@ -105,7 +105,7 @@ an administrator's problem.
 ## 2. WebAuthn ceremonies
 
 This is the part where a mistake costs the most, and the part best suited to
-being stated precisely.  pyloros implements the relying-party side of
+being stated precisely.  pyle implements the relying-party side of
 WebAuthn Level 3 directly, rather than through a library, because the list of
 checks *is* the specification of the security property.
 
@@ -174,7 +174,7 @@ against a breached-password list at the time it is set.
 
 A session is a row on the server and an opaque random identifier in a cookie:
 
-- named `__Host-pyloros`, so it is `Secure`, has `Path=/` and no `Domain`;
+- named `__Host-pyle`, so it is `Secure`, has `Path=/` and no `Domain`;
 - `HttpOnly`, `SameSite=Lax`;
 - the identifier is rotated on every change of authentication state, so a
   session fixed before sign-in is worthless after it;
@@ -182,7 +182,7 @@ A session is a row on the server and an opaque random identifier in a cookie:
 - records `amr`, `auth_time` and the authenticators used.
 
 **Step-up.**  A relying service may send `max_age` or ask for an `acr`; if the
-session's `auth_time` is too old, or its factors too weak, pyloros asks for a
+session's `auth_time` is too old, or its factors too weak, pyle asks for a
 fresh WebAuthn assertion without ending the session.  Removing an
 authenticator, adding one and minting long-lived tokens always require a
 step-up within the last five minutes.
@@ -194,7 +194,7 @@ can be ended individually.
 
 ### 5.1 OpenID Connect
 
-pyloros is an OpenID Provider for the authorization-code flow, and only that:
+pyle is an OpenID Provider for the authorization-code flow, and only that:
 
 - PKCE with `S256` is required for every client, confidential or not;
 - redirect URIs are compared exactly, byte for byte;
@@ -223,10 +223,10 @@ check if time($t), $t < 2026-10-25T11:00:00Z;
 check if audience($a), ["taxis", "orchestra"].contains($a);
 ```
 
-A service verifies it offline against pyloros's root public key, without a
+A service verifies it offline against pyle's root public key, without a
 call back, and authorizes it with its own datalog policy.  And because a
 biscuit can be attenuated by whoever holds it, the delegation the services
-already want falls out without pyloros knowing about it:
+already want falls out without pyle knowing about it:
 
 ```
 // orchestra, handing a task to an agent:
@@ -241,7 +241,7 @@ here for the same reason.
 
 ### 5.3 Forward authentication
 
-For services that have no sign-in of their own, pyloros answers Caddy's
+For services that have no sign-in of their own, pyle answers Caddy's
 `forward_auth`, Traefik's `forwardAuth` and nginx's `auth_request`:
 `200` with `Remote-User` and `Remote-Groups` headers when the session cookie is
 good and the user may reach that host, otherwise a redirect to sign in.  Which
@@ -250,15 +250,15 @@ decides access.
 
 ### 5.4 kleis
 
-pyloros signs a **third-party block** attesting `user("christian")` and the
+pyle signs a **third-party block** attesting `user("christian")` and the
 `amr`, and appends it to a kleis biscuit.  A kleis grant can then say
 
 ```
-check if user($u) trusting ed25519/<pyloros public key>, ["christian"].contains($u);
+check if user($u) trusting ed25519/<pyle public key>, ["christian"].contains($u);
 ```
 
 which is the third-party-block question in kleis's §15, answered.  The flow for
-handing an agent a kleis token becomes: sign in to pyloros, ask kleis for a
+handing an agent a kleis token becomes: sign in to pyle, ask kleis for a
 token for a grant, and attenuate it — no owner typing a bearer name.
 
 ### 5.5 Command-line clients and agents
@@ -290,7 +290,7 @@ an `amr` and an expiry like everything else.
 
 The curve arithmetic in `lean-biscuit` is written over `Nat`, which is right for
 a specification and for *verifying* signatures — every input is public — but
-its running time depends on the scalar.  Using it to sign with pyloros's
+its running time depends on the scalar.  Using it to sign with pyle's
 long-lived key would leak that key to anyone who can time enough signatures.
 
 So the rule is: **secrets only meet code with a constant-time guarantee.**  The
@@ -384,7 +384,7 @@ until someone proves it.
 ## 10. Module layout
 
 ```
-Pyloros/
+Pyle/
   Encoding/    Base64Url, Cbor, Cose, Json
   WebAuthn/    AuthenticatorData, ClientData, Assertion, Registration, Attestation
   Factor/      Totp, RecoveryCode, Password
@@ -417,7 +417,7 @@ codes, the two-authenticator rule, step-up.
 
 **M3 — biscuits.**  Access tokens as biscuits; orchestra attenuates them for
 agents; the device grant for CLIs; the kleis attestation of §5.4.  taxis moves
-from Google/GitHub sign-in to pyloros, and its personal access tokens become
+from Google/GitHub sign-in to pyle, and its personal access tokens become
 device-grant biscuits.
 
 **M4 — the rest.**  Forward auth, optional passwords, theorems 2, 4 and 5,
@@ -434,14 +434,13 @@ deployment.
 - **Account recovery when every authenticator is lost.**  Recovery codes cover
   most of it.  Beyond them: an administrator re-invites, which is honest about
   being a human process.  Anything automatic is a way in for someone else.
-- **A shared package.**  kleis and pyloros both want HTTP, the AEAD, DER and the
+- **A shared package.**  kleis and pyle both want HTTP, the AEAD, DER and the
   audit chain.  Extracting them is the right move and changes kleis's module
   layout; it should happen before M1, not after.
-- **Upstream identity providers.**  Signing in *with* GitHub at pyloros would
+- **Upstream identity providers.**  Signing in *with* GitHub at pyle would
   make migrating taxis users easy and would make GitHub a way into everything.
   Leaning towards linking a GitHub account only to import a profile, never to
   sign in.
 - **Synced passkeys.**  Passkeys synced by Apple, Google or a password manager
   are as strong as that account.  Whether to require device-bound credentials
   (backup-eligible flag clear) for administrators is a policy knob to decide.
-- **The name.**

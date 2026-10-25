@@ -1,10 +1,14 @@
 name: Docker image
 
 # Builds the runtime image on every change, and publishes it to
-# ghcr.io/chrisflav/pyle when the change is on master or tagged.  Pull requests
-# build but do not push: the point there is to catch a broken Dockerfile on the
-# pull request that caused it rather than on master afterwards, and a fork's
-# token cannot push to the registry in any case.
+# ghcr.io/chrisflav/pyle when the change is on master or tagged.
+#
+# Two jobs, so that a pull request's build never holds a token that can write
+# packages: `check` builds pull requests and pushes nothing; `publish` builds
+# and pushes everything else, and is the only job with `packages: write`.  The
+# point of `check` is to catch a broken Dockerfile on the pull request that
+# caused it rather than on master afterwards.  Actions are pinned by commit,
+# not by a tag that can move.
 
 on:
   # Only the default branch on push.  A push to any other branch that has an
@@ -16,9 +20,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 # Superseded runs are worth nothing and this build is long.
 concurrency:
@@ -29,32 +31,53 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image:
+  check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-
-    env:
-      # Every step that differs between "validate this change" and "ship this
-      # change" keys off this.
-      publish: ${{ github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # buildx, for the layer cache below and for docker/Dockerfile.dockerignore;
+      # buildx, for the layer cache and for docker/Dockerfile.dockerignore;
       # the classic builder reads neither.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - if: env.publish == 'true'
-        uses: docker/login-action@v3
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # The repository root: every COPY in the Dockerfile is relative to it.
+          context: .
+          file: docker/Dockerfile
+          push: false
+          # Master's cache, so a change that leaves the Lean sources alone
+          # reuses the whole build stage.  Not written: mode=max entries are
+          # large, and one per pull request would evict the master entry they
+          # all read from.
+          cache-from: type=gha,scope=pyle
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           # Not a configured secret: GitHub mints this per run, and
           # `packages: write` above is what makes it able to push.
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/pyle
           tags: |
@@ -65,29 +88,26 @@ jobs:
             type=sha,format=long,prefix=
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          # The repository root: every COPY in the Dockerfile is relative to it.
           context: .
           file: docker/Dockerfile
-          push: ${{ env.publish == 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # A pull request reads master's cache, so a change that leaves the
-          # Lean sources alone reuses the whole build stage.  Written on master
-          # only: mode=max entries are large, and one per pull request would
-          # evict the master entry they all read from.
           cache-from: type=gha,scope=pyle
-          cache-to: ${{ env.publish == 'true' && 'type=gha,mode=max,scope=pyle' || '' }}
+          cache-to: type=gha,mode=max,scope=pyle
 
       - name: Summarise
-        if: env.publish == 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/pyle:${{ github.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
             echo "### Published"
             echo
             echo '```'
-            echo "ghcr.io/${{ github.repository_owner }}/pyle:${{ github.sha }}"
-            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo "$IMAGE"
+            echo "digest: $DIGEST"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

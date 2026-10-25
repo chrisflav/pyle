@@ -740,8 +740,10 @@ def run(a):
     check(r.status == 403, "however the path is spelled", repr(r))
     r = ask("/a%2Fb", cookies=fcookie)
     check(r.status == 400, "and a path pyle cannot read the service's way is 400", repr(r))
-    r = ask("/", host="other." + a.fa_host, cookies=fcookie)
-    check(r.status != 200, "the cookie is for its host only", repr(r))
+    r = ask("/", host=a.fa_other, cookies=fcookie)
+    check(r.status == 302 and r.location.startswith(a.issuer + "/forward-auth/grant?"),
+          "the cookie is for its host only: another protected host sends to the grant",
+          repr(r) + " " + r.location)
 
     # ------------------------------------------------------------ logout
     section("end_session")
@@ -797,6 +799,7 @@ def main():
     p.add_argument("--post-logout", required=True)
     p.add_argument("--public-client", required=True)
     p.add_argument("--fa-host", required=True)
+    p.add_argument("--fa-other", required=True)
     p.add_argument("--fa-secret", required=True)
     p.add_argument("--counts", required=True)
     a = p.parse_args()

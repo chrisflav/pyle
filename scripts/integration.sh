@@ -34,6 +34,7 @@ check $? "lake build pyle" "$(tail -20 "$WORK/build.log")"
 PORT="$(free_port)"
 ISSUER="http://localhost:$PORT"
 FA_HOST="app.localhost"
+FA_OTHER="wiki.localhost"
 FA_SECRET="forward-auth-secret-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 REDIRECT="http://127.0.0.1:9/callback"
 BYE="http://127.0.0.1:9/bye"
@@ -52,13 +53,18 @@ cat > "$PYLE_CONFIG" <<EOF
   "devicePollSeconds": 1,
   "forwardAuthSecret": "$FA_SECRET",
   "forwardAuthHosts": {
-    "$FA_HOST": "deny if path(\$p), \$p.starts_with(\"/admin\");\nallow if group(\"admin\");"
+    "$FA_HOST": "deny if path(\$p), \$p.starts_with(\"/admin\");\nallow if group(\"admin\");",
+    "$FA_OTHER": "allow if user(\$u);"
   }
 }
 EOF
 
 echo
 echo "== first run"
+grep -v '"forwardAuthSecret"' "$PYLE_CONFIG" > "$WORK/nosecret.json"
+OUT="$("$PYLE" user list --config "$WORK/nosecret.json" 2>&1)"
+[ $? -ne 0 ] && grep -q "needs 'forwardAuthSecret'" <<< "$OUT"
+check $? "forward-auth hosts without the proxy's secret are refused" "$OUT"
 "$PYLE" init > "$WORK/init.log" 2>&1
 check $? "pyle init" "$(cat "$WORK/init.log")"
 MODE="$(stat -c '%a' "$WORK/data/root.key" 2>/dev/null)"
@@ -90,8 +96,9 @@ SECRET="$(tail -1 "$WORK/client.log")"
 check $? "the secret is printed and only its hash kept"
 "$PYLE" client add tv --public --name TV --redirect "http://127.0.0.1/cb" > "$WORK/tv.log" 2>&1
 check $? "pyle client add tv --public" "$(cat "$WORK/tv.log")"
-"$PYLE" client list | grep -q "^app	confidential	ES256"
-check $? "pyle client list" "$("$PYLE" client list)"
+CLIENTS="$("$PYLE" client list 2>&1)"
+grep -q "^app	confidential	ES256" <<< "$CLIENTS"
+check $? "pyle client list" "$CLIENTS"
 
 # ---------------------------------------------------------------- the server
 "$PYLE" serve > "$WORK/pyle.log" 2>&1 &
@@ -108,12 +115,17 @@ OUT="$(curl -s "http://127.0.0.1:$PORT/healthz")"
 grep -q "listening on 127.0.0.1:$PORT as $ISSUER" "$WORK/pyle.log"
 check $? "pyle serve says where it listens" "$(cat "$WORK/pyle.log")"
 HDRS="$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/healthz")"
-echo "$HDRS" | grep -qi "^content-security-policy: .*frame-ancestors 'none'"
+grep -qi "^content-security-policy: .*frame-ancestors 'none'" <<< "$HDRS"
 check $? "every reply carries the CSP" "$HDRS"
-echo "$HDRS" | grep -qi "^referrer-policy: no-referrer"
+grep -qi "^referrer-policy: no-referrer" <<< "$HDRS"
 check $? "and Referrer-Policy" "$HDRS"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/nothing-here")"
 [ "$CODE" = "404" ]; check $? "an unknown path is 404" "got $CODE"
+for P in /forward-auth/ //forward-auth /forward-auth// /forward-auth/grant/; do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -H "X-Pyle-Forward-Auth: $FA_SECRET" \
+    -H "X-Forwarded-Host: $FA_HOST" -H "X-Forwarded-Uri: /" "http://127.0.0.1:$PORT$P")"
+  [ "$CODE" = "404" ]; check $? "$P is not the forward-auth check" "got $CODE"
+done
 CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: http://evil.example" \
   "http://127.0.0.1:$PORT/logout")"
 [ "$CODE" = "403" ]; check $? "a cross-origin POST is refused" "got $CODE"
@@ -124,7 +136,8 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $ISSUER" \
 
 python3 -I "$ROOT/scripts/e2e.py" --port "$PORT" --issuer "$ISSUER" --invite "$INVITE" \
   --user alice --client app --secret="$SECRET" --redirect "$REDIRECT" --post-logout "$BYE" \
-  --public-client tv --fa-host "$FA_HOST" --fa-secret="$FA_SECRET" --counts "$WORK/counts"
+  --public-client tv --fa-host "$FA_HOST" --fa-other "$FA_OTHER" \
+  --fa-secret="$FA_SECRET" --counts "$WORK/counts"
 if [ -f "$WORK/counts" ]; then
   read -r P F < "$WORK/counts"
   PASS=$((PASS+P)); FAIL=$((FAIL+F))
@@ -134,15 +147,17 @@ fi
 
 echo
 echo "== afterwards"
-"$PYLE" user list | grep -q "^alice	groups: admin	authenticators: 1"
-check $? "pyle user list shows alice and her passkey" "$("$PYLE" user list)"
+USERS="$("$PYLE" user list 2>&1)"
+grep -q "^alice	groups: admin	authenticators: 1" <<< "$USERS"
+check $? "pyle user list shows alice and her passkey" "$USERS"
 kill -0 "$PYLE_PID" 2>/dev/null
 check $? "the server is still running"
-grep "pyle: connection" "$WORK/pyle.log" | grep -qv "Entity too large"
-[ $? -ne 0 ]; check $? "and logged no connection failures" "$(grep 'pyle: connection' "$WORK/pyle.log" | head -5)"
+# Only the oversized body above may have failed a connection.
+CONN="$(grep "pyle: connection" "$WORK/pyle.log" | grep -v "Entity too large")"
+[ -z "$CONN" ]; check $? "and logged no connection failures" "$CONN"
 OUT="$("$PYLE" audit verify 2>&1)"
 check $? "pyle audit verify" "$OUT"
-echo "$OUT" | grep -q "form an unbroken chain"
+grep -q "form an unbroken chain" <<< "$OUT"
 check $? "the audit log is an unbroken chain" "$OUT"
 grep -qF -- "$SECRET" "$WORK/data/pyle.db"
 [ $? -ne 0 ]; check $? "the database never contains the client secret"

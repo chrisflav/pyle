@@ -14,8 +14,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ENV ELAN_HOME=/root/.elan
 ENV PATH="${ELAN_HOME}/bin:${PATH}"
-RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
-      | sh -s -- -y --no-modify-path --default-toolchain none
+# elan itself from a pinned release, checked against the sha256 GitHub lists
+# for the asset, rather than whatever elan-init.sh and "latest" say today.
+ARG ELAN_VERSION=v4.2.4
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) sum=42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63 ;; \
+      aarch64) sum=05febd124d84ebf994b2e7479922a5650b1e950c17ae3bd1ddd776b65bb72bf9 ;; \
+      *) echo "no pinned elan for $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -sSfL -o /tmp/elan.tar.gz \
+      "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-${arch}-unknown-linux-gnu.tar.gz"; \
+    echo "$sum  /tmp/elan.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/elan.tar.gz -C /tmp; \
+    /tmp/elan-init -y --no-modify-path --default-toolchain none; \
+    rm /tmp/elan.tar.gz /tmp/elan-init
 WORKDIR /src
 COPY lean-toolchain lakefile.lean lake-manifest.json ./
 COPY Pyle.lean Main.lean ./

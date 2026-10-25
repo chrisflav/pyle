@@ -85,6 +85,17 @@ def oidEcPublicKey : ByteArray := ⟨#[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
 `prime256v1` (P-256). -/
 def oidPrime256v1 : ByteArray := ⟨#[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]⟩
 
+/-- The contents of the object identifier `2.5.4.6`, the country of a name. -/
+def oidCountry : ByteArray := ⟨#[0x55, 0x04, 0x06]⟩
+
+/-- The contents of the object identifier `2.5.4.10`, the organisation of a
+name. -/
+def oidOrganization : ByteArray := ⟨#[0x55, 0x04, 0x0a]⟩
+
+/-- The contents of the object identifier `2.5.4.3`, the common name of a
+name. -/
+def oidCommonName : ByteArray := ⟨#[0x55, 0x04, 0x03]⟩
+
 /-- The contents of the object identifier `2.5.4.11`, the organisational unit
 of a name. -/
 def oidOrganizationalUnit : ByteArray := ⟨#[0x55, 0x04, 0x0b]⟩
@@ -196,7 +207,11 @@ def Certificate.isCa (c : Certificate) : Option Bool := do
   | some e =>
     let fields ← elements (← single tagSequence e.value)
     match fields with
-    | (0x01, flag) :: _ => return flag.data == #[0xff]
+    | (0x01, flag) :: _ =>
+      -- DER writes a BOOLEAN as exactly 0x00 or 0xff; anything else is refused
+      if flag.data == #[0xff] then return true
+      else if flag.data == #[0x00] then return false
+      else none
     | _ => return false
 
 /-- The AAGUID the certificate names, if it carries the FIDO extension: an

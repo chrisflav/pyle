@@ -112,7 +112,8 @@ def verifyRegistration (rp : RelyingParty) (challenge : ByteArray)
   if cd.type ≠ "webauthn.create" then throw .wrongType
   if cd.challenge ≠ Base64Url.encode challenge then throw .challengeMismatch
   if cd.origin ∉ rp.origins then throw .originMismatch
-  if ¬ (rp.allowCrossOrigin = true ∨ (cd.crossOrigin ≠ some true ∧ cd.topOrigin = none)) then
+  if ¬ ((cd.topOrigin = none → cd.crossOrigin ≠ some true) ∧
+      ∀ t ∈ cd.topOrigin, cd.crossOrigin = some true ∧ t ∈ rp.allowedTopOrigins) then
     throw .crossOrigin
   let obj ← (AttestationObject.parse r.attestationObject).mapError .attestationObject
   let ad ← (AuthenticatorData.parse obj.authData).mapError .authenticatorData

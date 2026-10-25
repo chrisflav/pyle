@@ -12,15 +12,18 @@ and floating-point numbers is supported: unsigned and negative integers, byte
 and text strings, arrays, maps, and the simple values below 24 (`false`,
 `true`, `null`, `undefined`).  Anything else is refused rather than skipped.
 
-Decoding is bounded in two ways.  Nesting deeper than `maxDepth` is refused,
-so the recursion is bounded by a constant rather than by the input; and an
-array or map whose announced length exceeds the bytes left is refused before
-any of it is read, since every item takes at least one byte.  The whole input
-is limited to `maxSize` bytes.
+Decoding is bounded, and linear in its input.  Nesting deeper than
+`maxDepth` is refused, so the recursion is bounded by a constant rather than
+by the input.  The whole input is limited to `maxSize` bytes.  No step looks
+at more of the input than it consumes: a string is split off by walking its
+announced length and no further (`splitExact`), and an array or map with an
+announced count larger than the bytes left fails when they run out, since
+every item takes at least one byte.  In particular nothing measures the length
+of what is left, which would make decoding quadratic.
 
-Map keys are neither sorted nor checked for duplicates by the decoder; the
-lookups in `Cbor.Map` refuse a key that appears more than once, which is where
-a duplicate could change the meaning of a message.
+Map keys are neither sorted nor checked for duplicates by the decoder;
+`Cbor.lookup` refuses a key that appears more than once, which is where a
+duplicate could change the meaning of a message.
 
 The decoder works on lists of bytes, which makes the round trip
 `decode (encode c) = some c` a structural induction (`decode_encode`).
@@ -54,9 +57,9 @@ namespace Cbor
 object is three levels deep; sixteen leaves room for extensions. -/
 def maxDepth : Nat := 16
 
-/-- The largest input the decoder reads.  An attestation object with a
-certificate chain is a few kilobytes. -/
-def maxSize : Nat := 65536
+/-- The largest input the decoder reads, 16 KiB.  An attestation object with
+a certificate chain is a few kilobytes. -/
+def maxSize : Nat := 16384
 
 /-- The integer an `unsigned` or `negative` item stands for. -/
 def toInt? : Cbor → Option Int
@@ -165,9 +168,21 @@ end
 
 /-! ## Decoding -/
 
+/-- Split off the first `n` bytes, or `none` if there are fewer.  This walks
+`n` bytes and no more, whatever follows them. -/
+def splitExact : Nat → List UInt8 → Option (List UInt8 × List UInt8)
+  | 0, l => some ([], l)
+  | _ + 1, [] => none
+  | n + 1, b :: l =>
+    match splitExact n l with
+    | some (front, rest) => some (b :: front, rest)
+    | none => none
+
 /-- Split off `k` bytes and read them as a big-endian number. -/
 def takeBe (k : Nat) (l : List UInt8) : Option (Nat × List UInt8) :=
-  if l.length < k then none else some (ofBeBytes (l.take k), l.drop k)
+  match splitExact k l with
+  | some (front, rest) => some (ofBeBytes front, rest)
+  | none => none
 
 /-- Read the initial byte and argument of an item: its major type, its
 argument, and the bytes after them.  Arguments in a longer form than they need
@@ -213,19 +228,21 @@ def decodeItem (fuel : Nat) (l : List UInt8) : Option (Cbor × List UInt8) :=
       if major = 0 then some (unsigned n, rest)
       else if major = 1 then some (negative n, rest)
       else if major = 2 then
-        if rest.length < n then none else some (bytes (bytesOfList (rest.take n)), rest.drop n)
+        match splitExact n rest with
+        | some (front, rest) => some (bytes (bytesOfList front), rest)
+        | none => none
       else if major = 3 then
-        if rest.length < n then none else
-        match String.fromUTF8? (bytesOfList (rest.take n)) with
-        | some s => some (text s, rest.drop n)
+        match splitExact n rest with
+        | some (front, rest) =>
+          match String.fromUTF8? (bytesOfList front) with
+          | some s => some (text s, rest)
+          | none => none
         | none => none
       else if major = 4 then
-        if rest.length < n then none else
         match decodeItems fuel n rest with
         | some (items, rest) => some (array items, rest)
         | none => none
       else if major = 5 then
-        if rest.length < n then none else
         match decodeEntries fuel n rest with
         | some (entries, rest) => some (map entries, rest)
         | none => none
@@ -334,11 +351,19 @@ theorem ofBeBytes_beBytes (k n : Nat) : ofBeBytes (beBytes k n) = n % 256 ^ k :=
     rw [Nat.mul_comm]
     omega
 
+/-- Splitting off as many bytes as a list has gives the list back. -/
+theorem splitExact_append (l rest : List UInt8) :
+    splitExact l.length (l ++ rest) = some (l, rest) := by
+  induction l with
+  | nil => rfl
+  | cons b l ih => simp [splitExact, ih]
+
 /-- A number that fits in `k` bytes is read back from its own encoding. -/
 theorem takeBe_beBytes (k n : Nat) (rest : List UInt8) (h : n < 256 ^ k) :
     takeBe k (beBytes k n ++ rest) = some (n, rest) := by
-  have hl := length_beBytes k n
-  simp [takeBe, hl, ofBeBytes_beBytes, Nat.mod_eq_of_lt h]
+  have hs := splitExact_append (beBytes k n) rest
+  rw [length_beBytes] at hs
+  simp [takeBe, hs, ofBeBytes_beBytes, Nat.mod_eq_of_lt h]
 
 /-- A number below 256 survives the trip through a byte. -/
 theorem toNat_ofNat_lt (m : Nat) (h : m < 256) : (UInt8.ofNat m).toNat = m := by
@@ -385,30 +410,10 @@ theorem encodeHead_ne_nil (major n : Nat) : encodeHead major n ≠ [] := by
   split <;> try split <;> try split <;> try split
   all_goals simp
 
-/-- Every item takes at least one byte, which is what lets the decoder refuse
-a count larger than the input before reading any of it. -/
+/-- Every item takes at least one byte, which is why an array or map that
+announces more items than there are bytes left fails within those bytes. -/
 theorem encodeList_ne_nil (c : Cbor) : encodeList c ≠ [] := by
   cases c <;> simp [encodeList, encodeHead_ne_nil]
-
-/-- A list of items takes at least as many bytes as it has items. -/
-theorem length_encodeItems (cs : List Cbor) : cs.length ≤ (encodeItems cs).length := by
-  induction cs with
-  | nil => simp [encodeItems]
-  | cons c cs ih =>
-    have := List.length_pos_iff.mpr (encodeList_ne_nil c)
-    simp [encodeItems]
-    omega
-
-/-- A list of entries takes at least as many bytes as it has entries. -/
-theorem length_encodeEntries (es : List (Cbor × Cbor)) :
-    es.length ≤ (encodeEntries es).length := by
-  induction es with
-  | nil => simp [encodeEntries]
-  | cons e es ih =>
-    obtain ⟨k, v⟩ := e
-    have := List.length_pos_iff.mpr (encodeList_ne_nil k)
-    simp [encodeEntries]
-    omega
 
 /-- A byte string survives the trip through a list. -/
 theorem bytesOfList_data (b : ByteArray) : bytesOfList b.data.toList = b := by
@@ -474,33 +479,32 @@ theorem decodeItem_encodeList (fuel : Nat) :
     | bytes b =>
       simp only [encodeList, List.append_assoc]
       rw [decodeItem, decodeHead_encodeHead _ _ _ (by omega) hw]
-      simp [bytesOfList_data]
+      have hsplit := splitExact_append b.data.toList rest
+      rw [Array.length_toList, ← ByteArray.size] at hsplit
+      simp [hsplit, bytesOfList_data]
     | text s =>
       simp only [encodeList, List.append_assoc]
       rw [decodeItem, decodeHead_encodeHead _ _ _ (by omega) hw]
       have hs : bytesOfList s.toByteArray.data.toList = s.toByteArray := bytesOfList_data _
-      simp [hs, fromUTF8?_toByteArray]
+      have hsplit := splitExact_append s.toByteArray.data.toList rest
+      rw [Array.length_toList, ← ByteArray.size, String.size_toByteArray] at hsplit
+      simp [hsplit, hs, fromUTF8?_toByteArray]
     | array cs =>
       simp only [WellFormed] at hw
       simp only [depth] at hd
       simp only [encodeList, List.append_assoc]
       rw [decodeItem, decodeHead_encodeHead _ _ _ (by omega) hw.1]
-      have hl := length_encodeItems cs
-      have hlen : ¬ (encodeItems cs ++ rest).length < cs.length := by simp; omega
       simp only [show (4 : Nat) ≠ 0 from by decide, show (4 : Nat) ≠ 1 from by decide,
-        show (4 : Nat) ≠ 2 from by decide, show (4 : Nat) ≠ 3 from by decide, ↓reduceIte,
-        hlen]
+        show (4 : Nat) ≠ 2 from by decide, show (4 : Nat) ≠ 3 from by decide, ↓reduceIte]
       rw [items cs rest hw.2 (by omega)]
     | map es =>
       simp only [WellFormed] at hw
       simp only [depth] at hd
       simp only [encodeList, List.append_assoc]
       rw [decodeItem, decodeHead_encodeHead _ _ _ (by omega) hw.1]
-      have hl := length_encodeEntries es
-      have hlen : ¬ (encodeEntries es ++ rest).length < es.length := by simp; omega
       simp only [show (5 : Nat) ≠ 0 from by decide, show (5 : Nat) ≠ 1 from by decide,
         show (5 : Nat) ≠ 2 from by decide, show (5 : Nat) ≠ 3 from by decide,
-        show (5 : Nat) ≠ 4 from by decide, ↓reduceIte, hlen]
+        show (5 : Nat) ≠ 4 from by decide, ↓reduceIte]
       rw [entries es rest hw.2 (by omega)]
     | simple n =>
       simp only [WellFormed] at hw

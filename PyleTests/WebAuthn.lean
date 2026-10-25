@@ -146,6 +146,14 @@ def regOutcome : Except RegistrationError NewCredential → String
   | .error (.attestation _) => "attestation"
   | .error e => reprStr e
 
+/-- The reason an attestation statement was refused, or `""` if it was not. -/
+def attestationReason : Except RegistrationError NewCredential → String
+  | .error (.attestation reason) => reason
+  | _ => ""
+
+/-- Whether `needle` occurs in `s`. -/
+def mentions (s needle : String) : Bool := (s.splitOn needle).length > 1
+
 /-- An outcome of authentication, likewise. -/
 def assertOutcome : Except AssertionError VerifiedAssertion → String
   | .ok _ => "ok"
@@ -204,11 +212,16 @@ def vectorTests : IO Unit := do
   acceptVector noneEs256LongCredentialId .es256 "none"
   acceptVector packedEs256 .es256 "packed full (1 certificates)"
   acceptVector packedEdDsa .edDsa "packed full (1 certificates)"
-  -- §16.4 and §16.5 come from cross-origin frames: refused unless allowed
+  -- §16.4 and §16.5 come from cross-origin frames: refused unless the browser
+  -- names the top-level origin and it is allowed, which §16.4 does not
   refuseVector noneEs256CrossOrigin exampleRp "crossOrigin" (reprStr RegistrationError.crossOrigin)
   refuseVector noneEs256TopOrigin exampleRp "topOrigin" (reprStr RegistrationError.crossOrigin)
-  let framed := { exampleRp with allowCrossOrigin := true }
-  for v in [noneEs256CrossOrigin, noneEs256TopOrigin] do
+  let framed := { exampleRp with allowedTopOrigins := ["https://example.com"] }
+  refuseVector noneEs256CrossOrigin framed "crossOrigin without a topOrigin"
+    (reprStr RegistrationError.crossOrigin)
+  refuseVector noneEs256TopOrigin { exampleRp with allowedTopOrigins := ["https://example.net"] }
+    "a topOrigin that is not allowed" (reprStr RegistrationError.crossOrigin)
+  for v in [noneEs256TopOrigin] do
     match verifyRegistration framed (hex v.regChallenge) [.es256] v.registration with
     | .error e => check s!"§{v.section_}: registration when framing is allowed" false (reprStr e)
     | .ok c =>
@@ -249,13 +262,15 @@ def vectorTests : IO Unit := do
       { packedSelfEs256.registration with
         clientDataJSON := hex packedSelfEs256.regClientDataJSON ++ hex "20" }))
     "attestation"
-  -- a full attestation whose leaf certificate carries another AAGUID (the
-  -- signature would fail too, but the AAGUID check comes first)
+  -- altered authenticator data under a full attestation: the §16.7 leaf has no
+  -- AAGUID extension, so it is the signature that fails (the AAGUID check is
+  -- tested on hand-built certificates below)
   let otherAaguid := patchHex packedEs256.attestationObject packedEs256.aaguid
     "00000000000000000000000000000000"
-  checkEq "§16.7: the authenticator data names another AAGUID than the certificate"
-    (regOutcome (verifyRegistration exampleRp (hex packedEs256.regChallenge) [.es256]
-      { packedEs256.registration with attestationObject := hex otherAaguid })) "attestation"
+  check "§16.7: altered authenticator data fails the leaf signature"
+    (mentions (attestationReason (verifyRegistration exampleRp (hex packedEs256.regChallenge)
+      [.es256] { packedEs256.registration with attestationObject := hex otherAaguid }))
+      "does not verify under the leaf certificate")
   -- a none statement must be empty
   let notEmpty := patchHex noneEs256.attestationObject "6761747453746d74a0"
     "6761747453746d74a1616101"
@@ -367,8 +382,8 @@ def generatedTests : IO Unit := do
   let ed := storedFor .edDsa ed25519Secret
   let verify (g : Gen) (cred : StoredCredential := es) (rp := testRp)
       (allow : Option (List ByteArray) := none) (secret := p256Secret)
-      (alg := CoseAlgorithm.es256) :=
-    verifyAssertion rp testChallenge allow cred (g.sign alg secret)
+      (alg := CoseAlgorithm.es256) (requireUserHandle := false) :=
+    verifyAssertion rp testChallenge allow cred (g.sign alg secret) requireUserHandle
   let err (e : AssertionError) := reprStr e
   -- accepted
   match verify {} with
@@ -397,9 +412,13 @@ def generatedTests : IO Unit := do
     (err .credentialMismatch)
   expectAssertion "1: not among allowCredentials" (verify {} (allow := some [hex "00"]))
     (err .credentialNotAllowed)
-  expectAssertion "1: allowCredentials empty" (verify {} (allow := some []))
-    (err .credentialNotAllowed)
+  expectAssertion "1: an empty allowCredentials means none" (verify {} (allow := some []))
+    "ok"
   -- 2. the user handle
+  expectAssertion "2: discoverable flow with a user handle"
+    (verify {} (requireUserHandle := true)) "ok"
+  expectAssertion "2: discoverable flow without a user handle"
+    (verify { userHandle := none } (requireUserHandle := true)) (err .userHandleMissing)
   expectAssertion "2: another user handle" (verify { userHandle := some (hex "0011") })
     (err .userHandleMismatch)
   -- 3. the client data
@@ -424,6 +443,31 @@ def generatedTests : IO Unit := do
     (err .crossOrigin)
   expectAssertion "4: a topOrigin" (verify { extra := ",\"topOrigin\":\"https://a.example\"" })
     (err .crossOrigin)
+  let framedRp := { testRp with allowedTopOrigins := ["https://a.example"] }
+  expectAssertion "4: an allowed topOrigin from a cross-origin frame"
+    (verify { extra := ",\"crossOrigin\":true,\"topOrigin\":\"https://a.example\"" }
+      (rp := framedRp)) "ok"
+  expectAssertion "4: an allowed topOrigin without crossOrigin"
+    (verify { extra := ",\"topOrigin\":\"https://a.example\"" } (rp := framedRp))
+    (err .crossOrigin)
+  expectAssertion "4: an allowed topOrigin with crossOrigin false"
+    (verify { extra := ",\"crossOrigin\":false,\"topOrigin\":\"https://a.example\"" }
+      (rp := framedRp)) (err .crossOrigin)
+  expectAssertion "4: a topOrigin that is not allowed"
+    (verify { extra := ",\"crossOrigin\":true,\"topOrigin\":\"https://b.example\"" }
+      (rp := framedRp)) (err .crossOrigin)
+  expectAssertion "4: crossOrigin without a topOrigin, even with framing allowed"
+    (verify { extra := ",\"crossOrigin\":true" } (rp := framedRp)) (err .crossOrigin)
+  -- client data the strict reader handles without evaluating anything
+  let t₀ ← IO.monoMsNow
+  expectAssertion "an exponent of a billion is skipped, not evaluated"
+    (verify { extra := ",\"x\":1e1000000000" }) "ok"
+  let t₁ ← IO.monoMsNow
+  check "and quickly" (t₁ - t₀ < 2000) s!"{t₁ - t₀} ms"
+  expectAssertion "3: a repeated challenge"
+    (verify { extra := ",\"challenge\":\"AAAA\"" }) "clientData"
+  expectAssertion "3: a repeated type" (verify { extra := ",\"type\":\"webauthn.get\"" })
+    "clientData"
   expectAssertion "4: crossOrigin that is not a boolean"
     (verify { extra := ",\"crossOrigin\":\"false\"" }) "clientData"
   -- 5. the relying party id
@@ -483,14 +527,21 @@ def p256Coordinates (secret : ByteArray) : ByteArray × ByteArray :=
   let y := P256.F.mul q.Y (P256.F.mul zi (P256.F.mul zi zi))
   (Bytes.ofNatBE 32 x, Bytes.ofNatBE 32 y)
 
-/-- An attestation object of format `none` for a COSE key, as an authenticator
-would make it. -/
-def noneAttestation (key : Cbor) (flags : UInt8 := 0x45) : ByteArray :=
-  let authData := Sha256.hash "auth.example.org".toUTF8 ++ ByteArray.mk #[flags]
-    ++ Bytes.ofNatBE 4 0 ++ ByteArray.mk (Array.replicate 16 0) ++ Bytes.ofNatBE 2 16
-    ++ testCredentialId ++ Cbor.encode key
+/-- An attestation object of format `none` around authenticator data. -/
+def noneAttestationOf (authData : ByteArray) : ByteArray :=
   Cbor.encode (.map [(.text "fmt", .text "none"), (.text "attStmt", .map []),
     (.text "authData", .bytes authData)])
+
+/-- Authenticator data for `auth.example.org` carrying a credential with a
+COSE key, as an authenticator would make it. -/
+def attestedAuthData (key : Cbor) (flags : UInt8 := 0x45) (aaguid := ByteArray.mk
+    (Array.replicate 16 0)) : ByteArray :=
+  Sha256.hash "auth.example.org".toUTF8 ++ ByteArray.mk #[flags]
+    ++ Bytes.ofNatBE 4 0 ++ aaguid ++ Bytes.ofNatBE 2 16 ++ testCredentialId ++ Cbor.encode key
+
+/-- An attestation object of format `none` for a COSE key. -/
+def noneAttestation (key : Cbor) (flags : UInt8 := 0x45) : ByteArray :=
+  noneAttestationOf (attestedAuthData key flags)
 
 /-- Registrations made here, through the COSE encodings of keys whose
 compressed form is known. -/
@@ -530,12 +581,253 @@ def registrationTests : IO Unit := do
       (.negative 0, .unsigned 1), (.negative 1, .bytes x), (.negative 2, .bytes y),
       (.unsigned 3, .negative 7)])))
     "authenticatorData"
-  checkEq "no attested credential" (regOutcome (register (coseEs256 x y) 0x05))
-    "authenticatorData"
+  checkEq "AT flag clear but credential data present"
+    (regOutcome (register (coseEs256 x y) 0x05)) "authenticatorData"
+  let bare := Sha256.hash "auth.example.org".toUTF8 ++ ByteArray.mk #[0x05] ++ Bytes.ofNatBE 4 0
+  checkEq "no attested credential: 37 bytes of authenticator data"
+    (regOutcome (verifyRegistration testRp testChallenge [.es256, .edDsa]
+      { clientDataJSON := cd, attestationObject := noneAttestationOf bare, transports := [] }))
+    (reprStr RegistrationError.noAttestedCredential)
   checkEq "user not present" (regOutcome (register (coseEs256 x y) 0x44))
     (reprStr RegistrationError.userNotPresent)
   checkEq "user not verified" (regOutcome (register (coseEs256 x y) 0x41))
     (reprStr RegistrationError.userNotVerified)
+
+/-! ## Bounds on hostile input -/
+
+/-- CBOR and client data are read before any signature is checked, so their
+cost is the attacker's to choose; both must stay small and linear. -/
+def boundsTests : IO Unit := do
+  group "webauthn: bounds"
+  -- an array announcing 65000 items, each an empty byte string: over the cap
+  let big := hex "99fde8" ++ ByteArray.mk (Array.replicate 65000 0x40)
+  let t₀ ← IO.monoMsNow
+  check "CBOR over 16 KiB is refused" (Cbor.decode big).isNone
+  check "CBOR over 16 KiB is refused as a prefix too" (Cbor.decodePrefix big).isNone
+  let t₁ ← IO.monoMsNow
+  check "and at once" (t₁ - t₀ < 100) s!"{t₁ - t₀} ms"
+  -- the same shape at exactly 16 KiB, the worst the cap lets through
+  let worst := hex "993ffd" ++ ByteArray.mk (Array.replicate 16381 0x40)
+  checkEq "the worst case is 16 KiB" worst.size Cbor.maxSize
+  let t₂ ← IO.monoMsNow
+  let decoded := Cbor.decode worst
+  let t₃ ← IO.monoMsNow
+  check "the worst case decodes" (match decoded with
+    | some (.array items) => items.length == 16381
+    | _ => false)
+  check "and quickly" (t₃ - t₂ < 500) s!"{t₃ - t₂} ms"
+  -- the same through an assertion whose authenticator data claims a credential
+  let ad := Sha256.hash "auth.example.org".toUTF8 ++ hex "45" ++ Bytes.ofNatBE 4 7
+    ++ ByteArray.mk (Array.replicate 16 0) ++ Bytes.ofNatBE 2 16 ++ testCredentialId
+    ++ hex "993ffd" ++ ByteArray.mk (Array.replicate 16300 0x40)
+  let r := { Gen.sign {} .es256 p256Secret with authenticatorData := ad }
+  let t₄ ← IO.monoMsNow
+  expectAssertion "a large CBOR item in the authenticator data is refused"
+    (verifyAssertion testRp testChallenge none (storedFor .es256 p256Secret) r)
+    "authenticatorData"
+  let t₅ ← IO.monoMsNow
+  check "before the signature, and quickly" (t₅ - t₄ < 500) s!"{t₅ - t₄} ms"
+
+/-- The strict JSON reader of client data. -/
+def jsonTests : IO Unit := do
+  group "webauthn: client data JSON"
+  let text := "{\"a\":\"q\\\"b\\\\s\\/\\b\\f\\n\\r\\t\\u00e9\\ud83d\\ude00\",\"b\":true," ++
+    "\"c\":false,\"d\":null,\"e\":-1.5e+3,\"f\":[1,{\"g\":[]}],\"h\":{}, \"i\" : 0 }"
+  match Json.readObject text.toUTF8 with
+  | .error e => check "a full object reads" false e
+  | .ok members =>
+    checkEq "keys" (members.map (·.1)) ["a", "b", "c", "d", "e", "f", "h", "i"]
+    check "escapes" (members.head? == some ("a", .str "q\"b\\s/\x08\x0c\n\r\té😀"))
+    let get (k : String) := List.lookup k members
+    check "booleans" ((get "b" == some (.bool true)) && (get "c" == some (.bool false)))
+    check "the rest is other" ((["d", "e", "f", "h", "i"].map get).all
+      (· == some Json.Value.other))
+  let refused : List (String × String) := [
+    ("", "empty"), ("[]", "not an object"), ("{", "unterminated"), ("{\"a\":1,}", "trailing comma"),
+    ("{\"a\":01}", "leading zero"), ("{\"a\":1.}", "no fraction digits"),
+    ("{\"a\":-}", "bare minus"),
+    ("{\"a\":1e}", "no exponent digits"), ("{\"a\":+1}", "plus sign"), ("{\"a\":.5}", "no integer"),
+    ("{\"a\":1}x", "trailing characters"), ("{\"a\":\"\\ud800\"}", "lone high surrogate"),
+    ("{\"a\":\"\\udc00\"}", "lone low surrogate"), ("{\"a\":\"\\x\"}", "unknown escape"),
+    ("{\"a\":\"\x01\"}", "raw control character"), ("{\"a\":tru}", "bad literal"),
+    ("{\"a\":1,\"a\":2}", "repeated key"), ("{\"a\":{\"b\":1,\"b\":2}}", "repeated nested key"),
+    ("{a:1}", "unquoted key"), ("{\"a\" 1}", "no colon"),
+    ("{\"a\":[1,]}", "trailing comma in array"),
+    ("{\"a\":" ++ String.ofList (List.replicate 9 '[') ++
+      String.ofList (List.replicate 9 ']') ++ "}",
+      "nesting nine deep")]
+  for (t, why) in refused do
+    check s!"refuse: {why}" ((Json.readObject t.toUTF8) matches Except.error _)
+  check "nesting eight deep is read"
+    ((Json.readObject ("{\"a\":" ++ String.ofList (List.replicate 8 '[') ++
+      String.ofList (List.replicate 8 ']') ++ "}").toUTF8) matches Except.ok _)
+  let long := "{\"a\":\"" ++ String.ofList (List.replicate 4096 'x') ++ "\"}"
+  check "refuse more than 4 KiB" ((Json.readObject long.toUTF8) matches Except.error _)
+  let t₀ ← IO.monoMsNow
+  let r := ClientData.parse
+    "{\"type\":\"webauthn.get\",\"challenge\":\"\",\"origin\":\"a\",\"x\":1e1000000000}".toUTF8
+  let t₁ ← IO.monoMsNow
+  check "a huge exponent is skipped" (r matches Except.ok _)
+  check "without evaluating it" (t₁ - t₀ < 100) s!"{t₁ - t₀} ms"
+  check "client data with a repeated key is refused"
+    ((ClientData.parse
+      "{\"type\":\"webauthn.get\",\"challenge\":\"\",\"origin\":\"a\",\"origin\":\"b\"}".toUTF8)
+      matches Except.error _)
+
+/-! ## Attestation certificates -/
+
+/-- A DER length. -/
+def derLength (n : Nat) : ByteArray :=
+  if n < 0x80 then ByteArray.mk #[n.toUInt8]
+  else
+    let body := Bytes.ofNatBE (if n < 256 then 1 else 2) n
+    ByteArray.mk #[(0x80 + body.size).toUInt8] ++ body
+
+/-- A DER tag-length-value. -/
+def tlv (tag : UInt8) (contents : ByteArray) : ByteArray :=
+  ByteArray.mk #[tag] ++ derLength contents.size ++ contents
+
+/-- A DER `SEQUENCE`. -/
+def derSeq (items : List ByteArray) : ByteArray := tlv 0x30 (Bytes.concat items)
+
+/-- The `ecdsa-with-SHA256` algorithm identifier. -/
+def ecdsaSha256 : ByteArray := derSeq [tlv 0x06 (hex "2a8648ce3d040302")]
+
+/-- A `Name` from attributes, one per relative distinguished name. -/
+def derName (attrs : List (ByteArray × UInt8 × String)) : ByteArray :=
+  derSeq (attrs.map fun (oid, tag, value) =>
+    tlv 0x31 (derSeq [tlv 0x06 oid, tlv tag value.toUTF8]))
+
+/-- The subject a `packed` attestation certificate must have. -/
+def goodSubject : List (ByteArray × UInt8 × String) :=
+  [(Der.oidCountry, 0x13, "AA"), (Der.oidOrganization, 0x0c, "pyle tests"),
+    (Der.oidOrganizationalUnit, 0x0c, "Authenticator Attestation"),
+    (Der.oidCommonName, 0x0c, "pyle test authenticator")]
+
+/-- The `SubjectPublicKeyInfo` of the P-256 test key. -/
+def p256Spki : ByteArray :=
+  let (x, y) := p256Coordinates p256Secret
+  derSeq [derSeq [tlv 0x06 Der.oidEcPublicKey, tlv 0x06 Der.oidPrime256v1],
+    tlv 0x03 (hex "0004" ++ x ++ y)]
+
+/-- The `SubjectPublicKeyInfo` of the Ed25519 test key. -/
+def ed25519Spki : ByteArray :=
+  derSeq [derSeq [tlv 0x06 (hex "2b6570")],
+    tlv 0x03 (hex "00" ++ (Ed25519.publicKeyOfSecret ed25519Secret).getD .empty)]
+
+/-- An extension; `critical` is the raw BOOLEAN contents, if written. -/
+def derExtension (oid : ByteArray) (critical : Option ByteArray) (value : ByteArray) :
+    ByteArray :=
+  derSeq ([tlv 0x06 oid] ++ (critical.map (tlv 0x01 ·)).toList ++ [tlv 0x04 value])
+
+/-- Basic constraints with the given raw `cA` BOOLEAN, or none. -/
+def basicConstraints (ca : Option ByteArray) : ByteArray :=
+  derExtension Der.oidBasicConstraints (some (hex "ff")) (derSeq (ca.map (tlv 0x01 ·)).toList)
+
+/-- The FIDO AAGUID extension. -/
+def aaguidExtension (aaguid : ByteArray) (critical : Bool := false) : ByteArray :=
+  derExtension Der.oidFidoAaguid (if critical then some (hex "ff") else none) (tlv 0x04 aaguid)
+
+/-- The AAGUID of the hand-built certificates. -/
+def testAaguid : ByteArray := hex "f00df00df00df00df00df00df00df00d"
+
+/-- What a hand-built certificate is made of. -/
+structure CertSpec where
+  /-- Whether to write the version (v3). -/
+  version : Bool := true
+  /-- The subject. -/
+  subject : List (ByteArray × UInt8 × String) := goodSubject
+  /-- The key. -/
+  spki : ByteArray := p256Spki
+  /-- The extensions. -/
+  extensions : List ByteArray := [basicConstraints none, aaguidExtension testAaguid]
+
+/-- Build a certificate.  Its own signature is zeros: attestation leaves that
+to chain validation. -/
+def CertSpec.build (c : CertSpec) : ByteArray :=
+  let tbs := derSeq ((if c.version then [tlv 0xa0 (tlv 0x02 (hex "02"))] else []) ++
+    [tlv 0x02 (hex "01"), ecdsaSha256, derName [(Der.oidCommonName, 0x0c, "pyle test CA")],
+      derSeq [tlv 0x17 "240101000000Z".toUTF8, tlv 0x17 "340101000000Z".toUTF8],
+      derName c.subject, c.spki] ++
+    (if c.extensions.isEmpty then [] else [tlv 0xa3 (derSeq c.extensions)]))
+  derSeq [tbs, ecdsaSha256, tlv 0x03 (hex "00" ++ ByteArray.mk (Array.replicate 8 0))]
+
+/-- The reason a certificate was refused, or `""`. -/
+def certReason (c : CertSpec) : String :=
+  match checkAttestationCertificate c.build testAaguid with
+  | .ok _ => ""
+  | .error e => e
+
+/-- Hand-built `packed` attestation certificates, one broken for each
+requirement of WebAuthn §8.2.1, and statements around them. -/
+def attestationCertTests : IO Unit := do
+  group "webauthn: packed attestation certificates"
+  let compressed := (P256.publicKeyOfSecret p256Secret).getD .empty
+  let keyOf (c : CertSpec) : String :=
+    match checkAttestationCertificate c.build testAaguid with
+    | .ok k => toHex k
+    | .error e => e
+  checkEq "a good leaf yields its compressed key" (keyOf {}) (toHex compressed)
+  checkEq "a leaf without the AAGUID extension is fine" (keyOf { extensions := [] })
+    (toHex compressed)
+  let without (oid : ByteArray) := goodSubject.filter (·.1 != oid)
+  let cases : List (String × CertSpec × String) := [
+    ("version 1", { version := false }, "not version 3"),
+    ("no OU", { subject := without Der.oidOrganizationalUnit }, "OU"),
+    ("another OU", { subject := (without Der.oidOrganizationalUnit) ++
+      [(Der.oidOrganizationalUnit, 0x0c, "Something Else")] }, "OU"),
+    ("no C", { subject := without Der.oidCountry }, "has no C"),
+    ("no O", { subject := without Der.oidOrganization }, "has no O"),
+    ("no CN", { subject := without Der.oidCommonName }, "has no CN"),
+    ("CA:TRUE", { extensions := [basicConstraints (some (hex "ff"))] }, "is a CA"),
+    ("a non-DER BOOLEAN in basic constraints",
+      { extensions := [basicConstraints (some (hex "01"))] },
+      "basic constraints do not parse"),
+    ("a critical AAGUID extension", { extensions := [aaguidExtension testAaguid true] },
+      "malformed"),
+    ("another AAGUID", { extensions := [aaguidExtension (hex "00112233445566778899aabbccddeeff")] },
+      "differs from authenticator data"),
+    ("a short AAGUID", { extensions := [aaguidExtension (hex "0011")] }, "malformed"),
+    ("an Ed25519 key", { spki := ed25519Spki }, "not a P-256 key")]
+  for (why, spec, reason) in cases do
+    let got := certReason spec
+    check s!"refuse a leaf with {why}" (mentions got reason) s!"reason: {got}"
+  -- whole statements around a good leaf
+  let authData := attestedAuthData (coseEs256 (p256Coordinates p256Secret).1
+    (p256Coordinates p256Secret).2) (aaguid := testAaguid)
+  let clientHash := Sha256.hash "client data".toUTF8
+  let sig := (P256.sign p256Secret (authData ++ clientHash)).getD .empty
+  let cred : AttestedCredential :=
+    { aaguid := testAaguid, credentialId := testCredentialId,
+      publicKey := { algorithm := .es256, bytes := compressed } }
+  let leaf := ({} : CertSpec).build
+  let statement (alg : Cbor) (extra : List (Cbor × Cbor) := []) (sig := sig) :=
+    Cbor.map ([(.text "alg", alg), (.text "sig", .bytes sig),
+      (.text "x5c", .array [.bytes leaf])] ++ extra)
+  let reason (r : Except String AttestationKind) : String :=
+    match r with
+    | .ok k => s!"ok: {kindName k}"
+    | .error e => e
+  checkEq "full attestation under a good leaf"
+    (reason (verifyAttestation "packed" (statement (.negative 6)) authData clientHash cred))
+    "ok: packed full (1 certificates)"
+  check "alg -8 with x5c is refused"
+    (mentions (reason (verifyAttestation "packed" (statement (.negative 7)) authData clientHash
+      cred)) "only ES256")
+  check "ecdaaKeyId is refused"
+    (mentions (reason (verifyAttestation "packed"
+      (statement (.negative 6) [(.text "ecdaaKeyId", .bytes (hex "00"))]) authData clientHash
+      cred)) "ECDAA")
+  check "a signature over other data is refused"
+    (mentions (reason (verifyAttestation "packed" (statement (.negative 6)) authData
+      (Sha256.hash "other".toUTF8) cred)) "does not verify under the leaf")
+  check "the AAGUID must match the authenticator data's"
+    (mentions (reason (verifyAttestation "packed" (statement (.negative 6)) authData clientHash
+      { cred with aaguid := hex "00000000000000000000000000000000" })) "differs")
+  check "an empty x5c is refused"
+    (mentions (reason (verifyAttestation "packed"
+      (Cbor.map [(.text "alg", .negative 6), (.text "sig", .bytes sig), (.text "x5c", .array [])])
+      authData clientHash cred)) "x5c is empty")
 
 /-- All the WebAuthn tests. -/
 def webAuthnTests : IO Unit := do
@@ -543,6 +835,9 @@ def webAuthnTests : IO Unit := do
   cborTests
   derTests
   vectorTests
+  boundsTests
+  jsonTests
+  attestationCertTests
   generatedTests
   registrationTests
 

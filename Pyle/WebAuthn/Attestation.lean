@@ -60,6 +60,11 @@ def checkAttestationCertificate (der : ByteArray) (aaguid : ByteArray) :
     | throw "attestation: leaf certificate subject does not parse"
   if units != [attestationOrganizationalUnit] then
     throw "attestation: leaf certificate subject OU is not \"Authenticator Attestation\""
+  for (oid, name) in [(Der.oidCountry, "C"), (Der.oidOrganization, "O"),
+      (Der.oidCommonName, "CN")] do
+    match cert.subjectAttribute oid with
+    | some (_ :: _) => pure ()
+    | _ => throw s!"attestation: leaf certificate subject has no {name}"
   match cert.isCa with
   | some false => pure ()
   | some true => throw "attestation: leaf certificate is a CA"

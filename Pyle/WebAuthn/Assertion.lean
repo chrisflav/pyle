@@ -86,8 +86,10 @@ structure VerifiedAssertion where private mk ::
 inductive AssertionError where
   /-- Check 1: the response names a different credential. -/
   | credentialMismatch
-  /-- Check 1: the credential is not one of `allowCredentials`. -/
+  /-- Check 1: the credential is not one of a non-empty `allowCredentials`. -/
   | credentialNotAllowed
+  /-- Check 2: the flow requires a user handle and there is none. -/
+  | userHandleMissing
   /-- Check 2: the user handle is not the credential owner's. -/
   | userHandleMismatch
   /-- Check 3: the client data does not parse. -/
@@ -126,12 +128,22 @@ def signedBytes (authenticatorData clientDataJSON : ByteArray) : ByteArray :=
   authenticatorData ++ Sha256.hash clientDataJSON
 
 /-- Run the checks of DESIGN §2.1 on an assertion for a stored credential and a
-pending challenge. -/
+pending challenge.
+
+`allowCredentials` is the list sent to the browser, if any; an empty list
+means the same as none, as it does to the browser (WebAuthn §5.5).  In the
+discoverable flow, where the user is identified by the credential alone, pass
+`requireUserHandle := true`: the browser must then return the user handle
+(WebAuthn §7.2 step 6). -/
 def verifyAssertion (rp : RelyingParty) (challenge : ByteArray)
     (allowCredentials : Option (List ByteArray)) (cred : StoredCredential)
-    (r : AssertionResponse) : Except AssertionError VerifiedAssertion :=
+    (r : AssertionResponse) (requireUserHandle : Bool := false) :
+    Except AssertionError VerifiedAssertion :=
   if r.credentialId ≠ cred.id then .error .credentialMismatch else
-  if ¬ (∀ l ∈ allowCredentials, r.credentialId ∈ l) then .error .credentialNotAllowed else
+  if ¬ (∀ l ∈ allowCredentials, l ≠ [] → r.credentialId ∈ l) then
+    .error .credentialNotAllowed else
+  if ¬ (requireUserHandle = true → r.userHandle.isSome = true) then
+    .error .userHandleMissing else
   if ¬ (∀ h ∈ r.userHandle, h = cred.userHandle) then .error .userHandleMismatch else
   match ClientData.parse r.clientDataJSON with
   | .error e => .error (.clientData e)
@@ -139,7 +151,8 @@ def verifyAssertion (rp : RelyingParty) (challenge : ByteArray)
   if cd.type ≠ "webauthn.get" then .error .wrongType else
   if cd.challenge ≠ Base64Url.encode challenge then .error .challengeMismatch else
   if cd.origin ∉ rp.origins then .error .originMismatch else
-  if ¬ (rp.allowCrossOrigin = true ∨ (cd.crossOrigin ≠ some true ∧ cd.topOrigin = none)) then
+  if ¬ ((cd.topOrigin = none → cd.crossOrigin ≠ some true) ∧
+      ∀ t ∈ cd.topOrigin, cd.crossOrigin = some true ∧ t ∈ rp.allowedTopOrigins) then
     .error .crossOrigin else
   match AuthenticatorData.parse r.authenticatorData with
   | .error e => .error (.authenticatorData e)
@@ -160,18 +173,23 @@ def verifyAssertion (rp : RelyingParty) (challenge : ByteArray)
 them, and `v` reports what they say. -/
 def AssertionChecks (rp : RelyingParty) (challenge : ByteArray)
     (allowCredentials : Option (List ByteArray)) (cred : StoredCredential)
-    (r : AssertionResponse) (v : VerifiedAssertion) : Prop :=
+    (r : AssertionResponse) (requireUserHandle : Bool) (v : VerifiedAssertion) : Prop :=
   ∃ cd ad, ClientData.parse r.clientDataJSON = .ok cd ∧
     AuthenticatorData.parse r.authenticatorData = .ok ad ∧
-    -- 1. the credential is the stored one, and among those allowed if a list was sent
-    (r.credentialId = cred.id ∧ ∀ l ∈ allowCredentials, r.credentialId ∈ l) ∧
-    -- 2. the user handle, when present, is the owner's
-    (∀ h ∈ r.userHandle, h = cred.userHandle) ∧
+    -- 1. the credential is the stored one, and among those allowed if a
+    --    non-empty list was sent
+    (r.credentialId = cred.id ∧ ∀ l ∈ allowCredentials, l ≠ [] → r.credentialId ∈ l) ∧
+    -- 2. the user handle is present if the flow requires it, and when present
+    --    is the owner's
+    ((requireUserHandle = true → r.userHandle.isSome = true) ∧
+      ∀ h ∈ r.userHandle, h = cred.userHandle) ∧
     -- 3. the client data is for `get`, with our challenge, from one of our origins
     (cd.type = "webauthn.get" ∧ cd.challenge = Base64Url.encode challenge ∧
       cd.origin ∈ rp.origins) ∧
-    -- 4. not from a cross-origin frame, unless the deployment allows framing
-    (rp.allowCrossOrigin = true ∨ (cd.crossOrigin ≠ some true ∧ cd.topOrigin = none)) ∧
+    -- 4. not from a cross-origin frame, unless the browser names the top-level
+    --    origin and the deployment allows framing by it
+    ((cd.topOrigin = none → cd.crossOrigin ≠ some true) ∧
+      ∀ t ∈ cd.topOrigin, cd.crossOrigin = some true ∧ t ∈ rp.allowedTopOrigins) ∧
     -- 5. the credential is scoped to our relying party id
     ad.rpIdHash = Sha256.hash rp.id.toUTF8 ∧
     -- 6. the user was present, and verified if the policy says so
@@ -202,13 +220,14 @@ theorem ok_of_ite_error {ε α : Type} {c : Prop} [Decidable c] {e : ε} {k : Ex
 assertions for which every check of §2.1 holds. -/
 theorem verifyAssertion_sound {rp : RelyingParty} {challenge : ByteArray}
     {allowCredentials : Option (List ByteArray)} {cred : StoredCredential}
-    {r : AssertionResponse} {v : VerifiedAssertion}
-    (h : verifyAssertion rp challenge allowCredentials cred r = .ok v) :
-    AssertionChecks rp challenge allowCredentials cred r v := by
+    {r : AssertionResponse} {requireUserHandle : Bool} {v : VerifiedAssertion}
+    (h : verifyAssertion rp challenge allowCredentials cred r requireUserHandle = .ok v) :
+    AssertionChecks rp challenge allowCredentials cred r requireUserHandle v := by
   rw [verifyAssertion] at h
   obtain ⟨c1, h⟩ := ok_of_ite_error h
   obtain ⟨c1', h⟩ := ok_of_ite_error h
   obtain ⟨c2, h⟩ := ok_of_ite_error h
+  obtain ⟨c2', h⟩ := ok_of_ite_error h
   cases hcd : ClientData.parse r.clientDataJSON with
   | error e => rw [hcd] at h; cases h
   | ok cd =>
@@ -230,8 +249,8 @@ theorem verifyAssertion_sound {rp : RelyingParty} {challenge : ByteArray}
   obtain ⟨c8, h⟩ := ok_of_ite_error h
   obtain ⟨c9, h⟩ := ok_of_ite_error h
   cases h
-  simp only [ne_eq, Decidable.not_not] at c1 c2 c3 c3' c3'' c4 c5 c6 c6' c7 c8 c9 c1'
-  exact ⟨cd, ad, hcd, had, ⟨c1, c1'⟩, c2, ⟨c3, c3', c3''⟩, c4, c5, ⟨c6, c6'⟩, c7, c8, c9,
+  simp only [ne_eq, Decidable.not_not] at c1 c2 c2' c3 c3' c3'' c4 c5 c6 c6' c7 c8 c9 c1'
+  exact ⟨cd, ad, hcd, had, ⟨c1, c1'⟩, ⟨c2, c2'⟩, ⟨c3, c3', c3''⟩, c4, c5, ⟨c6, c6'⟩, c7, c8, c9,
     rfl, rfl, rfl, rfl, rfl⟩
 
 end WebAuthn

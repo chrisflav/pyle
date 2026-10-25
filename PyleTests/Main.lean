@@ -3,6 +3,7 @@ import PyleTests.Store
 import PyleTests.Http
 import PyleTests.Session
 import PyleTests.Audit
+import PyleTests.Factor
 
 /-!
 # The test driver
@@ -20,4 +21,5 @@ def main : IO UInt32 := do
   httpTests
   sessionTests
   auditTests
+  factorTests
   report

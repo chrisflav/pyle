@@ -148,7 +148,7 @@ def credentialTests : IO Unit := withCtx fun ctx _ => do
   checkEq "a TOTP secret counts" (← s.authenticatorCount alice.id) 3
 
 /-- TOTP replay and lockout, and recovery codes. -/
-def factorTests : IO Unit := withCtx fun ctx _ => do
+def storedFactorTests : IO Unit := withCtx fun ctx _ => do
   group "store: totp and recovery codes"
   let s := ctx.store
   let u ← s.addUser "alice" [] 1
@@ -389,7 +389,7 @@ def storeTests : IO Unit := do
   schemaTests
   userTests
   credentialTests
-  factorTests
+  storedFactorTests
   challengeTests
   oidcTests
   deviceTests

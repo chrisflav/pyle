@@ -49,7 +49,7 @@ extern_lib PyleSys pkg := ffiStaticLib pkg "PyleSys"
 lean_lib Pyle
 
 lean_lib PyleTests where
-  globs := #[.andSubmodules `PyleTests]
+  globs := #[.submodules `PyleTests]
 
 /-- The server and its administration commands. -/
 @[default_target]

@@ -4,6 +4,7 @@ import Pyle.Session.Session
 import Pyle.SignIn.Routes
 import Pyle.Audit
 import Pyle.Sys
+import Pyle.Oidc.Routes
 
 /-!
 # The server
@@ -28,6 +29,7 @@ The endpoints so far:
 * `POST /logout` — ends the request's session, if any, and clears the cookie.
 * `SignIn.routes` — the sign-in, account and invitation pages and their
   endpoints (`Pyle.SignIn.Routes`).
+* the protocols of DESIGN.md §5, listed in `Pyle.Oidc.Routes`.
 -/
 
 namespace Pyle
@@ -62,7 +64,7 @@ def logout : Http.Handler := fun ctx r => do
 def routes : List Route := [
   .mk' .get "/healthz" healthz,
   .mk' .post "/logout" logout
-] ++ SignIn.routes
+] ++ SignIn.routes ++ Oidc.routes
 
 /-- Answer one request. -/
 def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r
@@ -144,7 +146,7 @@ def toReq (config : Config) (req : Request Body.Stream) (body : ByteArray) : Req
     | some a => peerAddress a.addr
     | none => ""
   let xff := forwardedFor headers
-  { method := req.line.method, path, query, headers, body,
+  { method := req.line.method, path, query, headers, body, peer,
     clientAddress := Http.clientAddress config.trustedProxies peer xff }
 
 instance : Handler Adapter where
@@ -183,6 +185,8 @@ def purge (ctx : Ctx) : IO Unit := do
     ctx.config.sessionAbsoluteSeconds
   discard <| ctx.store.purgeChallenges now
   discard <| ctx.store.purgeDeviceCodes now
+  discard <| ctx.store.purgeCodes now
+  discard <| ctx.store.purgeForwardAuthCodes now
 
 /-- Serve until the process is stopped. -/
 def run (config : Config) : IO Unit := do

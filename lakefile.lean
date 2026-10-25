@@ -14,9 +14,10 @@ package pyle where
 -- would make the statements about something else.
 
 -- The biscuit format and datalog, and the P-256 and Ed25519 verifiers.  On the
--- branch of chrisflav/lean-biscuit#1 until it merges.
+-- branch of chrisflav/lean-biscuit#2 (signing through an external signer) until it
+-- merges.
 require «lean-biscuit» from git
-  "https://github.com/chrisflav/lean-biscuit" @ "669c5c8961eb10dbc6b61e6567b3c4c0b01004bb"
+  "https://github.com/chrisflav/lean-biscuit" @ "a94832b43b212baf0566e418df22b2149ce55365"
 
 -- SHA-1, SHA-2 and HMAC.
 require «lean-crypto-hash» from git

@@ -214,8 +214,63 @@ def migration3 : Migration where
     "CREATE INDEX challenges_client ON challenges(client_address)"
   ]
 
+/-- What the protocols need beyond the first three migrations (DESIGN.md §5):
+
+* per client, the algorithm its ID tokens are signed with (`ES256` unless the
+  client was registered with `RS256`, OpenID Connect Registration's
+  `id_token_signed_response_alg`) and the URIs RP-initiated logout may return
+  to (`post_logout_redirect_uris`);
+* per authorization code, the session it was issued from, so that the
+  refresh-token family it begins can be tied to that session;
+* per refresh-token family, an absolute expiry that rotation never extends,
+  and the session it is tied to — `NULL` for a grant that included
+  `offline_access`.  Two triggers keep the tie: a session given a new
+  identifier (rotation, step-up) carries its families along, and a session
+  that ends, however it ends, revokes them;
+* the one-time codes forward authentication hands a protected host to set its
+  own cookie with (§5.3), each bound to the session it was issued from, the
+  host, the path to return to, and the hash of the state cookie of the browser
+  that asked.  A session's identifier changes when it is rotated, so the
+  session is named by its hash without a foreign key. -/
+def migration4 : Migration where
+  version := 4
+  description := "client signing algorithm and logout URIs; refresh families; forward-auth codes"
+  statements := [
+    "ALTER TABLE clients ADD COLUMN id_token_alg TEXT NOT NULL DEFAULT 'ES256'
+       CHECK (id_token_alg IN ('ES256', 'RS256'))",
+    "ALTER TABLE clients ADD COLUMN post_logout_redirect_uris TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE codes ADD COLUMN session_hash BLOB",
+    "CREATE TABLE refresh_families (
+       family BLOB PRIMARY KEY,
+       expires INTEGER NOT NULL,
+       session_hash BLOB
+     ) STRICT",
+    "CREATE INDEX refresh_families_session ON refresh_families(session_hash)",
+    "CREATE TRIGGER sessions_rotate_families AFTER UPDATE OF id_hash ON sessions
+       BEGIN
+         UPDATE refresh_families SET session_hash = NEW.id_hash
+           WHERE session_hash = OLD.id_hash;
+       END",
+    "CREATE TRIGGER sessions_end_families AFTER DELETE ON sessions
+       BEGIN
+         INSERT OR IGNORE INTO revoked_families (family, revoked)
+           SELECT family, CAST(strftime('%s', 'now') AS INTEGER) FROM refresh_families
+             WHERE session_hash = OLD.id_hash;
+         DELETE FROM refresh_tokens WHERE family IN
+           (SELECT family FROM refresh_families WHERE session_hash = OLD.id_hash);
+       END",
+    "CREATE TABLE forward_auth_codes (
+       code_hash BLOB PRIMARY KEY,
+       session_hash BLOB NOT NULL,
+       host TEXT NOT NULL,
+       path TEXT NOT NULL,
+       state_hash BLOB NOT NULL,
+       expires INTEGER NOT NULL
+     ) STRICT"
+  ]
+
 /-- Every migration, in order.  Append only. -/
-def migrations : List Migration := [migration1, migration2, migration3]
+def migrations : List Migration := [migration1, migration2, migration3, migration4]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

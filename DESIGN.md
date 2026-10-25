@@ -262,7 +262,7 @@ pyle signs a **third-party block** attesting `user("christian")` and the
 `amr`, and appends it to a kleis biscuit.  A kleis grant can then say
 
 ```
-check if user($u) trusting ed25519/<pyle public key>, ["christian"].contains($u);
+check if user($u), ["christian"].contains($u) trusting ed25519/<pyle public key>;
 ```
 
 which is the third-party-block question in kleis's §15, answered.  The flow for

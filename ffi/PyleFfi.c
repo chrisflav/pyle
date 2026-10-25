@@ -33,6 +33,7 @@
 #include <openssl/params.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
 
 /* ------------------------------------------------------------------ */
@@ -118,8 +119,22 @@ LEAN_EXPORT uint8_t pyle_ct_equal(b_lean_obj_arg a, b_lean_obj_arg b) {
  * them. */
 enum { PYLE_ES256 = 0, PYLE_EDDSA = 1, PYLE_RS256 = 2 };
 
-/* Does `k` belong to algorithm `alg`?  ES256 wants a P-256 key, EdDSA an
- * Ed25519 key and RS256 an RSA key (not RSA-PSS) of at least 2048 bits. */
+/* Is the private scalar `d` of the EC key `k` in the range `0 < d < n`, `n`
+ * being the group order?  PKCS#8 parsing does not check this itself, and a
+ * scalar outside it is not a key. */
+static int pyle_scalar_in_range(EVP_PKEY *k) {
+    BIGNUM *d = NULL, *n = NULL;
+    int ok = EVP_PKEY_get_bn_param(k, OSSL_PKEY_PARAM_PRIV_KEY, &d) &&
+        EVP_PKEY_get_bn_param(k, OSSL_PKEY_PARAM_EC_ORDER, &n) &&
+        !BN_is_zero(d) && !BN_is_negative(d) && BN_cmp(d, n) < 0;
+    BN_clear_free(d);
+    BN_free(n);
+    return ok;
+}
+
+/* Does `k` belong to algorithm `alg`?  ES256 wants a P-256 private key whose
+ * scalar is in range, EdDSA an Ed25519 key and RS256 an RSA key (not RSA-PSS)
+ * of at least 2048 bits. */
 static int pyle_key_matches(EVP_PKEY *k, uint8_t alg) {
     switch (alg) {
     case PYLE_ES256: {
@@ -127,7 +142,8 @@ static int pyle_key_matches(EVP_PKEY *k, uint8_t alg) {
         size_t len = 0;
         if (!EVP_PKEY_is_a(k, "EC")) return 0;
         if (!EVP_PKEY_get_group_name(k, group, sizeof(group), &len)) return 0;
-        return strcmp(group, "prime256v1") == 0 || strcmp(group, "P-256") == 0;
+        if (strcmp(group, "prime256v1") != 0 && strcmp(group, "P-256") != 0) return 0;
+        return pyle_scalar_in_range(k);
     }
     case PYLE_EDDSA:
         return EVP_PKEY_is_a(k, "ED25519");
@@ -465,22 +481,37 @@ static X509 *pyle_load_cert(b_lean_obj_arg der) {
     return c;
 }
 
+/* The longest chain pyle accepts, leaf and intermediates together.  WebAuthn
+ * attestation chains are two or three certificates long. */
+#define PYLE_MAX_CHAIN 5
+
 /* Verify the certificate chain `chain` (an `Array ByteArray` of DER
  * certificates, leaf first, the rest untrusted intermediates in any order)
  * against the trust anchors `roots`, at the current time or, if `at_time` is
- * set, at the Unix time `time`.  Every input is public: this is here because
- * X.509 path validation is not something to rewrite.  Returns an
- * `IO (Except String Unit)`. */
+ * set, at the Unix time `time`.
+ *
+ * Beyond OpenSSL's path validation (signatures, validity periods, basic
+ * constraints and path lengths, and keyCertSign on every issuer), this asks
+ * for security level 2 -- at least 112-bit keys and signatures, so RSA below
+ * 2048 bits and SHA-1 signatures fail -- refuses a leaf that is itself a CA,
+ * and refuses chains of more than PYLE_MAX_CHAIN certificates.  No purpose or
+ * extended key usage is required and revocation is not checked.
+ *
+ * Every input is public: this is here because X.509 path validation is not
+ * something to rewrite.  Returns an `IO (Except String Unit)`. */
 LEAN_EXPORT lean_obj_res pyle_x509_verify(b_lean_obj_arg chain, b_lean_obj_arg roots,
                                           uint8_t at_time, uint64_t time, lean_obj_arg w) {
     (void)w;
     size_t nchain = lean_array_size(chain), nroots = lean_array_size(roots);
     if (nchain == 0)
         return lean_io_result_mk_ok(pyle_except_error("the certificate chain is empty"));
+    if (nchain > PYLE_MAX_CHAIN)
+        return lean_io_result_mk_ok(pyle_except_error("the certificate chain is too long"));
     X509_STORE *store = X509_STORE_new();
     STACK_OF(X509) *untrusted = sk_X509_new_null();
     X509_STORE_CTX *ctx = X509_STORE_CTX_new();
     X509 *leaf = NULL;
+    X509_VERIFY_PARAM *param = NULL;
     const char *why = NULL;
     char reason[256];
     if (!store || !untrusted || !ctx) { why = "out of memory"; goto done; }
@@ -493,6 +524,7 @@ LEAN_EXPORT lean_obj_res pyle_x509_verify(b_lean_obj_arg chain, b_lean_obj_arg r
     }
     leaf = pyle_load_cert(lean_array_get_core(chain, 0));
     if (!leaf) { why = "the leaf certificate is not valid DER"; goto done; }
+    if (X509_check_ca(leaf) != 0) { why = "the leaf certificate is a CA"; goto done; }
     for (size_t i = 1; i < nchain; i++) {
         X509 *c = pyle_load_cert(lean_array_get_core(chain, i));
         if (!c || !sk_X509_push(untrusted, c)) {
@@ -505,7 +537,10 @@ LEAN_EXPORT lean_obj_res pyle_x509_verify(b_lean_obj_arg chain, b_lean_obj_arg r
         why = "the verification context could not be set up";
         goto done;
     }
-    if (at_time) X509_VERIFY_PARAM_set_time(X509_STORE_CTX_get0_param(ctx), (time_t)time);
+    param = X509_STORE_CTX_get0_param(ctx);
+    X509_VERIFY_PARAM_set_auth_level(param, 2);
+    X509_VERIFY_PARAM_set_depth(param, PYLE_MAX_CHAIN);
+    if (at_time) X509_VERIFY_PARAM_set_time(param, (time_t)time);
     if (X509_verify_cert(ctx) != 1) {
         snprintf(reason, sizeof(reason), "certificate chain rejected: %s",
                  X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx)));

@@ -18,8 +18,15 @@ as the PHC format prescribes.
 
 `verify` recomputes the hash with the parameters stored in the string, so a
 later change of `recommended` does not lock anyone out, and compares the result
-with the constant-time primitive.  It refuses parameters outside sane bounds,
-so a tampered database row cannot make one verification allocate gigabytes.
+with the constant-time primitive.  It refuses parameters outside `Params.sane`
+(at most 256 MiB, eight passes and eight lanes), so a tampered database row
+cannot make one verification allocate gigabytes.
+
+A password is hashed as the UTF-8 bytes it arrives as, without the RFC 8265
+normalisation, so the same password typed with differently composed accents
+would not match.  That is acceptable here because passwords are an optional
+factor next to passkeys, and a user who cannot sign in with one still has
+their authenticators and recovery codes.
 
 Checking a new password against a breached-password list is the caller's
 business, at the time it is set.
@@ -53,11 +60,14 @@ def saltLength : Nat := 16
 def tagLength : Nat := 32
 
 /-- Whether stored parameters are within the bounds `verify` is willing to
-compute with: at most 16 passes, 1 GiB and 16 lanes, and at least the 8 KiB
-per lane Argon2 needs. -/
+compute with: at most 8 passes, 2¹⁸ KiB (256 MiB) and 8 lanes, and at least
+the 8 KiB per lane Argon2 needs.  `recommended` is well inside them. -/
 def Params.sane (p : Params) : Bool :=
-  1 ≤ p.iterations && p.iterations ≤ 16 && 1 ≤ p.lanes && p.lanes ≤ 16 &&
-    8 * p.lanes ≤ p.memoryKiB && p.memoryKiB ≤ 2 ^ 20
+  1 ≤ p.iterations && p.iterations ≤ 8 && 1 ≤ p.lanes && p.lanes ≤ 8 &&
+    8 * p.lanes ≤ p.memoryKiB && p.memoryKiB ≤ 2 ^ 18
+
+/-- The recommended parameters are among the sane ones. -/
+theorem recommended_sane : recommended.sane = true := by decide
 
 /-- Standard base64 without padding, as the PHC string format uses it. -/
 def b64Encode (b : ByteArray) : String :=

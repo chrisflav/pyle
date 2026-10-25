@@ -30,6 +30,10 @@ private def base32Tests : IO Unit := do
   check "rejects an impossible length" (base32Decode "MZX").isNone
   check "rejects non-zero trailing bits" (base32Decode "MZ").isNone
   check "rejects padding to a wrong length" (base32Decode "MY=").isNone
+  check "rejects too much padding" (base32Decode "MY==============").isNone
+  check "rejects padding alone" (base32Decode "========").isNone
+  check "rejects too little padding" (base32Decode "MY==").isNone
+  check "rejects padding after a full block" (base32Decode "MZXW6YTB========").isNone
   let random ← Crypto.randomBytes 20
   checkEq "round trip" ((base32Decode (base32Encode random)).map (·.toList)) (some random.toList)
 
@@ -90,8 +94,16 @@ private def recoveryCodeTests : IO Unit := do
   check "another key differs"
     (!Crypto.ctEqual digest (RecoveryCode.digest (← Crypto.randomBytes 32) "ABCDE-FGHIJ"))
   checkEq "digest is HMAC-SHA256" digest.size 32
+  for (name, typed) in [("no-break space", "abcde\u00A0fghij"),
+      ("figure space", "abcde\u2007fghij"), ("narrow no-break space", "abcde\u202Ffghij"),
+      ("zero-width space", "abcde\u200Bfghij"), ("non-breaking hyphen", "abcde\u2011fghij"),
+      ("en dash", "abcde\u2013fghij"), ("tab", "abcde\tfghij")] do
+    check s!"{name} is a separator" (Crypto.ctEqual digest (RecoveryCode.digest key typed))
+  checkEq "0, 1 and 8 read as O, I and B" (RecoveryCode.normalize "1o0-b8x") "IOOBBX"
+  check "look-alike digits give the same digest"
+    (Crypto.ctEqual (RecoveryCode.digest key "ABOIB-FGHIJ") (RecoveryCode.digest key "AB018-FGH1J"))
   check "wrong length is not well formed" (!RecoveryCode.wellFormed "ABCDE-FGHI")
-  check "wrong alphabet is not well formed" (!RecoveryCode.wellFormed "ABCDE-FGHI1")
+  check "wrong alphabet is not well formed" (!RecoveryCode.wellFormed "ABCDE-FGHI9")
 
 /-- RFC 4648 §10 for the PHC base64, the reference implementation's Argon2id
 vectors through `verify`, and a fresh hash with the recommended parameters. -/
@@ -104,6 +116,13 @@ private def passwordTests : IO Unit := do
     checkEq s!"unbase64 {encoded.quote}" ((Password.b64Decode encoded).map String.fromUTF8!)
       (some plain)
   check "PHC base64 rejects padding" (Password.b64Decode "Zg==").isNone
+  check "bounds: recommended" Password.recommended.sane
+  check "bounds: the largest accepted" (Password.Params.sane ⟨8, 2 ^ 18, 8⟩)
+  check "bounds: 2¹⁸ + 1 KiB refused" !(Password.Params.sane ⟨3, 2 ^ 18 + 1, 4⟩)
+  check "bounds: nine passes refused" !(Password.Params.sane ⟨9, 65536, 4⟩)
+  check "bounds: nine lanes refused" !(Password.Params.sane ⟨3, 65536, 9⟩)
+  check "bounds: under 8 KiB per lane refused" !(Password.Params.sane ⟨3, 31, 4⟩)
+  check "bounds: the reference vectors" ([⟨2, 256, 1⟩, ⟨2, 256, 2⟩].all Password.Params.sane)
   try
     -- github.com/P-H-C/phc-winner-argon2, src/test.c, the Argon2id cases with
     -- 256 KiB of memory (the 64 MiB ones are left to the hash below).
@@ -128,6 +147,14 @@ private def passwordTests : IO Unit := do
     check "excessive memory refused without computing"
       !(← Password.verify
         "$argon2id$v=19$m=4194304,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"
+        "password")
+    check "nine passes refused without computing"
+      !(← Password.verify
+        "$argon2id$v=19$m=256,t=9,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"
+        "password")
+    check "nine lanes refused without computing"
+      !(← Password.verify
+        "$argon2id$v=19$m=256,t=2,p=9$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"
         "password")
     check "leading zeros refused"
       !(← Password.verify

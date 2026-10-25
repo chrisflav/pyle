@@ -8,7 +8,8 @@ typed from paper.
 
 The encoder pads to a multiple of eight characters, as RFC 4648 says; the
 decoder accepts input with or without that padding and in either case, since
-that is what people and authenticator apps produce.  It rejects everything
+that is what people and authenticator apps produce, but padding, when present,
+must be exactly what the encoder would have written.  It rejects everything
 else, including non-zero bits after the last whole byte, so every byte string
 has exactly one unpadded upper-case encoding that decodes to it.
 -/
@@ -29,6 +30,9 @@ def base32Value (c : Char) : Option Nat :=
   else if '2' ≤ c && c ≤ '7' then some (c.toNat - '2'.toNat + 26)
   else none
 
+/-- The number of `=` the encoder writes after `n` characters of data. -/
+def base32Padding (n : Nat) : Nat := (8 - n % 8) % 8
+
 /-- Base32 encoding (RFC 4648 §6), padded with `=` to a multiple of eight
 characters. -/
 def base32Encode (b : ByteArray) : String :=
@@ -46,16 +50,17 @@ def base32Encode (b : ByteArray) : String :=
     emit out acc bits 2
   let (out, acc, bits) := b.foldl step ("", 0, 0)
   let out := if bits > 0 then out.push (base32Char (acc * 2 ^ (5 - bits))) else out
-  out.pushn '=' ((8 - out.length % 8) % 8)
+  out.pushn '=' (base32Padding out.length)
 
-/-- Base32 decoding (RFC 4648 §6).  Padding is optional but may only appear at
-the end; upper and lower case are both accepted; anything else, a length no
-encoding has, or non-zero trailing bits make it fail. -/
+/-- Base32 decoding (RFC 4648 §6).  Padding is optional, but if present it must
+be at the end and exactly `base32Padding` long; upper and lower case are both
+accepted; anything else, a length no encoding has, or non-zero trailing bits
+make it fail. -/
 def base32Decode (s : String) : Option ByteArray := do
   let chars := s.toList
   let body := chars.reverse.dropWhile (· == '=') |>.reverse
   let padding := chars.length - body.length
-  if padding > 0 && chars.length % 8 != 0 then none
+  if padding > 0 && padding != base32Padding body.length then none
   if body.length % 8 ∉ [0, 2, 4, 5, 7] then none
   let (out, acc, bits) ← body.foldlM (init := (ByteArray.empty, 0, 0))
     fun ((out, acc, bits) : ByteArray × Nat × Nat) c => do

@@ -307,6 +307,13 @@ Comparisons of secret values (session ids, recovery-code MACs, TOTP codes) go
 through one FFI primitive as well; `lean-crypto-hash`'s no-early-exit
 comparison is honest that Lean cannot promise constant time.
 
+Three computations over secrets do run in Lean: HMAC-SHA1 for TOTP,
+HMAC-SHA256 for recovery codes, and HKDF over the root key.  In
+`lean-crypto-hash` these are fixed-schedule ARX and bitwise computations with
+no secret-dependent branches or table lookups, but Lean promises nothing about
+the timing of what it compiles them to, so this is a stated trade-off rather
+than a guarantee.
+
 ### 6.3 Keys
 
 A root key encrypts every secret column (TOTP secrets, signing keys) with

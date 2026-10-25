@@ -40,6 +40,11 @@ private def showBytes : Except String ByteArray → String
   | .ok b => toHex b
   | .error e => s!"error: {e}"
 
+/-- An optional result as text: the hexadecimal bytes, or `none`. -/
+private def showOption : Option ByteArray → String
+  | some b => toHex b
+  | none => "none"
+
 /-- Whether a result is an error. -/
 private def isError : Except String α → Bool
   | .ok _ => false
@@ -150,6 +155,64 @@ private def unrelatedRoot : ByteArray := hex <|
   "5d1de547a216d1239fbfa393754ec8f5c8811f29f58e70"
 
 
+/-- A leaf issued directly by `testRoot`, signed with SHA-256. -/
+private def directLeaf : ByteArray := hex <|
+  "308201863082012ba003020102020104300a06082a8648ce3d04030230193117301506035504030c" ++
+  "0e70796c65207465737420726f6f743020170d3235303130313030303030305a180f323132353031" ++
+  "30313030303030305a301b3119301706035504030c1070796c6520646972656374206c6561663059" ++
+  "301306072a8648ce3d020106082a8648ce3d03010703420004f7986d66164e8e9e045ace892dcc05" ++
+  "97724a8e3c2fbbbc2742c33ce0b1600974b517be0ef0dcefad85a451326e58e399426efdad869f31" ++
+  "c30111b75f0d629330a360305e300c0603551d130101ff04023000300e0603551d0f0101ff040403" ++
+  "020780301d0603551d0e04160414b59ccf82e9194e16076cbc1553ce6db5a9292df7301f0603551d" ++
+  "23041830168014b3353db18996e3148f314a80e6e8d61dc7d6c0f0300a06082a8648ce3d04030203" ++
+  "49003046022100e2f41bf58b975da6dcffcf379e11899b951a17c23e6fed07aa2af3df9e6b09ae02" ++
+  "210093acd324a785cae607e706e7fce8541af94ad5a0f48599d7c777d2fc71b9e10c"
+
+/-- The same leaf issued by `testRoot` but signed with SHA-1. -/
+private def sha1Leaf : ByteArray := hex <|
+  "308201843082012aa003020102020105300906072a8648ce3d040130193117301506035504030c0e" ++
+  "70796c65207465737420726f6f743020170d3235303130313030303030305a180f32313235303130" ++
+  "313030303030305a301b3119301706035504030c1070796c6520646972656374206c656166305930" ++
+  "1306072a8648ce3d020106082a8648ce3d03010703420004f7986d66164e8e9e045ace892dcc0597" ++
+  "724a8e3c2fbbbc2742c33ce0b1600974b517be0ef0dcefad85a451326e58e399426efdad869f31c3" ++
+  "0111b75f0d629330a360305e300c0603551d130101ff04023000300e0603551d0f0101ff04040302" ++
+  "0780301d0603551d0e04160414b59ccf82e9194e16076cbc1553ce6db5a9292df7301f0603551d23" ++
+  "041830168014b3353db18996e3148f314a80e6e8d61dc7d6c0f0300906072a8648ce3d0401034900" ++
+  "30460221009ad79bda37d0c801808a259774489f54705e10e0dfea6a981606bdf5ea9e1012022100" ++
+  "c1040fde6a02b01714eb90fac9126c31d0389cdf621fa96d36991ecfdcc2aa7b"
+
+/-- A root CA with a 1024-bit RSA key. -/
+private def weakRoot : ByteArray := hex <|
+  "3082022030820189a0030201020214459bafb8df550a016fd8674257feb620c5505026300d06092a" ++
+  "864886f70d01010b050030193117301506035504030c0e70796c65207765616b20726f6f74302017" ++
+  "0d3235303130313030303030305a180f32313235303130313030303030305a301931173015060355" ++
+  "04030c0e70796c65207765616b20726f6f7430819f300d06092a864886f70d010101050003818d00" ++
+  "30818902818100dca49dc1fc435c5de4254f105bf6823bc379e0dead8544041e4e367a1cc4e0a9d8" ++
+  "adac03e0cd51c9bd03ca09271c405b8d85ccb3c5d7ec3daf3939ef6e155b58d7994546cfe0d9eb4b" ++
+  "73ec2f4c402da89f57751edc18c0b4c195eabe4949364413d3dbb31c509e688d73d57517be7b1c4d" ++
+  "dec636edac7bd4a3246f48b53fb5fb0203010001a3633061301d0603551d0e04160414d92c4d75a9" ++
+  "58165678d0f6467018b2c330d917b9301f0603551d23041830168014d92c4d75a958165678d0f646" ++
+  "7018b2c330d917b9300f0603551d130101ff040530030101ff300e0603551d0f0101ff0404030201" ++
+  "06300d06092a864886f70d01010b050003818100052f97431d353080413c3180f9482f272ff175b9" ++
+  "301b3ea85bdb455ea0734fabe32e2305eb5fcfd723b54c96f14254f9607f05d7a1e7e9d57096df93" ++
+  "628613a5d73a8290551ced4a708a17d0b8aa88c94660461c1e86745b47f929ef038fa3686a4ee051" ++
+  "648845f5b35db2ea4d64ccd6fd09d6535a0cd83d5c2eb7de552ade7c"
+
+/-- A leaf issued by `weakRoot`, signed with SHA-256. -/
+private def weakLeaf : ByteArray := hex <|
+  "308201c53082012ea003020102020106300d06092a864886f70d01010b0500301931173015060355" ++
+  "04030c0e70796c65207765616b20726f6f743020170d3235303130313030303030305a180f323132" ++
+  "35303130313030303030305a301b3119301706035504030c1070796c6520646972656374206c6561" ++
+  "663059301306072a8648ce3d020106082a8648ce3d03010703420004f7986d66164e8e9e045ace89" ++
+  "2dcc0597724a8e3c2fbbbc2742c33ce0b1600974b517be0ef0dcefad85a451326e58e399426efdad" ++
+  "869f31c30111b75f0d629330a360305e300c0603551d130101ff04023000300e0603551d0f0101ff" ++
+  "040403020780301d0603551d0e04160414b59ccf82e9194e16076cbc1553ce6db5a9292df7301f06" ++
+  "03551d23041830168014d92c4d75a958165678d0f6467018b2c330d917b9300d06092a864886f70d" ++
+  "01010b050003818100c0030c6da441dc5ad6f1667260780d7ccb20f142955c05030a2fa5694e164a" ++
+  "4c776eee9461b5fab831ef25082907de2d7969b1d0fa6275cd64eb42a98d2ecd86dc8d472bedef44" ++
+  "35f005a40b7d1bbc46a38f2cd4162770991707685d207752a4a3d7410d2f0228f6f2d70a42a01ac4" ++
+  "6ae07bdf2633383454e144eb79bfaa9015"
+
 /-- Randomness and constant-time comparison. -/
 private def primitiveTests : IO Unit := do
   group "crypto: ffi"
@@ -185,23 +248,26 @@ private def hmacSha1Tests : IO Unit := do
 /-- RFC 5869 Appendix A, the three SHA-256 test cases. -/
 private def hkdfTests : IO Unit := do
   group "crypto: HKDF-SHA256 (RFC 5869)"
-  checkEq "A.1" (toHex (hkdfSha256 (repeatByte 0x0b 22) (hex "000102030405060708090a0b0c")
+  checkEq "A.1" (showOption (hkdfSha256 (repeatByte 0x0b 22) (hex "000102030405060708090a0b0c")
       (hex "f0f1f2f3f4f5f6f7f8f9") 42))
     ("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf" ++
       "34007208d5b887185865")
   let range (lo : Nat) : ByteArray := ⟨(Array.range 80).map fun i => UInt8.ofNat (lo + i)⟩
-  checkEq "A.2" (toHex (hkdfSha256 (range 0x00) (range 0x60) (range 0xb0) 82))
+  checkEq "A.2" (showOption (hkdfSha256 (range 0x00) (range 0x60) (range 0xb0) 82))
     ("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c" ++
       "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71" ++
       "cc30c58179ec3e87c14c01d5c1f3434f1d87")
-  checkEq "A.3" (toHex (hkdfSha256 (repeatByte 0x0b 22) .empty .empty 42))
+  checkEq "A.3" (showOption (hkdfSha256 (repeatByte 0x0b 22) .empty .empty 42))
     ("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d" ++
       "9d201395faa4b61a96c8")
   checkEq "A.1 extract" (toHex (hkdfSha256Extract (hex "000102030405060708090a0b0c")
       (repeatByte 0x0b 22)))
     "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-  checkEq "output is capped at 255 blocks" (hkdfSha256 (repeatByte 1 32) .empty .empty 9000).size
-    hkdfSha256MaxLength
+  checkEq "255 blocks is the most"
+    ((hkdfSha256 (repeatByte 1 32) .empty .empty hkdfSha256MaxLength).map (·.size))
+    (some hkdfSha256MaxLength)
+  check "one byte more is refused"
+    (hkdfSha256 (repeatByte 1 32) .empty .empty (hkdfSha256MaxLength + 1)).isNone
 
 /-- RFC 8439 §2.8.2, and the ways a sealed value must fail to open. -/
 private def aeadTests : IO Unit := do
@@ -286,11 +352,26 @@ private def keyTests : IO Unit := do
       check s!"{name}: deserialised key signs" (leanVerifies alg k.publicKey
         (ascii "again") (← k'.sign (ascii "again")))
     let other := match alg with | .es256 => SigningAlgorithm.edDsa | _ => .es256
-    check s!"{name}: refused as {other.joseName}" (isError (SigningKey.ofPkcs8 other k.pkcs8))
+    check s!"{name}: refused as {other.joseName}" (isError (SigningKey.deserialize
+      (⟨#[other.code]⟩ ++ k.serialize.extract 1 k.serialize.size)))
   check "empty serialised key" (isError (SigningKey.deserialize .empty))
   check "unknown algorithm code" (isError (SigningKey.deserialize (hex "07")))
   check "garbage" (isError (SigningKey.deserialize (hex "00300100")))
   check "short seed" (isError (SigningKey.ofEd25519Seed (repeatByte 1 31)))
+  let order := LeanBiscuit.Bytes.ofNatBE 32 LeanBiscuit.P256.n
+  let orderMinusOne := LeanBiscuit.Bytes.ofNatBE 32 (LeanBiscuit.P256.n - 1)
+  check "P-256 scalar 0 refused" (isError (SigningKey.ofP256Scalar (repeatByte 0 32)))
+  check "P-256 scalar n refused" (isError (SigningKey.ofP256Scalar order))
+  check "P-256 scalar n - 1 accepted" (!isError (SigningKey.ofP256Scalar orderMinusOne))
+  -- The same PKCS#8 header `ofP256Scalar` uses, so that the FFI's range check
+  -- is what refuses these.
+  let p256Header := hex ("3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420")
+  check "serialised P-256 scalar n refused"
+    (isError (SigningKey.deserialize (hex "00" ++ p256Header ++ order)))
+  check "serialised P-256 scalar 0 refused"
+    (isError (SigningKey.deserialize (hex "00" ++ p256Header ++ repeatByte 0 32)))
+  check "serialised P-256 scalar n - 1 accepted"
+    (!isError (SigningKey.deserialize (hex "00" ++ p256Header ++ orderMinusOne)))
 
 /-- RFC 9106 §5.3, and the vectors of the reference implementation, which
 `PyleTests.Factor` checks through `Password.verify`. -/
@@ -323,6 +404,18 @@ private def x509Tests : IO Unit := do
   check "empty chain" (isError (← verifyChain [] [testRoot]))
   check "not DER" (isError (← verifyChain [hex "3000", testIntermediate] [testRoot]))
   check "trailing bytes" (isError (← verifyChain [testLeaf.push 0, testIntermediate] [testRoot]))
+  checkEq "a direct leaf with SHA-256" (showBytes (← verifyChain [directLeaf] [testRoot]))
+    (toHex directLeaf)
+  check "a SHA-1 signature" (isError (← verifyChain [sha1Leaf] [testRoot]))
+  check "a 1024-bit RSA root" (isError (← verifyChain [weakLeaf] [weakRoot]))
+  check "a root as leaf" (isError (← verifyChain [testRoot] [testRoot]))
+  check "an intermediate as leaf" (isError (← verifyChain [testIntermediate] [testRoot]))
+  check "six certificates" (isError (← verifyChain
+    [testLeaf, testIntermediate, testIntermediate, testIntermediate, testIntermediate,
+      testIntermediate] [testRoot]))
+  checkEq "five certificates" (showBytes (← verifyChain
+    [testLeaf, testIntermediate, testIntermediate, testIntermediate, testIntermediate]
+    [testRoot])) (toHex testLeaf)
 
 /-- The payload of RFC 7515's examples, with its CR LF line breaks. -/
 private def rfc7515Payload : String :=

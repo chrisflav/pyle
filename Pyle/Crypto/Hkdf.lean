@@ -23,10 +23,11 @@ def hkdfSha256Extract (salt ikm : ByteArray) : ByteArray :=
   LeanBiscuit.Hmac.sha256 salt ikm
 
 /-- HKDF-Expand: `T(1) ‖ T(2) ‖ …` truncated to `length` bytes, where
-`T(i) = HMAC(prk, T(i-1) ‖ info ‖ i)` and `T(0)` is empty.  At most
-`hkdfSha256MaxLength` bytes are produced: the block counter is a single byte. -/
-def hkdfSha256Expand (prk info : ByteArray) (length : Nat) : ByteArray :=
-  let length := min length hkdfSha256MaxLength
+`T(i) = HMAC(prk, T(i-1) ‖ info ‖ i)` and `T(0)` is empty.  RFC 5869 §2.3 allows
+at most `hkdfSha256MaxLength` bytes, since the block counter is a single byte;
+a longer request gives `none`. -/
+def hkdfSha256Expand (prk info : ByteArray) (length : Nat) : Option ByteArray :=
+  if length > hkdfSha256MaxLength then none else
   let blocks := (length + 31) / 32
   let rec go (i : Nat) (fuel : Nat) (prev acc : ByteArray) : ByteArray :=
     match fuel with
@@ -34,12 +35,12 @@ def hkdfSha256Expand (prk info : ByteArray) (length : Nat) : ByteArray :=
     | fuel + 1 =>
       let t := LeanBiscuit.Hmac.sha256 prk (prev ++ info ++ ⟨#[UInt8.ofNat i]⟩)
       go (i + 1) fuel t (acc ++ t)
-  (go 1 blocks .empty .empty).extract 0 length
+  some ((go 1 blocks .empty .empty).extract 0 length)
 
 /-- HKDF with SHA-256 (RFC 5869): extract a pseudorandom key from `ikm` and
-`salt`, then expand it with `info` to `length` bytes, capped at
-`hkdfSha256MaxLength`. -/
-def hkdfSha256 (ikm salt info : ByteArray) (length : Nat) : ByteArray :=
+`salt`, then expand it with `info` to `length` bytes; `none` if `length`
+exceeds `hkdfSha256MaxLength`. -/
+def hkdfSha256 (ikm salt info : ByteArray) (length : Nat) : Option ByteArray :=
   hkdfSha256Expand (hkdfSha256Extract salt ikm) info length
 
 end Crypto

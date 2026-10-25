@@ -15,8 +15,12 @@ code is a lookup of its digest rather than a comparison against each stored
 value.  Marking a code spent is the store's business: it must be a single
 atomic delete of that digest.
 
-Normalisation forgives what people do when typing a code from paper: lower
-case, and spaces or hyphens anywhere.
+Normalisation forgives what people do when typing a code from paper or
+pasting it from a document: lower case, spaces and hyphens anywhere (including
+the Unicode ones word processors substitute), and the digits 0, 1 and 8 for the
+letters O, I and B they resemble.  RFC 4648's base32 alphabet has none of
+those digits, so reading them as letters can never turn one valid code into
+another.
 -/
 
 namespace Pyle
@@ -35,10 +39,29 @@ def ofRandom (bytes : ByteArray) : String :=
   let chars := bytes.toList.take length |>.map fun b => base32Char (b.toNat % 32)
   String.ofList (chars.take 5) ++ "-" ++ String.ofList (chars.drop 5)
 
-/-- The canonical form of a code as typed: separators (`-`, spaces and other
-whitespace) removed and letters in upper case. -/
+/-- Whether a character is a separator someone might type or paste inside a
+code: ASCII whitespace and hyphen-minus, the Unicode spaces (no-break, figure,
+narrow no-break, the U+2000 block, ideographic), the zero-width space and
+byte-order mark, and the Unicode hyphens, dashes and minus sign. -/
+def isSeparator (c : Char) : Bool :=
+  c.isWhitespace || c == '-' ||
+    [0x00A0, 0x00AD, 0x1680, 0x200B, 0x200C, 0x200D, 0x2060, 0x202F, 0x205F, 0x2212, 0x3000,
+      0xFEFF].contains c.toNat ||
+    (0x2000 ≤ c.toNat && c.toNat ≤ 0x200A) || (0x2010 ≤ c.toNat && c.toNat ≤ 0x2015)
+
+/-- A character as typed, read as the base32 character it is meant to be:
+upper case, with `0`, `1` and `8` read as `O`, `I` and `B`. -/
+def canonicalChar (c : Char) : Char :=
+  match c.toUpper with
+  | '0' => 'O'
+  | '1' => 'I'
+  | '8' => 'B'
+  | c => c
+
+/-- The canonical form of a code as typed: separators removed, letters in
+upper case, and the digits that look like base32 letters read as them. -/
 def normalize (code : String) : String :=
-  String.ofList (code.toList.filter (fun c => c != '-' && !c.isWhitespace) |>.map Char.toUpper)
+  String.ofList (code.toList.filter (!isSeparator ·) |>.map canonicalChar)
 
 /-- Whether a string, once normalised, has the shape of a recovery code. -/
 def wellFormed (code : String) : Bool :=

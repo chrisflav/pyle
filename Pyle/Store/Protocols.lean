@@ -202,46 +202,104 @@ def Store.familyExpiry (s : Store) (tokenHash : SecretHash) : IO (Option Nat) :=
 
 /-! ## Device codes, by client -/
 
+/-- A device authorization as a poll reads it. -/
+structure DeviceRow where
+  /-- The `status` column: `pending`, `approved` or `denied`. -/
+  status : String
+  /-- The client it was issued to. -/
+  clientId : String
+  /-- The scope asked for. -/
+  scope : String
+  /-- Who approved it, once approved. -/
+  user : Option UserId
+  /-- The approving session's `amr`. -/
+  amr : List String
+  /-- The approving session's `auth_time`. -/
+  authTime : Option Nat
+  /-- The minimum seconds between polls. -/
+  interval : Nat
+  /-- When it was last polled. -/
+  lastPoll : Nat
+  /-- When it stops being accepted. -/
+  expires : Nat
+
+/-- What a poll is to do to the store. -/
+inductive DeviceDecision where
+  /-- Delete the authorization and answer with its outcome. -/
+  | collect (outcome : DevicePoll)
+  /-- Record the poll, grow the interval by five seconds and answer
+  `slow_down`. -/
+  | slowDown
+  /-- Record the poll and answer `authorization_pending`. -/
+  | pending
+  /-- Change nothing: the code is unknown or has expired. -/
+  | expired
+  /-- Change nothing: the code was issued to another client. -/
+  | otherClient
+
+/-- Decide a poll with a device code on behalf of `clientId` at `now`, given
+the code's row, if there is one (RFC 8628 §3.5).  A code issued to another
+client is refused without being touched, whatever its state.  Of this
+client's codes, an expired one is `expired`; a decided one is collected — an
+approval with the approving user and `auth_time` recorded as approved, any
+other decision as denied; and a pending one asks to slow down if polled sooner
+than `interval` after the previous poll. -/
+def deviceDecision (row : Option DeviceRow) (clientId : String) (now : Nat) :
+    DeviceDecision :=
+  match row with
+  | none => .expired
+  | some r =>
+    if r.clientId ≠ clientId then .otherClient
+    else if ¬ now < r.expires then .expired
+    else match r.status, r.user, r.authTime with
+      | "approved", some user, some authTime =>
+        .collect (.approved r.clientId r.scope user r.amr authTime)
+      | "approved", _, _ => .collect .denied
+      | "denied", _, _ => .collect .denied
+      | "pending", _, _ => if r.lastPoll + r.interval > now then .slowDown else .pending
+      | _, _, _ => .expired
+
 /-- Poll with a device code on behalf of `clientId` (RFC 8628 §3.5), as
 `Store.pollDeviceCode` does, with two differences: only a code issued to
 `clientId` is touched, so a poll by another client changes and destroys
 nothing; and polling too fast grows the code's interval by five seconds, as
 §3.5 asks of `slow_down`.  `none` when the code exists but belongs to another
-client. -/
+client.
+
+One `BEGIN IMMEDIATE` transaction reads the row, lets `deviceDecision`
+decide, and carries the decision out: a collected authorization is deleted in
+the same transaction, so a device code yields tokens at most once. -/
 def Store.pollDeviceCodeFor (s : Store) (deviceCodeHash : SecretHash) (clientId : String)
     (now : Nat) : IO (Option DevicePoll) := s.atomically fun c => do
-  let decided ← queryOne c
-    "DELETE FROM device_codes \
-      WHERE device_code_hash = ? AND client_id = ? AND status IN ('approved', 'denied') \
-      AND expires > ? \
-      RETURNING status, client_id, scope, user_id, amr, auth_time"
-    #[deviceCodeHash, clientId, now] fun st =>
-      return (← colText st 0, ← colText st 1, ← colText st 2, ← colOpt colInt st 3,
-        ← colList st 4, ← colOpt colNat st 5)
-  match decided with
-  | some ("approved", cid, scope, some user, amr, some authTime) =>
-    return some (.approved cid scope ⟨user⟩ amr authTime)
-  | some _ => return some .denied
-  | none =>
-    let pending ← queryOne c
-      "SELECT interval, last_poll FROM device_codes \
-        WHERE device_code_hash = ? AND client_id = ? AND status = 'pending' AND expires > ?"
-      #[deviceCodeHash, clientId, now] fun st => return (← colNat st 0, ← colNat st 1)
-    match pending with
-    | some (interval, lastPoll) =>
-      if lastPoll + interval > now then
-        discard <| exec c
-          "UPDATE device_codes SET last_poll = ?, interval = interval + 5 \
-            WHERE device_code_hash = ?" #[now, deviceCodeHash]
-        return some .slowDown
-      discard <| exec c "UPDATE device_codes SET last_poll = ? WHERE device_code_hash = ?"
-        #[now, deviceCodeHash]
-      return some .pending
-    | none =>
-      let other ← queryOne c
-        "SELECT 1 FROM device_codes WHERE device_code_hash = ? AND client_id != ?"
-        #[deviceCodeHash, clientId] (colInt · 0)
-      return if other.isSome then none else some .expired
+  let row ← queryOne c
+    "SELECT status, client_id, scope, user_id, amr, auth_time, interval, last_poll, expires \
+      FROM device_codes WHERE device_code_hash = ?"
+    #[deviceCodeHash] fun st => do
+      return {
+        status := ← colText st 0
+        clientId := ← colText st 1
+        scope := ← colText st 2
+        user := (← colOpt colInt st 3).map (⟨·⟩)
+        amr := ← colList st 4
+        authTime := ← colOpt colNat st 5
+        interval := ← colNat st 6
+        lastPoll := ← colNat st 7
+        expires := ← colNat st 8 : DeviceRow }
+  match deviceDecision row clientId now with
+  | .collect outcome =>
+    discard <| exec c "DELETE FROM device_codes WHERE device_code_hash = ?" #[deviceCodeHash]
+    return some outcome
+  | .slowDown =>
+    discard <| exec c
+      "UPDATE device_codes SET last_poll = ?, interval = interval + 5 \
+        WHERE device_code_hash = ?" #[now, deviceCodeHash]
+    return some .slowDown
+  | .pending =>
+    discard <| exec c "UPDATE device_codes SET last_poll = ? WHERE device_code_hash = ?"
+      #[now, deviceCodeHash]
+    return some .pending
+  | .expired => return some .expired
+  | .otherClient => return none
 
 end Store
 end Pyle

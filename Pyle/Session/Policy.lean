@@ -317,8 +317,7 @@ def checkAssertion (ctx : Ctx) (purpose : ChallengePurpose) (r : WebAuthn.Assert
   let some ch ← ctx.store.consumeChallenge challenge purpose now
     | return .error .unknownChallenge
   let some cred ← ctx.store.findCredential r.credentialId | return .error .unknownCredential
-  if let some u := ch.user then
-    if u != cred.user then return .error .wrongUser
+  unless ch.admits cred.user do return .error .wrongUser
   let some user ← ctx.store.findUser cred.user | return .error .unknownCredential
   if user.disabled then return .error .disabled
   let allow ← match ch.user with

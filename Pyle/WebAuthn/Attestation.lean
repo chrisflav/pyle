@@ -116,5 +116,21 @@ def verifyAttestation (fmt : String) (attStmt : Cbor) (authData clientDataHash :
     | some _ => throw "attestation: x5c is not an array"
   | other => throw s!"attestation: unsupported format {other}"
 
+/-- An attestation statement is accepted only in one of the two formats pyle
+knows, `none` and `packed`. -/
+theorem verifyAttestation_format {fmt : String} {attStmt : Cbor}
+    {authData clientDataHash : ByteArray} {cred : AttestedCredential} {k : AttestationKind}
+    (h : verifyAttestation fmt attStmt authData clientDataHash cred = .ok k) :
+    fmt = "none" ∨ fmt = "packed" := by
+  unfold verifyAttestation at h
+  cases attStmt with
+  | map entries =>
+    dsimp only at h
+    split at h
+    · exact .inl rfl
+    · exact .inr rfl
+    · cases h
+  | _ => cases h
+
 end WebAuthn
 end Pyle

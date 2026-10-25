@@ -1,0 +1,10 @@
+# Only what the Dockerfile copies: above all not .lake, which holds gigabytes of
+# build output the image rebuilds from source anyway.
+*
+!lean-toolchain
+!lakefile.lean
+!lake-manifest.json
+!Pyle.lean
+!Main.lean
+!Pyle
+!ffi

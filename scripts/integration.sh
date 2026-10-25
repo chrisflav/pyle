@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# End to end: a real `pyle serve` on a free port, driven over HTTP.
+#
+# Everything happens in a temporary directory, over plain HTTP on localhost --
+# which pyle accepts as an issuer for development -- so the test needs no
+# certificate and touches nothing of the invoking user's.  The administrative
+# steps are the real commands; the browser, the passkey, the OpenID Connect
+# clients, the device and the reverse proxy are scripts/e2e.py, which uses the
+# Python standard library only.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK="$(mktemp -d)"
+PYLE="$ROOT/.lake/build/bin/pyle"
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
+check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
+
+cleanup() {
+  [ -n "${PYLE_PID:-}" ] && kill "$PYLE_PID" 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
+
+echo "== build"
+(cd "$ROOT" && lake build pyle) > "$WORK/build.log" 2>&1
+check $? "lake build pyle" "$(tail -20 "$WORK/build.log")"
+[ -x "$PYLE" ] || { echo "no pyle binary at $PYLE"; exit 1; }
+
+PORT="$(free_port)"
+ISSUER="http://localhost:$PORT"
+FA_HOST="app.localhost"
+FA_SECRET="forward-auth-secret-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+REDIRECT="http://127.0.0.1:9/callback"
+BYE="http://127.0.0.1:9/bye"
+export PYLE_CONFIG="$WORK/pyle.json"
+
+# ---------------------------------------------------------------- config
+cat > "$PYLE_CONFIG" <<EOF
+{
+  "issuer": "$ISSUER",
+  "rpId": "localhost",
+  "origins": ["$ISSUER"],
+  "port": $PORT,
+  "database": "data/pyle.db",
+  "rootKeyFile": "data/root.key",
+  "trustedProxies": ["127.0.0.1"],
+  "devicePollSeconds": 1,
+  "forwardAuthSecret": "$FA_SECRET",
+  "forwardAuthHosts": {
+    "$FA_HOST": "deny if path(\$p), \$p.starts_with(\"/admin\");\nallow if group(\"admin\");"
+  }
+}
+EOF
+
+echo
+echo "== first run"
+"$PYLE" init > "$WORK/init.log" 2>&1
+check $? "pyle init" "$(cat "$WORK/init.log")"
+MODE="$(stat -c '%a' "$WORK/data/root.key" 2>/dev/null)"
+[ "$MODE" = "600" ]; check $? "the root key is mode 0600" "got $MODE"
+SIZE="$(stat -c '%s' "$WORK/data/root.key" 2>/dev/null)"
+[ "$SIZE" = "32" ]; check $? "and 32 bytes" "got $SIZE"
+"$PYLE" init > "$WORK/init2.log" 2>&1
+[ $? -ne 0 ]; check $? "a second init does not replace it" "$(cat "$WORK/init2.log")"
+MODE="$(stat -c '%a' "$WORK/data/pyle.db" 2>/dev/null)"
+[ "$MODE" = "600" ]; check $? "the database is mode 0600" "got $MODE"
+
+"$PYLE" keys rotate > "$WORK/rotate.log" 2>&1
+check $? "pyle keys rotate" "$(cat "$WORK/rotate.log")"
+"$PYLE" keys list > "$WORK/keys.log" 2>&1
+for use in es256 rs256 biscuit; do
+  grep -q "^$use	current" "$WORK/keys.log"
+  check $? "a current $use key" "$(cat "$WORK/keys.log")"
+done
+
+INVITE="$("$PYLE" invite alice --group admin --ttl 1h 2>"$WORK/invite.err")"
+check $? "pyle invite alice --group admin" "$(cat "$WORK/invite.err")"
+case "$INVITE" in "$ISSUER/invite/"*) ok "the link is on the issuer";; *) bad "the link is on the issuer" "$INVITE";; esac
+
+"$PYLE" client add app --name App --redirect "$REDIRECT" --post-logout "$BYE" \
+  > "$WORK/client.log" 2>&1
+check $? "pyle client add app" "$(cat "$WORK/client.log")"
+SECRET="$(tail -1 "$WORK/client.log")"
+[ -n "$SECRET" ] && ! grep -qF -- "$SECRET" "$WORK/data/pyle.db"
+check $? "the secret is printed and only its hash kept"
+"$PYLE" client add tv --public --name TV --redirect "http://127.0.0.1/cb" > "$WORK/tv.log" 2>&1
+check $? "pyle client add tv --public" "$(cat "$WORK/tv.log")"
+"$PYLE" client list | grep -q "^app	confidential	ES256"
+check $? "pyle client list" "$("$PYLE" client list)"
+
+# ---------------------------------------------------------------- the server
+"$PYLE" serve > "$WORK/pyle.log" 2>&1 &
+PYLE_PID=$!
+for _ in $(seq 100); do
+  curl -s -o /dev/null "http://127.0.0.1:$PORT/healthz" && break
+  sleep 0.1
+done
+
+echo
+echo "== the server"
+OUT="$(curl -s "http://127.0.0.1:$PORT/healthz")"
+[ "$OUT" = '{"status":"ok"}' ]; check $? "/healthz answers" "$OUT"
+grep -q "listening on 127.0.0.1:$PORT as $ISSUER" "$WORK/pyle.log"
+check $? "pyle serve says where it listens" "$(cat "$WORK/pyle.log")"
+HDRS="$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/healthz")"
+echo "$HDRS" | grep -qi "^content-security-policy: .*frame-ancestors 'none'"
+check $? "every reply carries the CSP" "$HDRS"
+echo "$HDRS" | grep -qi "^referrer-policy: no-referrer"
+check $? "and Referrer-Policy" "$HDRS"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/nothing-here")"
+[ "$CODE" = "404" ]; check $? "an unknown path is 404" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: http://evil.example" \
+  "http://127.0.0.1:$PORT/logout")"
+[ "$CODE" = "403" ]; check $? "a cross-origin POST is refused" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $ISSUER" \
+  -H 'Content-Type: application/json' --data-binary @<(head -c 100000 /dev/zero | tr '\0' a) \
+  "http://127.0.0.1:$PORT/signin/webauthn/begin")"
+[ "$CODE" = "413" ]; check $? "an oversized body is refused" "got $CODE"
+
+python3 -I "$ROOT/scripts/e2e.py" --port "$PORT" --issuer "$ISSUER" --invite "$INVITE" \
+  --user alice --client app --secret="$SECRET" --redirect "$REDIRECT" --post-logout "$BYE" \
+  --public-client tv --fa-host "$FA_HOST" --fa-secret="$FA_SECRET" --counts "$WORK/counts"
+if [ -f "$WORK/counts" ]; then
+  read -r P F < "$WORK/counts"
+  PASS=$((PASS+P)); FAIL=$((FAIL+F))
+else
+  bad "scripts/e2e.py reported its counts"
+fi
+
+echo
+echo "== afterwards"
+"$PYLE" user list | grep -q "^alice	groups: admin	authenticators: 1"
+check $? "pyle user list shows alice and her passkey" "$("$PYLE" user list)"
+kill -0 "$PYLE_PID" 2>/dev/null
+check $? "the server is still running"
+grep "pyle: connection" "$WORK/pyle.log" | grep -qv "Entity too large"
+[ $? -ne 0 ]; check $? "and logged no connection failures" "$(grep 'pyle: connection' "$WORK/pyle.log" | head -5)"
+OUT="$("$PYLE" audit verify 2>&1)"
+check $? "pyle audit verify" "$OUT"
+echo "$OUT" | grep -q "form an unbroken chain"
+check $? "the audit log is an unbroken chain" "$OUT"
+grep -qF -- "$SECRET" "$WORK/data/pyle.db"
+[ $? -ne 0 ]; check $? "the database never contains the client secret"
+
+echo
+if [ "$FAIL" -eq 0 ]; then
+  echo "$PASS checks passed"
+  exit 0
+else
+  echo "$PASS passed, $FAIL FAILED"
+  echo "--- pyle log ---"; tail -30 "$WORK/pyle.log"
+  exit 1
+fi

@@ -19,3 +19,8 @@ jobs:
       - uses: leanprover/lean-action@v1
         with:
           test: true
+
+      # The built `pyle` against real HTTP: scripts/integration.sh drives it
+      # with curl and a standard-library Python client.
+      - name: Integration test
+        run: ./scripts/integration.sh

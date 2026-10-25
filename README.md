@@ -302,3 +302,162 @@ Optional, with their defaults: `accessTokenSeconds` (3600), `idTokenSeconds`
 `devicePollSeconds` (5), `attestationSeconds` (300), `forwardAuthHosts` (none),
 `forwardAuthCookieSeconds` (eight hours) and `forwardAuthSecret` (none; at
 least 16 characters).
+
+## Deployment
+
+pyle speaks plain HTTP on the loopback and expects a reverse proxy in front
+that terminates TLS.  With Caddy, for pyle at `auth.example.org` and a
+service it protects at `wiki.example.org`, and this `pyle.json`:
+
+```json
+{
+  "issuer": "https://auth.example.org",
+  "rpId": "auth.example.org",
+  "origins": ["https://auth.example.org"],
+  "database": "/var/lib/pyle/pyle.db",
+  "rootKeyFile": "/var/lib/pyle/root.key",
+  "trustedProxies": ["127.0.0.1"],
+  "forwardAuthSecret": "<32 random characters>",
+  "forwardAuthHosts": {
+    "wiki.example.org": "allow if group(\"staff\");"
+  }
+}
+```
+
+```
+auth.example.org {
+  # The proxy check is for the proxy alone.  /forward-auth/grant, where the
+  # browser goes to sign in, stays public: the matcher is the exact path.
+  respond /forward-auth 404
+  reverse_proxy 127.0.0.1:8420
+}
+
+wiki.example.org {
+  # Every request, /.pyle/forward-auth?code=… included, is asked about first.
+  # That one pyle answers itself, with a 302 that sets the host's cookie,
+  # and Caddy hands the 302 to the browser: there is nothing to route.
+  forward_auth 127.0.0.1:8420 {
+    uri /forward-auth
+    header_up X-Pyle-Forward-Auth "<the forwardAuthSecret>"
+    copy_headers Remote-User Remote-Groups
+  }
+  reverse_proxy 127.0.0.1:3000
+}
+```
+
+`trustedProxies` names Caddy's address as pyle sees it: the loopback here, the
+proxy's container address under Docker.  Caddy sends `X-Forwarded-For`,
+`-Host`, `-Uri`, `-Method` and `-Proto` on its own, and pyle believes them
+from that address only.  `/.pyle/forward-auth` must not be stripped or
+answered by the service: keep any `handle` or `rewrite` of the service's
+below `forward_auth`.  A service whose API is called with its own bearer
+tokens can let those requests past, so that only browsers are sent to sign
+in:
+
+```
+  @browser not header Authorization *
+  forward_auth @browser 127.0.0.1:8420 { … }
+```
+
+### First run
+
+```sh
+pyle init                          # the root key (mode 0600) and the database
+pyle keys rotate                   # announce the first ES256, RS256 and biscuit keys…
+pyle keys rotate                   # …and make them current
+pyle invite alice --group admin    # open the link it prints, on a device with a passkey
+pyle client add wiki --name Wiki --redirect https://wiki.example.org/oauth/callback \
+  --post-logout https://wiki.example.org/
+```
+
+The keys are made on first use if this is skipped; rotating twice up front
+only means the first clients find a `next` key in `/jwks` already.  `client
+add` prints the secret once.  Then have alice add a second passkey or a
+security key from `/account`, so that losing a phone does not lock her out.
+
+### Docker
+
+`docker/Dockerfile` builds an image with `pyle` alone, published as
+`ghcr.io/chrisflav/pyle` (`latest` from master, and each commit's full sha).
+It runs as uid 991, reads `PYLE_CONFIG=/pyle/config/pyle.json`, and keeps its
+state in the volume `/pyle/data`; the health check asks `/healthz` on port
+8420.  The configuration must say `"host": "0.0.0.0"` and name the state by
+absolute path:
+
+```sh
+docker volume create pyle-data
+docker run --rm -v pyle-data:/pyle/data -v "$PWD/config:/pyle/config:ro" \
+  ghcr.io/chrisflav/pyle init
+docker run -d --name pyle -p 127.0.0.1:8420:8420 \
+  -v pyle-data:/pyle/data -v "$PWD/config:/pyle/config:ro" ghcr.io/chrisflav/pyle
+docker exec pyle pyle invite alice --group admin
+```
+
+### Backups
+
+Two files are the whole state: the database and the root key.  The database
+holds the accounts, credentials, sessions, clients and the audit log; the
+root key encrypts the signing keys and the TOTP secrets inside it, so a database
+without its root key is useless, and a root key beside its database is
+everything.  Copy the root key once, offline, when it is made: it never
+changes.  Back the database up with SQLite rather than by copying the file
+under a running server:
+
+```sh
+sqlite3 /var/lib/pyle/pyle.db ".backup '/backup/pyle-$(date +%F).db'"
+```
+
+To restore, put both back, check them with `pyle audit verify`, and start
+the server.  A restored database brings back sessions and refresh tokens as
+they were; rotate the keys (`pyle keys rotate`, twice) if the backup may have
+been read by someone else.
+
+### Verifying access tokens in a service
+
+A service in Lean copies `Pyle/Token/Verify.lean`, which needs only
+`lean-biscuit`, fetches the root keys from `GET /biscuit/keys` (every one
+listed, `next` and `previous` too) and refreshes them now and then, for
+instance when a token fails under all of them:
+
+```lean
+open LeanBiscuit in
+def roots (keys : List String) : List PublicKey :=  -- each "ed25519/<hex>"
+  keys.filterMap fun k => do
+    let hex ← k.dropPrefix? "ed25519/"
+    return { algorithm := .ed25519, key := ← Bytes.ofHex? hex.toString }
+
+match Pyle.Token.verify (roots published) "wiki" now bearer "allow if group(\"staff\");" with
+| .ok who => -- who.user, who.groups, who.amr, who.client, who.authTime, who.scopes
+| .error why => -- 401
+```
+
+The service name is the client id the token was issued to: the token checks
+that it is used there or at pyle and nowhere else.  A service in another
+language verifies it with any biscuit library, giving the facts
+`time(<now>)` and `audience("<client id>")` and reading `user`, `group` and
+`amr` from the authority block only.  One that would rather not verify
+anything asks `GET /userinfo` with the token.
+
+### diff-reviewer, taxis and orchestra
+
+- **diff-reviewer** signs its web front-end in with `DIFF_REVIEWER_PASSWORD`
+  and its scripts and agents with bearer tokens.  Put its host behind
+  `forward_auth` with the `@browser` matcher above and a policy such as
+  `allow if group("admin");`, so that `/api/v1/` (the API token, orchestra)
+  and `/api/agent/v1/` (the agent token, injected by kleis) keep working
+  unchanged, and add Caddy's address to `--trusted-proxy` as before.  Until
+  it reads `Remote-User`, the password remains the second door.
+- **taxis** signs in through Google and GitHub OAuth and has no generic
+  OpenID Connect provider yet.  The client to register for one is
+  `pyle client add taxis --name Taxis --redirect https://taxis.example.org/auth/pyle/callback --post-logout https://taxis.example.org/`;
+  the `groups` claim then maps onto `auth.readGroups`.  Meanwhile a private instance (`auth.private`)
+  can sit behind `forward_auth` with the `@browser` matcher, which leaves bot
+  tokens on `/api` alone.
+- **orchestra**'s dashboard (`orchestrad dashboard`) takes a password as a
+  cookie or as `Authorization: Bearer`, which the `orchestra` CLI and
+  orchestra-app send.  Behind `forward_auth` with the `@browser` matcher, the
+  page and its SSE streams need a pyle session and the clients go past as
+  before; a policy of `allow if group("admin");` keeps it to administrators.
+  An SSE stream that reconnects after the forward-auth cookie has expired
+  (`forwardAuthCookieSeconds`, eight hours) is sent to sign in instead; the
+  page must then be reloaded.

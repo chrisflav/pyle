@@ -22,7 +22,12 @@ code while the user approves it in a browser.
 * **Polling** answers `authorization_pending` until a decision, `slow_down` to
   a client polling faster than the interval, `access_denied` once denied,
   `expired_token` once expired; an approved code yields tokens once, with a
-  refresh token whose family is begun there.
+  refresh token whose family is begun there.  `slow_down` also adds five
+  seconds to the code's interval (§3.5), and only the client a code was issued
+  to can poll it: another client's poll changes nothing.  The family is not
+  tied to the browser session that approved it — the device is another device,
+  and signing out of the browser should not sign it out — but it expires like
+  every family.
 -/
 
 namespace Pyle
@@ -105,7 +110,9 @@ def poll (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × S
   let some deviceCode := lookupOnce form "device_code"
     | return oauthError "invalid_request" "device_code is required"
   let now ← ctx.clock
-  match ← ctx.store.pollDeviceCode (tokenHash deviceCode) now with
+  let some outcome ← ctx.store.pollDeviceCodeFor (tokenHash deviceCode) client.id now
+    | return oauthError "invalid_grant" "the device code was issued to another client"
+  match outcome with
   | .pending => return oauthError "authorization_pending" "the user has not decided yet"
   | .slowDown => return oauthError "slow_down" "poll less often"
   | .denied => return oauthError "access_denied" "the user refused"
@@ -117,7 +124,7 @@ def poll (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × S
       | return oauthError "invalid_grant" "the account is gone"
     if user.disabled then return oauthError "invalid_grant" "the account is disabled"
     let family ← Crypto.randomBytes 32
-    let refresh ← startRefresh ctx family client user scope amr authTime
+    let refresh ← startRefresh ctx family client user scope amr authTime none
     tokenResponse ctx r client user scope amr authTime none (some refresh) "device_code"
 
 /-- The form a user types a code into. -/
@@ -135,7 +142,7 @@ def needSignin (r : Req) : Reply :=
 
 /-- The session of a request, if it is phishing-resistant. -/
 def strongSession (ctx : Ctx) (r : Req) : IO (Option Session) := do
-  return (← Session.current ctx r).filter (acrOf ·.amr == "phr")
+  return (← Session.current ctx r).filter (Policy.acr ·.amr == "phr")
 
 /-- Look a typed user code up, through the rate limiter for the signed-in
 user and the client's address: a wrong code counts as a failure. -/

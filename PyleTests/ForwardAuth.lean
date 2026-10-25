@@ -13,6 +13,7 @@ datalog policy; and ending the session ends it everywhere.
 namespace PyleTests
 
 open Pyle Pyle.Http Pyle.Oidc
+open Pyle.ForwardAuth (stateHash)
 
 /-- The proxy's address in these tests. -/
 def proxy : String := "10.0.0.1"
@@ -35,19 +36,31 @@ def askProxy (ctx : Ctx) (host uri : String) (method : String := "GET")
       (if cookies.isEmpty then [] else [("Cookie", "; ".intercalate cookies)]))
     (clientAddress := peer) with peer }
 
+/-- Every cookie a reply sets, as `name=value`. -/
+def setCookies (r : Reply) : List String :=
+  r.headers.filterMap fun (k, v) =>
+    if k.toLower == "set-cookie" then (v.splitOn ";").head? else none
+
+/-- The cookie of a name a reply sets, as `name=value`. -/
+def cookieSet (r : Reply) (name : String) : Option String :=
+  (setCookies r).find? (·.startsWith (name ++ "="))
+
 /-- The protected host's cookie a reply sets, as `name=value`. -/
-def forwardCookie (r : Reply) : Option String :=
-  (r.header "set-cookie").bind fun c => (c.splitOn ";").head?
+def forwardCookie (r : Reply) : Option String := cookieSet r ForwardAuth.cookieName
+
+/-- Begin at a protected host, go through the grant with a pyle session, and
+come back to the callback with the state cookie; the callback's reply. -/
+def throughGrant (ctx : Ctx) (session host uri : String) (keepState : Bool := true) :
+    IO Reply := do
+  let r ← askProxy ctx host uri
+  let state := (cookieSet r ForwardAuth.stateCookieName).getD ""
+  let g ← get ctx (location r |>.drop issuer.length |>.toString) session
+  let rest := ((location g).splitOn host)[1]?.getD ""
+  askProxy ctx host rest (cookies := if keepState then [state] else [])
 
 /-- Sign in through the grant and the callback; the host's cookie. -/
-def forwardSignIn (ctx : Ctx) (session host uri : String) : IO (Option String) := do
-  let r ← askProxy ctx host uri
-  let some rd := param (location r) "rd" | return none
-  let g ← get ctx s!"/forward-auth/grant?{queryString [("rd", rd)]}" session
-  let callback := location g
-  let some rest := (callback.splitOn host)[1]? | return none
-  let c ← askProxy ctx host rest
-  return forwardCookie c
+def forwardSignIn (ctx : Ctx) (session host uri : String) : IO (Option String) :=
+  return forwardCookie (← throughGrant ctx session host uri)
 
 /-- The policy as a function. -/
 def policyTests : IO Unit := do
@@ -71,6 +84,20 @@ def policyTests : IO Unit := do
   let tampered := "A" ++ (c.drop 1).toString
   check "and not altered" (ForwardAuth.decodeCookie key tampered "app.example.org" 99).isNone
 
+/-- Path normalisation and safe redirects, as functions. -/
+def pathTests : IO Unit := do
+  group "forward-auth: paths"
+  for raw in ["//admin/x", "/./admin/x", "/x/../admin/x", "/%61dmin/x", "/%2E/admin/x",
+      "/x/%2e%2e/admin/x", "///admin//x"] do
+    checkEq s!"{raw} is /admin/x" (ForwardAuth.normalisePath raw) (some "/admin/x")
+  checkEq "a trailing slash is kept" (ForwardAuth.normalisePath "/a/b/") (some "/a/b/")
+  checkEq "other escapes are kept" (ForwardAuth.normalisePath "/a%20b") (some "/a%20b")
+  for raw in ["/a%2Fb", "/a%2fb", "/a%5Cb", "/a\\b", "/a\x01b", "a/b", "/a..b", "/a%00b"] do
+    checkEq s!"{raw} is refused" (ForwardAuth.normalisePath raw) none
+  check "/x?q is safe to go back to" (ForwardAuth.safeRedirectPath "/x?q=1")
+  for p in ["//evil.example/phish", "/\\evil", "x", "/a\\b", "/a\nb"] do
+    check s!"{p} is not" (!ForwardAuth.safeRedirectPath p)
+
 /-- The flow through the proxy. -/
 def proxyTests : IO Unit := withCtx fun ctx0 _ => do
   group "forward-auth: through the proxy"
@@ -83,31 +110,67 @@ def proxyTests : IO Unit := withCtx fun ctx0 _ => do
   checkEq "a host not listed is refused" r.status.toCode 403
   let r ← askProxy ctx "app.example.org" "/reports?q=1"
   checkEq "no cookie: 302" r.status.toCode 302
-  checkEq "to the grant, with the original URL" (location r)
-    s!"{issuer}/forward-auth/grant?{queryString [("rd", "https://app.example.org/reports?q=1")]}"
+  check "to the grant, with the original URL"
+    ((location r).startsWith (s!"{issuer}/forward-auth/grant?" ++
+      queryString [("rd", "https://app.example.org/reports?q=1")] ++ "&state="))
+  check "setting a state cookie on the host" (cookieSet r ForwardAuth.stateCookieName).isSome
   let r ← askProxy ctx "app.example.org" "/api" "POST"
   checkEq "a POST without a cookie: 401" r.status.toCode 401
+  let r ← askProxy ctx "app.example.org" "/a%2Fb"
+  checkEq "a path pyle cannot read the same way as the service: 400" r.status.toCode 400
   -- The grant, on pyle's host.
-  let rd := "https://app.example.org/reports?q=1"
-  let g ← get ctx s!"/forward-auth/grant?{queryString [("rd", rd)]}"
+  let aliceSession ← signedIn ctx alice
+  let begun ← askProxy ctx "app.example.org" "/reports?q=1"
+  let grantPath := (location begun).drop issuer.length |>.toString
+  let g ← get ctx grantPath
   check "the grant without a session sends to sign in" ((location g).startsWith "/signin?")
-  let aliceSession ← signIn ctx alice.id ["hwk", "user"]
-  let g ← get ctx s!"/forward-auth/grant?{queryString [("rd", rd)]}" aliceSession
+  let g ← get ctx grantPath aliceSession
   check "with one, to the host's callback with a code"
     ((location g).startsWith "https://app.example.org/.pyle/forward-auth?code=")
-  let g2 ← get ctx s!"/forward-auth/grant?{queryString [("rd", "https://evil.example/")]}"
+  let st := stateHash "x"
+  let grantFor (rd : String) := get ctx
+    s!"/forward-auth/grant?{queryString [("rd", rd), ("state", st)]}" aliceSession
+  checkEq "the grant refuses a host it does not protect"
+    (← grantFor "https://evil.example/").status.toCode 403
+  for rd in ["https://app.example.org//evil.example/phish", "https://app.example.org/\\evil",
+      "https://app.example.org/a\\b"] do
+    let g ← grantFor rd
+    checkEq s!"the grant refuses {rd}" g.status.toCode 400
+    check "without redirecting" (g.header "location").isNone
+  let g ← get ctx s!"/forward-auth/grant?{queryString [("rd", "https://app.example.org/")]}"
     aliceSession
-  checkEq "the grant refuses a host it does not protect" g2.status.toCode 403
-  -- The callback, through the proxy.
+  checkEq "the grant refuses a request without state" g.status.toCode 400
+  -- Opening a double-slash path directly goes round on the same host.
+  let r ← askProxy ctx "app.example.org" "//evil.example/phish"
+  check "a double-slash path stays on the host"
+    ((param (location r) "rd") == some "https://app.example.org/evil.example/phish")
+  -- The callback, through the proxy, with the state cookie.
+  let state := (cookieSet begun ForwardAuth.stateCookieName).getD ""
   let callback := ((location g).splitOn "app.example.org")[1]?.getD ""
-  let c ← askProxy ctx "app.example.org" callback
+  let g ← get ctx grantPath aliceSession
+  let callback := if callback.isEmpty then ((location g).splitOn "app.example.org")[1]?.getD ""
+    else callback
+  let c ← askProxy ctx "app.example.org" callback (cookies := [state])
   checkEq "the callback answers 302" c.status.toCode 302
   checkEq "back to where the user was going" (location c) "/reports?q=1"
   let some cookie := forwardCookie c | check "and sets the host's cookie" false
   check "and sets the host's cookie" (cookie.startsWith "__Host-pyle-forward=")
+  check "and clears the state" (cookieSet c ForwardAuth.stateCookieName ==
+    some s!"{ForwardAuth.stateCookieName}=")
   check "HttpOnly" (((c.header "set-cookie").getD "").splitOn "; " |>.contains "HttpOnly")
-  let again ← askProxy ctx "app.example.org" callback
-  check "a code is good once" (again.header "set-cookie").isNone
+  let again ← askProxy ctx "app.example.org" callback (cookies := [state])
+  check "a code is good once" (forwardCookie again).isNone
+  -- Login CSRF: a code redeemed in a browser that did not begin the sign-in.
+  let planted ← throughGrant ctx aliceSession "app.example.org" "/" (keepState := false)
+  checkEq "a code without the state cookie is refused" planted.status.toCode 403
+  check "and sets nothing" (forwardCookie planted).isNone
+  let r ← askProxy ctx "app.example.org" "/"
+  let wrong := (cookieSet r ForwardAuth.stateCookieName).getD ""
+  let g ← get ctx ((location (← askProxy ctx "app.example.org" "/")).drop issuer.length
+    |>.toString) aliceSession
+  let c ← askProxy ctx "app.example.org" (((location g).splitOn "app.example.org")[1]?.getD "")
+    (cookies := [wrong])
+  checkEq "nor with another sign-in's state" c.status.toCode 403
   -- With the cookie.
   let r ← askProxy ctx "app.example.org" "/reports" (cookies := [cookie])
   checkEq "alice is let through" r.status.toCode 200
@@ -117,8 +180,9 @@ def proxyTests : IO Unit := withCtx fun ctx0 _ => do
   let r ← askProxy ctx "wiki.example.org" "/" (cookies := [cookie])
   checkEq "the cookie is for its host only" r.status.toCode 302
   -- Bob is signed in but not allowed on app.
-  let bobSession ← signIn ctx bob.id ["hwk", "user"]
-  let g ← get ctx s!"/forward-auth/grant?{queryString [("rd", rd)]}" bobSession
+  let bobSession ← signedIn ctx bob
+  let r ← askProxy ctx "app.example.org" "/reports?q=1"
+  let g ← get ctx ((location r).drop issuer.length |>.toString) bobSession
   checkEq "bob is refused at the grant" g.status.toCode 403
   let key := ForwardAuth.macKey ctx.rootKey
   let bobHash := Store.SecretHash.of ((Session.decodeId bobSession).getD .empty)
@@ -126,21 +190,42 @@ def proxyTests : IO Unit := withCtx fun ctx0 _ => do
     ForwardAuth.encodeCookie key bobHash "app.example.org" ((← ctx.clock) + 100)
   let r ← askProxy ctx "app.example.org" "/" (cookies := [forged])
   checkEq "and by the policy even with a cookie" r.status.toCode 403
-  -- The wiki: a path rule.
+  -- The wiki: a path rule, and every way around it.
   let some wiki ← forwardSignIn ctx bobSession "wiki.example.org" "/page"
     | check "bob signs in to the wiki" false
   checkEq "bob may read the wiki" (← askProxy ctx "wiki.example.org" "/page" (cookies := [wiki])
     ).status.toCode 200
-  checkEq "but not its admin pages" (← askProxy ctx "wiki.example.org" "/admin/x"
-    (cookies := [wiki])).status.toCode 403
+  for uri in ["/admin/x", "//admin/x", "/./admin/x", "/x/../admin/x", "/%61dmin/x",
+      "/%2e/admin/x"] do
+    checkEq s!"but not {uri}" (← askProxy ctx "wiki.example.org" uri (cookies := [wiki])
+      ).status.toCode 403
+  checkEq "and an escaped slash is not read at all" (← askProxy ctx "wiki.example.org"
+    "/admin%2Fx" (cookies := [wiki])).status.toCode 400
   -- Signing out of pyle ends it everywhere.
   discard <| ctx.store.endSession (.of ((Session.decodeId aliceSession).getD .empty))
   let r ← askProxy ctx "app.example.org" "/reports" (cookies := [cookie])
   checkEq "once the session ends, the cookie is worthless" r.status.toCode 302
 
+/-- The shared secret between the proxy and pyle. -/
+def secretTests : IO Unit := withCtx fun ctx0 _ => do
+  group "forward-auth: shared secret"
+  let ctx := withForwardAuth ctx0
+  let ctx := { ctx with
+    config := { ctx.config with forwardAuthSecret := some "s3cret-s3cret-s3cret" } }
+  let ask (headers : List (String × String)) := Server.route ctx { Req.mk' .get "/forward-auth"
+    ([("X-Forwarded-Host", "app.example.org"), ("X-Forwarded-Uri", "/")] ++ headers)
+    (clientAddress := proxy) with peer := proxy }
+  checkEq "without the secret, refused" (← ask []).status.toCode 403
+  checkEq "with a wrong one, refused" (← ask [("X-Pyle-Forward-Auth", "s3cret-s3cret-s3creT")]
+    ).status.toCode 403
+  checkEq "with it, answered" (← ask [("X-Pyle-Forward-Auth", "s3cret-s3cret-s3cret")]
+    ).status.toCode 302
+
 /-- Forward authentication. -/
 def forwardAuthTests : IO Unit := do
   policyTests
+  pathTests
   proxyTests
+  secretTests
 
 end PyleTests

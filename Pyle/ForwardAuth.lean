@@ -128,6 +128,82 @@ def splitUrl (url : String) : Option (String × String × String) := do
 /-- The path of a path with query. -/
 def pathOnly (pathAndQuery : String) : String := (pathAndQuery.splitOn "?").headD pathAndQuery
 
+/-- Whether a character is a control character. -/
+def isControl (c : Char) : Bool := c.toNat < 0x20 || c.toNat == 0x7f
+
+/-- Whether a percent-decoded byte is an RFC 3986 unreserved character. -/
+def unreservedByte (b : Nat) : Bool :=
+  let c := Char.ofNat b
+  c.isAlphanum || c == '-' || c == '.' || c == '_' || c == '~'
+
+/-- Decode the percent-escapes of unreserved characters (`%61` → `a`, `%2E` →
+`.`), which RFC 3986 §6.2.2.2 says mean the same as the characters; every other
+escape is kept as it is. -/
+def decodeUnreserved (s : String) : String :=
+  let hex (c : Char) : Option Nat :=
+    if c.isDigit then some (c.toNat - '0'.toNat)
+    else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+    else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
+    else none
+  let rec go : List Char → String → String
+    | '%' :: a :: b :: rest, out =>
+      match hex a, hex b with
+      | some x, some y =>
+        if unreservedByte (16 * x + y) then go rest (out.push (Char.ofNat (16 * x + y)))
+        else go rest (out.push '%' |>.push a |>.push b)
+      | _, _ => go (a :: b :: rest) (out.push '%')
+    | c :: rest, out => go rest (out.push c)
+    | [], out => out
+  go s.toList ""
+
+/-- Whether a string escapes a control character (`%00`–`%1F`, `%7F`). -/
+def escapesControl (s : String) : Bool :=
+  let control : List Char → Bool
+    | a :: b :: _ =>
+      let a := a.toLower
+      let b := b.toLower
+      ((a == '0' || a == '1') && (b.isDigit || ('a' ≤ b && b ≤ 'f'))) || (a == '7' && b == 'f')
+    | _ => false
+  let rec go : List Char → Bool
+    | c :: rest => (c == '%' && control rest) || go rest
+    | [] => false
+  go s.toList
+
+/-- Remove `.` and `..` segments (RFC 3986 §5.2.4); a `..` at the root stays at
+the root. -/
+def removeDotSegments (segs : List String) : List String :=
+  segs.foldl (init := []) fun acc seg =>
+    if seg == "." then acc else if seg == ".." then acc.dropLast else acc ++ [seg]
+
+/-- The path a policy sees: the path of the request with unreserved escapes
+decoded, empty segments (`//`) collapsed and dot segments removed, so that
+`//admin`, `/./admin`, `/x/../admin` and `/%61dmin` are all `/admin`.  `none`
+for a path that must not be evaluated at all: one not starting with `/`, or
+containing a backslash, a control character, an escaped `/` or `\`
+(`%2F`, `%5C`), an escaped control character, or — after all that — `..`
+anywhere, since each of these is read differently by different servers. -/
+def normalisePath (raw : String) : Option String := do
+  guard (raw.startsWith "/" && !raw.any (fun c => c == '\\' || isControl c))
+  let lower := raw.toLower
+  guard ((lower.splitOn "%2f").length == 1 && (lower.splitOn "%5c").length == 1)
+  guard (!escapesControl raw)
+  let decoded := decodeUnreserved raw
+  guard (!decoded.any isControl)
+  let segs := (decoded.splitOn "/").filter (!·.isEmpty)
+  let kept := removeDotSegments segs
+  let trailing := decoded.endsWith "/" && !kept.isEmpty
+  let path := "/" ++ "/".intercalate kept ++ (if trailing then "/" else "")
+  guard ((path.splitOn "..").length == 1)
+  return path
+
+/-- Whether a path and query is safe to send a browser to on the same host:
+exactly one `/` first, not followed by another `/` or a `\` (which browsers
+read as a different host), and no backslash or control character anywhere. -/
+def safeRedirectPath (pathAndQuery : String) : Bool :=
+  let rest := (pathAndQuery.drop 1).toString
+  pathAndQuery.startsWith "/" && !rest.startsWith "/" && !rest.startsWith "\\" &&
+    !pathAndQuery.any (fun c => c == '\\' || isControl c)
+
 /-- A `302` to `location`, the status forward-auth proxies pass on. -/
 def found (location : String) : Reply :=
   { status := .found, headers := [("Location", location)] }
@@ -148,26 +224,67 @@ def sessionOf (ctx : Ctx) (r : Req) (host : String) : IO (Option Store.SessionRo
   let some hash := decodeCookie (macKey ctx.rootKey) value host now | return none
   ctx.store.touchSession hash now ctx.config.sessionIdleSeconds ctx.config.sessionAbsoluteSeconds
 
-/-- Redeem a code at the callback path: set the host's cookie and go back to
-where the user was going. -/
-def redeem (ctx : Ctx) (scheme authority host query : String) : IO Reply := do
+/-- The cookie that ties a sign-in begun on a protected host to the browser
+that began it. -/
+def stateCookieName : String := "__Host-pyle-forward-state"
+
+/-- How long a browser has to finish a sign-in it began on a protected host,
+in seconds. -/
+def stateSeconds : Nat := 600
+
+/-- A cookie that is not the session-carrying one: `Set-Cookie` for `name`. -/
+def cookieFor (name value : String) (maxAge : Nat) : String :=
+  s!"{name}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={maxAge}"
+
+/-- The hash of a state value, as it travels through the grant: base64url. -/
+def stateHash (state : String) : String := Jose.b64urlEncode (tokenHash state).bytes
+
+/-- Send a browser without the host's cookie to the grant on pyle's host, with
+a fresh state cookie set on the protected host and its hash in the URL.  The
+code the grant issues is bound to that hash, and only a browser holding the
+cookie can redeem it: a code obtained in another browser — an attacker's own,
+planted to sign the victim in as the attacker — is refused. -/
+def toGrant (ctx : Ctx) (scheme authority pathAndQuery : String) : IO Reply := do
+  let state ← randomToken
+  return (found (issuerUrl ctx "/forward-auth/grant?" ++
+      queryString [("rd", s!"{scheme}://{authority}{pathAndQuery}"),
+        ("state", stateHash state)])).withHeader "Set-Cookie"
+    (cookieFor stateCookieName state stateSeconds)
+
+/-- Redeem a code at the callback path: check that this browser holds the state
+the code was issued for, set the host's cookie, and go back to where the user
+was going. -/
+def redeem (ctx : Ctx) (r : Req) (scheme authority host query : String) : IO Reply := do
   let ps := (parseUrlEncoded query).getD []
-  let restart := found (issuerUrl ctx "/forward-auth/grant?" ++
-    queryString [("rd", s!"{scheme}://{authority}/")])
-  let some code := lookupOnce ps "code" | return restart
+  let restart := toGrant ctx scheme authority "/"
+  let some code := lookupOnce ps "code" | restart
   let now ← ctx.clock
-  let some fc ← ctx.store.consumeForwardAuthCode (tokenHash code) now | return restart
-  if fc.host != host then return restart
+  let some fc ← ctx.store.consumeForwardAuthCode (tokenHash code) now | restart
+  if fc.host != host then restart
+  else
+  let some state := r.cookie stateCookieName
+    | return Reply.error .forbidden "forbidden" "this sign-in was not begun in this browser"
+  unless Crypto.ctEqual (tokenHash state).bytes fc.state.bytes do
+    return Reply.error .forbidden "forbidden" "this sign-in was not begun in this browser"
   let live ← ctx.store.touchSession fc.session now ctx.config.sessionIdleSeconds
     ctx.config.sessionAbsoluteSeconds
-  if live.isNone then return restart
+  if live.isNone then restart
+  else
   let maxAge := ctx.config.forwardAuthCookieSeconds
-  return (found fc.path).withHeader "Set-Cookie"
-    (setCookie (encodeCookie (macKey ctx.rootKey) fc.session host (now + maxAge)) maxAge)
+  return ((found fc.path).withHeader "Set-Cookie"
+      (setCookie (encodeCookie (macKey ctx.rootKey) fc.session host (now + maxAge)) maxAge))
+    |>.withHeader "Set-Cookie" (cookieFor stateCookieName "" 0)
+
+/-- Whether a request carries the shared secret, when one is configured. -/
+def secretPresented (ctx : Ctx) (r : Req) : Bool :=
+  match ctx.config.forwardAuthSecret with
+  | none => true
+  | some secret =>
+    (r.header "x-pyle-forward-auth").any fun h => Crypto.ctEqual h.toUTF8 secret.toUTF8
 
 /-- `GET /forward-auth`. -/
 def check : Handler := fun ctx r => do
-  unless ctx.config.trustedProxies.contains r.peer do
+  unless ctx.config.trustedProxies.contains r.peer && secretPresented ctx r do
     return Reply.error .forbidden "forbidden" "forward authentication answers trusted proxies only"
   let some authority := r.header "x-forwarded-host"
     | return Reply.error .badRequest "invalid_request" "X-Forwarded-Host is required"
@@ -177,13 +294,15 @@ def check : Handler := fun ctx r => do
   let scheme := (r.header "x-forwarded-proto").getD "https"
   let some policy := policyFor ctx host
     | return Reply.error .forbidden "forbidden" "this host is not protected by pyle"
-  let path := pathOnly uri
+  let rawPath := pathOnly uri
+  let query := (uri.drop rawPath.length).toString
+  let some path := normalisePath rawPath
+    | return Reply.error .badRequest "invalid_request" "the path is not acceptable"
   if path == callbackPath then
-    return ← redeem ctx scheme authority host ((uri.drop (path.length + 1)).toString)
+    return ← redeem ctx r scheme authority host (query.drop 1).toString
   let some s ← sessionOf ctx r host
     | if method == "GET" || method == "HEAD" then
-        return found (issuerUrl ctx "/forward-auth/grant?" ++
-          queryString [("rd", s!"{scheme}://{authority}{uri}")])
+        return ← toGrant ctx scheme authority (path ++ query)
       return (Reply.error .unauthorized "login_required" "sign in first").withHeader
         "WWW-Authenticate" "Cookie"
   let some user ← ctx.store.findUser s.user
@@ -193,25 +312,35 @@ def check : Handler := fun ctx r => do
   return { status := .ok, headers :=
     [("Remote-User", user.name), ("Remote-Groups", ",".intercalate user.groups)] }
 
-/-- `GET /forward-auth/grant?rd=<url>`: on pyle's own host, with the session,
-issue a one-time code for a protected host and send the browser there to
-redeem it. -/
+/-- `GET /forward-auth/grant?rd=<url>&state=<hash>`: on pyle's own host, with
+the session, issue a one-time code for a protected host, bound to the session,
+the host, the path and the state, and send the browser there to redeem it.  The
+path must be one a redirect cannot turn into another host
+(`safeRedirectPath`). -/
 def grant : Handler := fun ctx r => do
-  let refuse (msg : String) := page "Access refused" s!"<p>{htmlEscape msg}</p>" .forbidden
+  let refuse (msg : String) (status : Std.Http.Status := .forbidden) :=
+    page "Access refused" s!"<p>{htmlEscape msg}</p>" status
   let ps := (r.queryParams.toOption).getD []
-  let some rd := lookupOnce ps "rd" | return refuse "The request names no address."
+  let some rd := lookupOnce ps "rd" | return refuse "The request names no address." .badRequest
+  let some state := (lookupOnce ps "state").bind Jose.b64urlDecode? |>.filter (·.size == 32)
+    | return refuse "The request was not begun by a protected host." .badRequest
   let some (scheme, authority, pathAndQuery) := splitUrl rd
     | return refuse "The address is not one pyle protects."
+  unless safeRedirectPath pathAndQuery do
+    return refuse "The address is not one pyle can send you to." .badRequest
+  let some path := normalisePath (pathOnly pathAndQuery)
+    | return refuse "The address is not one pyle can send you to." .badRequest
   let host := hostName authority
   let some policy := policyFor ctx host | return refuse "The address is not one pyle protects."
   let some s ← Session.current ctx r | return signinRedirect (Req.pathAndQuery r)
   let some user ← ctx.store.findUser s.user | return signinRedirect (Req.pathAndQuery r)
-  unless allows policy user.name user.groups host (pathOnly pathAndQuery) "GET" do
+  unless allows policy user.name user.groups host path "GET" do
     return refuse s!"Your account may not use {host}."
   let code ← randomToken
   let now ← ctx.clock
   ctx.store.addForwardAuthCode (tokenHash code)
-    { session := s.idHash, host, path := pathAndQuery, expires := now + codeSeconds }
+    { session := s.idHash, host, path := pathAndQuery, state := .ofStored state,
+      expires := now + codeSeconds }
   return Reply.redirect (s!"{scheme}://{authority}{callbackPath}?" ++ queryString [("code", code)])
 
 end ForwardAuth

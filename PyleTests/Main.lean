@@ -5,6 +5,9 @@ import PyleTests.Session
 import PyleTests.Audit
 import PyleTests.Factor
 import PyleTests.WebAuthn
+import PyleTests.SignIn
+import PyleTests.Account
+import PyleTests.Web
 import PyleTests.Oidc
 import PyleTests.Token
 import PyleTests.Device
@@ -28,6 +31,9 @@ def main : IO UInt32 := do
   auditTests
   factorTests
   webAuthnTests
+  signInTests
+  accountTests
+  webTests
   providerTests
   tokenTests
   deviceGrantTests

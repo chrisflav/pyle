@@ -56,17 +56,23 @@ def deviceFlowTests : IO Unit := withCtx fun ctx clock => do
   -- Polling before anyone decides.
   checkEq "pending" (jsonStr (← pollDevice ctx deviceCode) "error") (some "authorization_pending")
   checkEq "too fast: slow_down" (jsonStr (← pollDevice ctx deviceCode) "error") (some "slow_down")
+  clock.modify (· + ctx.config.devicePollSeconds)
+  checkEq "slow_down adds five seconds to the interval" (jsonStr (← pollDevice ctx deviceCode)
+    "error") (some "slow_down")
+  clock.modify (· + ctx.config.devicePollSeconds + 10)
+  checkEq "waiting the grown interval is pending again" (jsonStr (← pollDevice ctx deviceCode)
+    "error") (some "authorization_pending")
   -- The page needs a phishing-resistant session.
   let page := s!"/device?{queryString [("user_code", userCode)]}"
   let r ← get ctx page
   check "without a session the page sends to sign in" ((location r).startsWith "/signin?")
   checkEq "asking for a passkey" (param (location r) "acr") (some "phr")
   checkEq "and back to the code" (param (location r) "return") (some page)
-  let weak ← signIn ctx alice.id ["otp", "pwd", "mfa"]
+  let weak ← weakFor ctx alice
   let r ← get ctx page weak
   checkEq "a session without a passkey is sent to sign in too" (param (location r) "acr")
     (some "phr")
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let r ← get ctx page cookie
   checkEq "with a passkey the page answers" r.status.toCode 200
   check "naming the client" ((r.bodyText.splitOn "A CLI").length > 1)
@@ -117,6 +123,8 @@ def deviceFlowTests : IO Unit := withCtx fun ctx clock => do
   let other ← postForm ctx "/token" [("grant_type", Device.grantType), ("device_code", dc)]
     (basic "app" appSecret)
   checkEq "nor another client" (jsonStr other "error") (some "invalid_grant")
+  checkEq "whose poll destroys nothing: the right client still collects"
+    (← pollDevice ctx dc).status.toCode 200
   -- Expiry.
   let r ← deviceCodes ctx
   let dc := (jsonStr r "device_code").getD ""

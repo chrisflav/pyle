@@ -5,8 +5,12 @@ import Pyle.Audit
 /-!
 # RP-initiated logout
 
-`GET /logout` is the end-session endpoint of OpenID Connect RP-Initiated
-Logout 1.0.  A relying party sends the browser here with any of
+`/end_session` is the end-session endpoint of OpenID Connect RP-Initiated
+Logout 1.0, answering `GET` and, as §2 requires, `POST`: the form is sent back
+as a `GET` with the same parameters (303), as `POST /authorize` is, so the
+route can be exempt from the `Origin` check — a relying party's page posts
+it — and the one handler that reads the session answers.  A relying party
+sends the browser here with any of
 `id_token_hint`, `client_id`, `post_logout_redirect_uri` and `state`:
 
 * an `id_token_hint` must be an ID token pyle signed for this issuer — its
@@ -19,10 +23,14 @@ Logout 1.0.  A relying party sends the browser here with any of
 
 Signing out changes state, and a `GET` that anyone can link to must not, so
 when the browser has a session pyle asks: the page shows a form that posts to
-`POST /logout/confirm`, under the `Origin` check, which ends the session,
-revokes the refresh tokens the user holds at that client, and then redirects
-to the registered URI with `state`.  Without a session there is nothing to end,
-and the browser is redirected at once.
+`POST /end_session/confirm`, under the `Origin` check, which ends the session
+(and with it, through the schema's triggers, every refresh-token family tied
+to it), revokes the refresh tokens the user holds at that client, and answers
+with a page saying so and linking to the registered URI with `state`.  It links
+rather than redirects because the Content Security Policy's
+`form-action 'self'` would stop a browser following a redirect from a form
+submission to another origin.  Without a session there is nothing to end, and
+the browser is redirected at once.
 -/
 
 namespace Pyle
@@ -114,11 +122,11 @@ def confirmPage (clientName : Option String) (l : LogoutRequest) : Reply :=
   let who := (clientName.map fun n => s!" {htmlEscape n} asks you to sign out.").getD ""
   page "Sign out" <|
     s!"<p>{who} Sign out of pyle on this browser?</p>\n" ++
-    "<form method=\"post\" action=\"/logout/confirm\">\n" ++
+    "<form method=\"post\" action=\"/end_session/confirm\">\n" ++
     hidden "client_id" l.client ++ hidden "post_logout_redirect_uri" l.redirect ++
     hidden "state" l.state ++ "<button type=\"submit\">Sign out</button>\n</form>"
 
-/-- `GET /logout`. -/
+/-- `GET /end_session`. -/
 def endSession : Handler := fun ctx r => do
   let .ok ps := r.queryParams
     | return page "Sign out" "<p>The request is malformed.</p>" .badRequest
@@ -131,8 +139,24 @@ def endSession : Handler := fun ctx r => do
       | none => pure none
     return confirmPage clientName l
 
-/-- `POST /logout/confirm`: end the session and the client's refresh tokens,
-then go where the relying party asked. -/
+/-- `POST /end_session`: the form as a `GET` (303). -/
+def endSessionPost : Handler := fun _ r => do
+  match r.form with
+  | .ok ps => return Reply.redirect ("/end_session?" ++ queryString ps)
+  | .error _ => return page "Sign out" "<p>The request is malformed.</p>" .badRequest
+
+/-- The page after signing out: a link back to the relying party, if it gave a
+registered address. -/
+def signedOutPage (l : LogoutRequest) : Reply :=
+  let back := (l.redirect.map fun uri =>
+    let target := addQuery uri ((l.state.map fun s => [("state", s)]).getD [])
+    let name := htmlEscape (l.client.getD "the service")
+    s!"\n<p><a href=\"{htmlEscape target}\">Return to {name}</a></p>"
+    ).getD ""
+  page "Signed out" ("<p>You are signed out of pyle.</p>" ++ back)
+
+/-- `POST /end_session/confirm`: end the session and the client's refresh
+tokens, then show where to go next. -/
 def confirmLogout : Handler := fun ctx r => do
   let .ok form := r.form | return page "Sign out" "<p>The form is malformed.</p>" .badRequest
   match ← checkLogout ctx form with
@@ -145,7 +169,7 @@ def confirmLogout : Handler := fun ctx r => do
       let name := (← ctx.store.findUser s.user).map (·.name)
       Audit.log ctx r .signOut .success (userName := name)
         (detail := (l.client.map (s!"requested by {·}")).getD "")
-    return (afterLogout l).clearSession
+    return (signedOutPage l).clearSession
 
 end Oidc
 end Pyle

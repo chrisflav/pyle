@@ -1,4 +1,4 @@
-import PyleTests.Session
+import PyleTests.Web
 
 /-!
 # OpenID Connect
@@ -10,8 +10,8 @@ the negatives — PKCE, redirect URIs, client authentication, prompts — and th
 signing-key lifecycle.  ID tokens are verified with `Jwt.verify` against the
 key the JWKS publishes.
 
-Sessions are written into the store directly (`signIn`): creating them is the
-sign-in pages' business, and these tests only read them.
+Sessions are made through the sign-in endpoints (`signedIn`, `weakFor`): the
+protocol endpoints only read them.
 -/
 
 namespace PyleTests
@@ -35,15 +35,30 @@ def issuer : String := "https://auth.example.org"
 /-- The registered redirect URI of the test client. -/
 def appRedirect : String := "https://app.example.org/cb"
 
-/-- Write a session row for `user` authenticated now with `amr`, as the
-sign-in pages would; the cookie value. -/
-def signIn (ctx : Ctx) (user : Store.UserId) (amr : List String) : IO String := do
-  let id ← Crypto.randomBytes 32
-  let now ← ctx.clock
-  ctx.store.insertSession
-    { idHash := .of id, user, amr, factors := [], authTime := now, created := now,
-      lastSeen := now, clientAddress := "1.2.3.4", userAgent := "test" }
-  return Session.encodeId id
+/-- A session for `user`, signed in with a fresh passkey through the sign-in
+endpoints (`sessionFor`): its `amr` is `["hwk", "user"]`.  The cookie value. -/
+def signedIn (ctx : Ctx) (user : Store.User) : IO String :=
+  return (← sessionFor ctx user).1
+
+/-- A session for `user` that is not phishing-resistant: a security key without
+user verification and a TOTP code, through `Policy.establish`.  Its `amr` is
+`["hwk", "otp", "mfa"]` and its `acr` `mfa`.  The cookie value. -/
+def weakFor (ctx : Ctx) (user : Store.User) : IO String := do
+  let k ← SoftKey.new (uv := false)
+  enrol ctx user k "no-uv key"
+  let secret ← giveTotp ctx user
+  let ch ← match ← SignIn.newChallenge ctx (Req.mk' .post "/") .authenticate none with
+    | .ok ch => pure ch
+    | .error _ => throw (.userError "weakFor: no challenge")
+  let cred ← k.assert (SignIn.requestOptions ctx ch [] "discouraged")
+  let resp ← IO.ofExcept (SignIn.parseAssertion cred)
+  let .ok ca ← Policy.checkAssertion ctx .authenticate resp
+    | throw (.userError "weakFor: the assertion was refused")
+  let .ok totp ← Policy.checkTotp ctx user.id (totpAt secret (← ctx.clock))
+    | throw (.userError "weakFor: the TOTP code was refused")
+  let some sa := Policy.StrongAuthentication.ofFactors [ca.factor, totp]
+    | throw (.userError "weakFor: the factors do not satisfy the policy")
+  return (← Policy.establish ctx (Req.mk' .post "/") sa).2
 
 /-- A `GET` through the server, with a session cookie if one is given. -/
 def get (ctx : Ctx) (target : String) (cookie : Option String := none)
@@ -188,7 +203,7 @@ def codeFlowTests : IO Unit := withCtx fun ctx clock => do
   check "to sign in" ((location r).startsWith "/signin?")
   checkEq "and back to this very request" (param (location r) "return") (some (authorizeUrl "app"))
   -- Signed in, a code comes back.
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let r ← get ctx (authorizeUrl "app") cookie
   checkEq "signed in: 303" r.status.toCode 303
   check "to the redirect URI" ((location r).startsWith (appRedirect ++ "?"))
@@ -308,7 +323,7 @@ def negativeTests : IO Unit := withCtx fun ctx _ => do
   group "oidc: refusals"
   let alice ← ctx.store.addUser "alice" [] 1
   let (secret, _) ← addClients ctx
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   -- The client and redirect URI are checked before anything is redirected.
   let r ← get ctx (authorizeUrl "nobody") cookie
   checkEq "an unknown client: 400" r.status.toCode 400
@@ -395,7 +410,7 @@ def promptTests : IO Unit := withCtx fun ctx clock => do
   checkEq "prompt=none without a session: login_required" (param (location r) "error")
     (some "login_required")
   checkEq "sent to the client" ((location r).startsWith appRedirect) true
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let (cookie, key) ← sessionFor ctx alice
   clock.modify (· + 1000)
   -- prompt=login: a fresh authentication, and back without looping.
   let r ← get ctx (authorizeUrl "app" [("prompt", "login")]) cookie
@@ -407,26 +422,43 @@ def promptTests : IO Unit := withCtx fun ctx clock => do
     (some (toString (← clock.get)))
   let r ← get ctx back cookie
   check "until the user authenticates again, it still asks" ((location r).startsWith "/signin?")
-  -- The sign-in pages re-authenticate the session; here, by hand.
-  let id := (Session.decodeId cookie).getD .empty
-  let now ← clock.get
-  discard <| ctx.store.reauthenticateSession (.of id) (.of id) ["hwk", "user"] [] now
+  -- Sign-in takes a few seconds; the step-up goes through the real endpoints.
+  clock.modify (· + 3)
+  let some cookie := sessionCookieOf (← stepUpVia ctx key (some cookie))
+    | check "the step-up succeeds" false
   let r ← get ctx back cookie
   check "afterwards the code comes" ((param (location r) "code").isSome)
-  -- max_age.
+  -- max_age=0 is prompt=login.
+  clock.modify (· + 10)
+  let r ← get ctx (authorizeUrl "app" [("max_age", "0")]) cookie
+  checkEq "max_age=0 asks for a fresh authentication" (param (location r) "max_age") (some "0")
+  let some back0 := param (location r) "return" | check "a way back" false
+  check "and the way back has no max_age" (param back0 "max_age").isNone
+  check "but pyle_auth_after" (param back0 "pyle_auth_after").isSome
+  -- max_age: an old authentication is renewed, and the way back does not loop.
   clock.modify (· + 500)
+  let r ← get ctx (authorizeUrl "app" [("max_age", "100"), ("prompt", "none")]) cookie
+  checkEq "an old authentication with prompt=none: login_required" (param (location r) "error")
+    (some "login_required")
   let r ← get ctx (authorizeUrl "app" [("max_age", "100")]) cookie
   checkEq "an old authentication with max_age goes to sign in" (param (location r) "max_age")
     (some "100")
-  let r ← get ctx (authorizeUrl "app" [("max_age", "100"), ("prompt", "none")]) cookie
-  checkEq "or, with prompt=none, login_required" (param (location r) "error")
-    (some "login_required")
+  let some backAged := param (location r) "return" | check "a way back" false
+  check "the way back drops max_age" (param backAged "max_age").isNone
+  checkEq "for the time of the request" (param backAged "pyle_auth_after")
+    (some (toString (← clock.get)))
+  clock.modify (· + 2)
+  let some cookie := sessionCookieOf (← stepUpVia ctx key (some cookie))
+    | check "the step-up succeeds" false
+  let r ← get ctx backAged cookie
+  check "a sign-in that crossed a second boundary still gives a code"
+    ((param (location r) "code").isSome)
   let r ← get ctx (authorizeUrl "app" [("max_age", "1000")]) cookie
   check "a recent enough one gives a code" ((param (location r) "code").isSome)
   checkEq "max_age must be a number" (param (location (← get ctx
     (authorizeUrl "app" [("max_age", "soon")]) cookie)) "error") (some "invalid_request")
   -- acr_values=phr.
-  let weak ← signIn ctx alice.id ["otp", "pwd", "mfa"]
+  let weak ← weakFor ctx alice
   let r ← get ctx (authorizeUrl "app" [("acr_values", "phr")]) weak
   checkEq "acr_values=phr without a passkey goes to sign in with acr=phr"
     (param (location r) "acr") (some "phr")
@@ -435,10 +467,10 @@ def promptTests : IO Unit := withCtx fun ctx clock => do
   let code ← obtainCode ctx weak
   let t ← exchange ctx code secret
   let claims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
-  checkEq "an OTP and password sign-in is acr mfa" (claims.getObjValAs? String "acr").toOption
-    (some "mfa")
+  checkEq "a security key without UV and TOTP is acr mfa"
+    (claims.getObjValAs? String "acr").toOption (some "mfa")
   checkEq "with its amr" (claims.getObjVal? "amr" |>.toOption.map (·.compress))
-    (some "[\"otp\",\"pwd\",\"mfa\"]")
+    (some "[\"hwk\",\"otp\",\"mfa\"]")
   -- RS256 for the client that needs it.
   let code ← obtainCode ctx cookie "legacy"
   let t ← exchange ctx code legacySecret (client := "legacy")
@@ -459,47 +491,118 @@ def rpLogoutTests : IO Unit := withCtx fun ctx _ => do
   group "oidc: logout"
   let alice ← ctx.store.addUser "alice" [] 1
   let (secret, _) ← addClients ctx
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let t ← exchange ctx (← obtainCode ctx cookie) secret
   let idToken := (jsonStr t "id_token").getD ""
   let refresh := (jsonStr t "refresh_token").getD ""
   let bye := "https://app.example.org/bye"
   let q := queryString [("id_token_hint", idToken), ("post_logout_redirect_uri", bye),
     ("state", "x1")]
-  let r ← get ctx s!"/logout?{q}" cookie
+  let r ← get ctx s!"/end_session?{q}" cookie
   checkEq "with a session, logout asks first" r.status.toCode 200
-  check "with a form to confirm" ((r.bodyText.splitOn "action=\"/logout/confirm\"").length == 2)
+  check "with a form to confirm"
+    ((r.bodyText.splitOn "action=\"/end_session/confirm\"").length == 2)
   check "and the session is still there" ((← Session.current ctx (withCookie cookie)).isSome)
-  let r ← get ctx s!"/logout?{queryString [("client_id", "app"),
+  let r ← postForm ctx "/end_session" (queryOf s!"/end_session?{q}")
+    [("Origin", "https://app.example.org")]
+  checkEq "a POST from the relying party becomes a GET" (location r) s!"/end_session?{q}"
+  let r ← get ctx s!"/end_session?{queryString [("client_id", "app"),
     ("post_logout_redirect_uri", "https://evil.example/")]}" cookie
   checkEq "an unregistered return address is refused" r.status.toCode 400
   check "without redirecting" (r.header "location").isNone
-  let r ← get ctx s!"/logout?{queryString [("id_token_hint", idToken), ("client_id", "cli")]}"
-    cookie
+  let r ← get ctx s!"/end_session?{queryString [("id_token_hint", idToken),
+    ("client_id", "cli")]}" cookie
   checkEq "a client_id that is not the hint's audience is refused" r.status.toCode 400
-  let r ← get ctx s!"/logout?{queryString [("id_token_hint", "a.b.c")]}" cookie
+  let r ← get ctx s!"/end_session?{queryString [("id_token_hint", "a.b.c")]}" cookie
   checkEq "a hint pyle did not sign is refused" r.status.toCode 400
-  let crossSite ← postForm ctx "/logout/confirm" [("client_id", "app")]
+  let crossSite ← postForm ctx "/end_session/confirm" [("client_id", "app")]
     [("Origin", "https://evil.example")] (cookie := some cookie)
   checkEq "a cross-site confirmation is refused" crossSite.status.toCode 403
-  let r ← postForm ctx "/logout/confirm" [("client_id", "app"),
+  let r ← postForm ctx "/end_session/confirm" [("client_id", "app"),
     ("post_logout_redirect_uri", bye), ("state", "x1")] sameOrigin (cookie := some cookie)
-  checkEq "confirming redirects" r.status.toCode 303
-  checkEq "to the registered address with the state" (location r) s!"{bye}?state=x1"
+  checkEq "confirming answers with a page, not a redirect (form-action 'self')"
+    r.status.toCode 200
+  check "which links back to the registered address with the state"
+    ((r.bodyText.splitOn s!"href=\"{bye}?state=x1\"").length == 2)
   check "and clears the cookie" (hasHeader r "Set-Cookie" clearSessionCookie)
   check "the session is over" ((← Session.current ctx (withCookie cookie)).isNone)
   let rt ← postForm ctx "/token" [("grant_type", "refresh_token"), ("refresh_token", refresh)]
     (basic "app" secret)
   checkEq "and the client's refresh tokens are revoked" (jsonStr rt "error") (some "invalid_grant")
-  let r ← get ctx s!"/logout?{q}"
+  let r ← get ctx s!"/end_session?{q}"
   checkEq "without a session, straight back" (location r) s!"{bye}?state=x1"
+
+/-- Which claims a scope releases, and refresh-token families: their absolute
+expiry, and their tie to the session. -/
+def scopeAndFamilyTests : IO Unit := withCtx fun ctx clock => do
+  group "oidc: scopes and refresh families"
+  let alice ← ctx.store.addUser "alice" ["admin"] 1
+  let (secret, _) ← addClients ctx
+  let some offSecret ← registerClient ctx.store "offline" "Offline" [appRedirect]
+      ["openid", "offline_access"] false {} 1
+    | check "an offline client" false
+  let (cookie, key) ← sessionFor ctx alice
+  -- Scopes.
+  let t ← exchange ctx (← obtainCode ctx cookie (scope := "openid")) secret
+  let claims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
+  check "without profile, no name" (claims.getObjVal? "name").toOption.isNone
+  check "without groups, no groups" (claims.getObjVal? "groups").toOption.isNone
+  let u ← get ctx "/userinfo"
+    (headers := [("Authorization", s!"Bearer {(jsonStr t "access_token").getD ""}")])
+  check "nor from userinfo" ((jsonStr u "name").isNone &&
+    ((bodyJson u).getObjVal? "groups").toOption.isNone && (jsonStr u "sub").isSome)
+  let t ← exchange ctx (← obtainCode ctx cookie (scope := "openid profile")) secret
+  let claims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
+  checkEq "profile releases the name" (claims.getObjValAs? String "name").toOption (some "alice")
+  check "and only the name" (claims.getObjVal? "groups").toOption.isNone
+  let d ← get ctx "/.well-known/openid-configuration"
+  check "discovery offers offline_access"
+    (((bodyJson d).getObjValAs? (Array String) "scopes_supported").toOption.getD #[]
+      |>.contains "offline_access")
+  checkEq "and the end-session endpoint" (jsonStr d "end_session_endpoint")
+    (some s!"{issuer}/end_session")
+  -- A family survives a step-up of its session.
+  let refreshWith (rt client sec : String) := postForm ctx "/token"
+    [("grant_type", "refresh_token"), ("refresh_token", rt)] (basic client sec)
+  let bound := (jsonStr (← exchange ctx (← obtainCode ctx cookie) secret) "refresh_token").getD ""
+  let offline := (jsonStr (← exchange ctx (← obtainCode ctx cookie "offline"
+    (scope := "openid offline_access")) offSecret (client := "offline")) "refresh_token").getD ""
+  let some cookie := sessionCookieOf (← stepUpVia ctx key (some cookie))
+    | check "the step-up succeeds" false
+  let r ← refreshWith bound "app" secret
+  checkEq "a family survives its session's step-up" r.status.toCode 200
+  let bound := (jsonStr r "refresh_token").getD ""
+  -- Signing out ends the families tied to the session, not offline ones.
+  let out ← Server.route ctx (withCookie cookie .post "/logout" sameOrigin)
+  check "signing out works" (out.status.toCode < 400)
+  checkEq "signing out revokes the session's family" (jsonStr (← refreshWith bound "app" secret)
+    "error") (some "invalid_grant")
+  let r ← refreshWith offline "offline" offSecret
+  checkEq "but not an offline_access one" r.status.toCode 200
+  -- The absolute expiry.
+  let start ← clock.get
+  let some rt := jsonStr r "refresh_token" | check "a token" false
+  clock.set (start + ctx.config.refreshTokenSeconds - 10)
+  let r ← refreshWith rt "offline" offSecret
+  checkEq "rotating just before the family expires works" r.status.toCode 200
+  let some rt := jsonStr r "refresh_token" | check "a token" false
+  clock.set (start + ctx.config.refreshTokenSeconds + 1)
+  checkEq "but rotation does not extend the family" (jsonStr (← refreshWith rt "offline"
+    offSecret) "error") (some "invalid_grant")
+  -- Unused codes are purged.
+  let fresh ← signedIn ctx alice
+  discard <| obtainCode ctx fresh
+  clock.modify (· + codeSeconds + 1)
+  Server.purge ctx
+  checkEq "the purge removes codes never exchanged" ((← ctx.store.run fun c =>
+    Store.query c "SELECT 1 FROM codes" #[] (Store.colInt · 0)).size) 0
 
 /-- Signing keys: sealing, rotation, publication. -/
 def keyTests : IO Unit := withCtx fun ctx clock => do
   group "oidc: signing keys"
   let alice ← ctx.store.addUser "alice" [] 1
   let (secret, _) ← addClients ctx
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let now ← clock.get
   let (kid1, _) ← Keys.current ctx.store ctx.rootKey .idTokenEs256 now
   let stored := (← Keys.published ctx.store .idTokenEs256).toList
@@ -544,6 +647,7 @@ def providerTests : IO Unit := do
   negativeTests
   promptTests
   rpLogoutTests
+  scopeAndFamilyTests
   keyTests
 
 end PyleTests

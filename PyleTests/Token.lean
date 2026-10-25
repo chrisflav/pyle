@@ -29,7 +29,7 @@ def accessTokenTests : IO Unit := withCtx fun ctx clock => do
   group "token: access tokens"
   let alice ← ctx.store.addUser "alice" ["admin", "ops"] 1
   let (secret, _) ← addClients ctx
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let access ← accessToken ctx cookie secret
   let roots ← Pyle.Token.publishedRoots ctx.store
   let now ← clock.get
@@ -109,7 +109,7 @@ def attestTests : IO Unit := withCtx fun ctx clock => do
   group "token: kleis attestation"
   let alice ← ctx.store.addUser "alice" ["admin"] 1
   let (secret, _) ← addClients ctx
-  let cookie ← signIn ctx alice.id ["hwk", "user"]
+  let cookie ← signedIn ctx alice
   let some agentSecret ← registerClient ctx.store "agent" "An agent" [appRedirect]
       ["openid", "kleis"] false {} 1
     | check "an agent client" false

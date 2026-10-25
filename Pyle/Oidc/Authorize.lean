@@ -27,11 +27,14 @@ answered.
 
 When the session does not satisfy them, the browser is sent to sign in and back
 here (`Oidc.signinRedirect`), or, under `prompt=none`, the client gets
-`login_required`.  For `prompt=login` the way back carries, instead of the
-prompt, the parameter `pyle_auth_after` with the time of the request, so that
-the authentication that just happened satisfies it and the request does not
-loop.  A client that sends `pyle_auth_after` itself only asks for a fresher
-authentication than it needs.
+`login_required`.  `max_age=0` means the same as `prompt=login`.  When the
+authentication is too old — `prompt=login`, or older than `max_age` — the way
+back carries, instead of `prompt` and `max_age`, the parameter
+`pyle_auth_after` with the time of the request, so that the authentication that
+just happened satisfies it and the request does not loop, however many seconds
+sign-in takes.  The client still sees `auth_time` in the ID token and checks
+`max_age` against it.  A client that sends `pyle_auth_after` itself only asks
+for a fresher authentication than it needs.
 
 A code is good once, for 60 seconds, and only for the client, redirect URI and
 code challenge it was issued with (the store binds them, `/token` checks them).
@@ -73,7 +76,7 @@ structure Requirements where
 /-- Whether a session satisfies the requirements at `now`. -/
 def Requirements.satisfied (q : Requirements) (s : Session) (now : Nat) : Bool :=
   q.notBefore.all (· ≤ s.authTime) && q.maxAge.all (fun a => now ≤ s.authTime + a) &&
-    (!q.phr || acrOf s.amr == "phr")
+    (!q.phr || Policy.acr s.amr == "phr")
 
 /-- The `max_age` to ask sign-in for: zero for a fresh authentication. -/
 def Requirements.signinMaxAge (q : Requirements) : Option Nat :=
@@ -135,19 +138,28 @@ def authorizeParams (ctx : Ctx) (r : Req) (ps : List (String × String)) : IO Re
   if nonce.any (·.length > 512) then return fail "invalid_request" "the nonce is too long"
   let phr := words ((lookupOnce ps "acr_values").getD "") |>.contains "phr"
   let now ← ctx.clock
-  -- `prompt=login` becomes `pyle_auth_after=<now>` on the way back from sign-in.
-  let (returnTo, notBefore) :=
-    if prompt.contains "login" then
-      let kept := ps.filter fun (k, _) => k != "prompt" && k != "pyle_auth_after"
-      ("/authorize?" ++ queryString (kept ++ [("pyle_auth_after", toString now)]), some now)
-    else (Req.pathAndQuery r, authAfter)
-  let req : Requirements := { notBefore, maxAge, phr }
+  -- `prompt=login` and `max_age=0` ask for an authentication now.
+  let login := prompt.contains "login" || maxAge == some 0
+  let req : Requirements :=
+    { notBefore := if login then some now else authAfter,
+      maxAge := if login then none else maxAge, phr }
   let session ← Session.current ctx r
-  let satisfied := session.any (req.satisfied · now)
-  let some s := session.filter (fun _ => satisfied)
+  let some s := session.filter (req.satisfied · now)
     | if prompt.contains "none" then
         return fail "login_required" "the user must sign in"
-      return signinRedirect returnTo req.signinMaxAge phr
+      -- An authentication too old for the request is renewed at sign-in, and the
+      -- way back asks only for one no older than now, which the renewed one is,
+      -- so the request cannot loop however long sign-in takes.
+      let freshness : Requirements := { req with phr := false }
+      let stale := (req.notBefore.isSome || req.maxAge.isSome) &&
+        !session.any (freshness.satisfied · now)
+      if stale then
+        let kept := ps.filter fun (k, _) =>
+          k != "prompt" && k != "max_age" && k != "pyle_auth_after"
+        return signinRedirect
+          ("/authorize?" ++ queryString (kept ++ [("pyle_auth_after", toString now)]))
+          req.signinMaxAge phr
+      return signinRedirect (Req.pathAndQuery r) none phr
   let some user ← ctx.store.findUser s.user
     | return fail "server_error" "the account is gone"
   let code ← randomToken
@@ -155,6 +167,7 @@ def authorizeParams (ctx : Ctx) (r : Req) (ps : List (String × String)) : IO Re
     { clientId, redirectUri, codeChallenge := challenge, user := user.id,
       scope := " ".intercalate scopes, nonce, amr := s.amr, authTime := s.authTime,
       expires := now + codeSeconds }
+  ctx.store.setCodeSession (tokenHash code) s.idHash
   return Reply.redirect <| addQuery redirectUri <|
     [("code", code)] ++ (state.map fun st => [("state", st)]).getD [] ++
     [("iss", ctx.config.issuer)]

@@ -11,11 +11,16 @@ authenticated (`Oidc.authenticateClient`):
   tokens are issued only if it was issued to this client, for this
   `redirect_uri`, with a challenge `code_verifier` answers (DESIGN.md §9.4).  A
   code presented again after its first use revokes the refresh-token family
-  that use began, as RFC 6749 §4.1.2 asks;
+  that use began, as RFC 6749 §4.1.2 asks.  The ID token and access token that
+  use issued are not revoked — they are self-contained and short-lived, and
+  revoking them is what the RFC's "when possible" leaves out;
 * `refresh_token` — rotated by `Store.rotateRefreshToken`: the token presented
   is used up and a successor issued, and a token presented a second time
   revokes its whole family.  A narrower `scope` may be asked for the new access
-  and ID tokens; the refresh token keeps the original grant;
+  and ID tokens; the refresh token keeps the original grant.  A family expires
+  `refreshTokenSeconds` after it began, however often it is rotated, and,
+  unless the grant included `offline_access`, when the pyle session it came
+  from ends;
 * `urn:ietf:params:oauth:grant-type:device_code` — the device grant's poll
   (`Device.poll`).
 
@@ -43,6 +48,7 @@ def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String
     | return oauthError "invalid_request" "code_verifier is required"
   let now ← ctx.clock
   let h := tokenHash code
+  let session ← ctx.store.codeSession h
   let some a ← ctx.store.consumeCode h now
     | let family := familyOfCode h
       if ← ctx.store.familyExists family then
@@ -54,7 +60,7 @@ def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String
   unless Pkce.verifies verifier a.codeChallenge do
     return oauthError "invalid_grant" "the code verifier does not match the challenge"
   let some user ← liveUser ctx a.user | return oauthError "invalid_grant" "the account is gone"
-  let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime
+  let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime session
   tokenResponse ctx r client user a.scope a.amr a.authTime a.nonce (some refresh)
     "authorization_code"
 
@@ -65,8 +71,10 @@ def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
     | return oauthError "invalid_request" "refresh_token is required"
   let now ← ctx.clock
   let new ← randomToken
+  -- Rotation never extends the family past its absolute expiry.
+  let cap := (← ctx.store.familyExpiry (tokenHash old)).getD (now + ctx.config.refreshTokenSeconds)
   match ← ctx.store.rotateRefreshToken (tokenHash old) (tokenHash new) client.id now
-      (now + ctx.config.refreshTokenSeconds) with
+      (min cap (now + ctx.config.refreshTokenSeconds)) with
   | .invalid => return oauthError "invalid_grant" "the refresh token is unknown or expired"
   | .reused =>
     Audit.log ctx r .refreshReuse .refused (detail := s!"refresh token reused by {client.id}")

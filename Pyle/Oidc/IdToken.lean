@@ -15,8 +15,9 @@ What an OpenID Connect client learns about the user (OpenID Connect Core
 * `iat`, `exp` — issued now, good for `idTokenSeconds`;
 * `auth_time` — when the user authenticated, which may be long before;
 * `nonce` — the one the authorization request carried, if any;
-* `amr` (RFC 8176) and `acr` (`phr` or `mfa`, `Oidc.acrOf`) — how;
-* `name` and `groups` — the account's name and groups.
+* `amr` (RFC 8176) and `acr` (`phr` or `mfa`, `Policy.acr`) — how;
+* `name` and `groups` — the account's name when the scope includes `profile`,
+  its groups when it includes `groups`.
 
 It is signed with the client's algorithm: ES256 unless the client was
 registered for RS256, with the current key of that algorithm, named in the
@@ -28,16 +29,23 @@ namespace Oidc
 
 open Lean (Json)
 
-/-- The claims of an ID token. -/
-def idTokenClaims (issuer clientId : String) (u : Store.User) (amr : List String)
+/-- The claims about the user that a scope releases: `name` for `profile`,
+`groups` for `groups`.  Shared by ID tokens and `/userinfo`. -/
+def scopedClaims (u : Store.User) (scopes : List String) : List (String × Json) :=
+  (if scopes.contains "profile" then [("name", Json.str u.name)] else []) ++
+  (if scopes.contains "groups" then [("groups", Json.arr (u.groups.map Json.str).toArray)]
+   else [])
+
+/-- The claims of an ID token for a grant of `scopes`. -/
+def idTokenClaims (issuer clientId : String) (u : Store.User) (scopes amr : List String)
     (authTime : Option Nat) (nonce : Option String) (now expires : Nat) : Json :=
   Json.mkObj <|
     [("iss", Json.str issuer), ("sub", Json.str (subjectOf u)), ("aud", Json.str clientId),
      ("exp", (expires : Json)), ("iat", (now : Json))] ++
     (authTime.map fun t => [("auth_time", (t : Json))]).getD [] ++
     (nonce.map fun n => [("nonce", Json.str n)]).getD [] ++
-    [("amr", Json.arr (amr.map Json.str).toArray), ("acr", Json.str (acrOf amr)),
-     ("name", Json.str u.name), ("groups", Json.arr (u.groups.map Json.str).toArray)]
+    [("amr", Json.arr (amr.map Json.str).toArray), ("acr", Json.str (Policy.acr amr))] ++
+    scopedClaims u scopes
 
 /-- The key use a client's ID tokens are signed with. -/
 def idTokenUse (settings : Store.ClientSettings) : Keys.Use :=

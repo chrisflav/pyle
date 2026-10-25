@@ -1,21 +1,17 @@
-import PyleTests.Http
+import PyleTests.SignIn
 
 /-!
 # Sessions
 
 Creation, lookup through the cookie, both timeouts, rotation, step-up, the
 session list, and sign-out through the real route — with the clock moved by
-hand.
+hand.  A session can only be made from a `StrongAuthentication`, so each one
+here comes from an assertion of a software passkey (`strongFor`).
 -/
 
 namespace PyleTests
 
 open Pyle Pyle.Http
-
-/-- A request carrying a session cookie. -/
-def withCookie (id : String) (method : Std.Http.Method := .get) (path : String := "/")
-    (headers : List (String × String) := []) : Req :=
-  Req.mk' method path ((("Cookie", s!"{sessionCookieName}={id}")) :: headers)
 
 /-- Identifiers in the cookie. -/
 def idTests : IO Unit := do
@@ -35,9 +31,13 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   group "session: lifecycle"
   let alice ← ctx.store.addUser "alice" [] 1
   let bob ← ctx.store.addUser "bob" [] 1
+  let ak ← SoftKey.new
+  enrol ctx alice ak
+  let bk ← SoftKey.new
+  enrol ctx bob bk
   let start ← clock.get
   let signIn := Req.mk' .post "/" [("User-Agent", "Test/1.0")] (clientAddress := "1.2.3.4")
-  let (_, id) ← Session.create ctx signIn alice.id ["hwk", "user"] ["webauthn:abc"]
+  let (_, id) ← Policy.establish ctx signIn (← strongFor ctx ak)
   let stored ← ctx.store.run fun c =>
     Store.query c "SELECT id_hash FROM sessions" #[] (Store.colBlob · 0)
   check "the database holds the hash of the identifier"
@@ -65,7 +65,7 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   check "and the row is gone" ((← ctx.store.listSessions alice.id).isEmpty)
   -- Absolute timeout: used throughout, it still ends.
   let t0 ← clock.get
-  let (_, id2) ← Session.create ctx signIn alice.id ["hwk"] []
+  let (_, id2) ← Policy.establish ctx signIn (← strongFor ctx ak)
   let mut t := t0
   let mut alive := true
   while t < t0 + ctx.config.sessionAbsoluteSeconds do
@@ -77,7 +77,7 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   clock.set (t0 + ctx.config.sessionAbsoluteSeconds + 1)
   check "and not past it" ((← Session.current ctx (withCookie id2)).isNone)
   -- Rotation.
-  let (s3, id3) ← Session.create ctx signIn alice.id ["hwk"] []
+  let (s3, id3) ← Policy.establish ctx signIn (← strongFor ctx ak)
   let some (_, id3') ← Session.rotate ctx s3
     | check "rotation succeeds" false
   check "the old identifier is dead" ((← Session.current ctx (withCookie id3)).isNone)
@@ -86,17 +86,19 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   -- Step-up.
   let some cur3 ← Session.current ctx (withCookie id3') | check "still there" false
   clock.modify (· + 100)
-  let some (up, id4) ← Session.reauthenticate ctx cur3 ["hwk", "user", "mfa"] ["webauthn:x"]
+  let ek ← SoftKey.new .edDsa (backupEligible := true)
+  enrol ctx alice ek
+  let some (up, id4) ← Policy.stepUp ctx cur3 (← strongFor ctx ek)
     | check "step-up succeeds" false
   checkEq "step-up refreshes auth_time" up.authTime (← clock.get)
   check "and rotates" ((← Session.current ctx (withCookie id3')).isNone)
   checkEq "and records the new amr" ((← Session.current ctx (withCookie id4)).map (·.amr))
-    (some ["hwk", "user", "mfa"])
+    (some ["swk", "user"])
   check "it counts as recent" (Session.authenticatedWithin up (← clock.get) 300)
   check "and not after five minutes" (!Session.authenticatedWithin up ((← clock.get) + 301) 300)
   -- The list, and ending sessions.
-  discard <| Session.create ctx signIn alice.id ["hwk"] []
-  let (_, bid) ← Session.create ctx signIn bob.id ["hwk"] []
+  discard <| Policy.establish ctx signIn (← strongFor ctx ak)
+  let (_, bid) ← Policy.establish ctx signIn (← strongFor ctx bk)
   let mine ← Session.list ctx alice.id
   checkEq "alice sees her two live sessions" mine.size 2
   let some first := mine[0]? | check "a session to end" false
@@ -112,8 +114,10 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
 def replaceTests : IO Unit := withCtx fun ctx _ => do
   group "session: replacement"
   let alice ← ctx.store.addUser "alice" [] 1
-  let (_, planted) ← Session.create ctx (Req.mk' .post "/") alice.id ["hwk"] []
-  let (_, fresh) ← Session.create ctx (withCookie planted .post) alice.id ["hwk", "user"] []
+  let k ← SoftKey.new
+  enrol ctx alice k
+  let (_, planted) ← Policy.establish ctx (Req.mk' .post "/") (← strongFor ctx k)
+  let (_, fresh) ← Policy.establish ctx (withCookie planted .post) (← strongFor ctx k)
   check "the session the request carried is ended"
     ((← Session.current ctx (withCookie planted)).isNone)
   check "the new one works" ((← Session.current ctx (withCookie fresh)).isSome)
@@ -123,7 +127,9 @@ def replaceTests : IO Unit := withCtx fun ctx _ => do
 def logoutTests : IO Unit := withCtx fun ctx _ => do
   group "session: sign-out"
   let alice ← ctx.store.addUser "alice" [] 1
-  let (_, id) ← Session.create ctx (Req.mk' .post "/") alice.id ["hwk"] []
+  let k ← SoftKey.new
+  enrol ctx alice k
+  let (_, id) ← Policy.establish ctx (Req.mk' .post "/") (← strongFor ctx k)
   let crossSite ← Server.route ctx (withCookie id .post "/logout"
     [("Origin", "https://evil.example")])
   checkEq "a cross-site sign-out is refused" crossSite.status.toCode 403

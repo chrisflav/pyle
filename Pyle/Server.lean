@@ -1,6 +1,7 @@
 import Std.Http
 import Std.Net
 import Pyle.Session.Session
+import Pyle.SignIn.Routes
 import Pyle.Audit
 import Pyle.Sys
 import Pyle.Oidc.Routes
@@ -26,6 +27,8 @@ The endpoints so far:
 
 * `GET /healthz` — `200` with `{"status":"ok"}` once the database answers.
 * `POST /logout` — ends the request's session, if any, and clears the cookie.
+* `SignIn.routes` — the sign-in, account and invitation pages and their
+  endpoints (`Pyle.SignIn.Routes`).
 * the protocols of DESIGN.md §5, listed in `Pyle.Oidc.Routes`.
 -/
 
@@ -61,7 +64,7 @@ def logout : Http.Handler := fun ctx r => do
 def routes : List Route := [
   .mk' .get "/healthz" healthz,
   .mk' .post "/logout" logout
-] ++ Oidc.routes
+] ++ SignIn.routes ++ Oidc.routes
 
 /-- Answer one request. -/
 def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r
@@ -182,6 +185,8 @@ def purge (ctx : Ctx) : IO Unit := do
     ctx.config.sessionAbsoluteSeconds
   discard <| ctx.store.purgeChallenges now
   discard <| ctx.store.purgeDeviceCodes now
+  discard <| ctx.store.purgeCodes now
+  discard <| ctx.store.purgeForwardAuthCodes now
 
 /-- Serve until the process is stopped. -/
 def run (config : Config) : IO Unit := do

@@ -126,6 +126,8 @@ structure ForwardAuthCode where
   host : String
   /-- The path and query to send the browser back to. -/
   path : String
+  /-- The SHA-256 of the state cookie of the browser that asked for it. -/
+  state : SecretHash
   /-- When it stops being accepted. -/
   expires : Nat
 
@@ -133,9 +135,9 @@ structure ForwardAuthCode where
 def Store.addForwardAuthCode (s : Store) (codeHash : SecretHash) (fc : ForwardAuthCode) :
     IO Unit := s.run fun c => do
   discard <| exec c
-    "INSERT INTO forward_auth_codes (code_hash, session_hash, host, path, expires) \
-      VALUES (?, ?, ?, ?, ?)"
-    #[codeHash, fc.session, fc.host, fc.path, fc.expires]
+    "INSERT INTO forward_auth_codes (code_hash, session_hash, host, path, state_hash, \
+      expires) VALUES (?, ?, ?, ?, ?, ?)"
+    #[codeHash, fc.session, fc.host, fc.path, fc.state, fc.expires]
 
 /-- Consume a forward-authentication code: delete it and return it, if it
 existed and had not expired at `now`. -/
@@ -143,15 +145,103 @@ def Store.consumeForwardAuthCode (s : Store) (codeHash : SecretHash) (now : Nat)
     IO (Option ForwardAuthCode) := s.run fun c => do
   let row ← queryOne c
     "DELETE FROM forward_auth_codes WHERE code_hash = ? \
-      RETURNING session_hash, host, path, expires"
+      RETURNING session_hash, host, path, state_hash, expires"
     #[codeHash] fun st => do
       return { session := .ofStored (← colBlob st 0), host := ← colText st 1,
-               path := ← colText st 2, expires := ← colNat st 3 : ForwardAuthCode }
+               path := ← colText st 2, state := .ofStored (← colBlob st 3),
+               expires := ← colNat st 4 : ForwardAuthCode }
   return row.filter (now < ·.expires)
 
 /-- Remove expired forward-authentication codes; how many. -/
 def Store.purgeForwardAuthCodes (s : Store) (now : Nat) : IO Nat := s.run fun c =>
   exec c "DELETE FROM forward_auth_codes WHERE expires <= ?" #[now]
+
+/-- Remove expired authorization codes; how many.  A code is consumed by its
+exchange, so these are the ones never exchanged. -/
+def Store.purgeCodes (s : Store) (now : Nat) : IO Nat := s.run fun c =>
+  exec c "DELETE FROM codes WHERE expires <= ?" #[now]
+
+/-! ## Codes and refresh-token families tied to sessions -/
+
+/-- Record which session an authorization code was issued from. -/
+def Store.setCodeSession (s : Store) (codeHash session : SecretHash) : IO Unit :=
+  s.run fun c => discard <| exec c "UPDATE codes SET session_hash = ? WHERE code_hash = ?"
+    #[session, codeHash]
+
+/-- The session an authorization code was issued from, read before the code is
+consumed. -/
+def Store.codeSession (s : Store) (codeHash : SecretHash) : IO (Option SecretHash) :=
+  s.run fun c => do
+    let row ← queryOne c "SELECT session_hash FROM codes WHERE code_hash = ?" #[codeHash]
+      (colOpt colBlob · 0)
+    return (row.bind id).map SecretHash.ofStored
+
+/-- Record a new refresh-token family's absolute expiry and the session it is
+tied to (`none` for an `offline_access` grant).  The triggers of the schema
+move the tie when the session is rotated, and revoke the family when the
+session ends.  A family whose session has already ended when it is recorded is
+revoked at once, so nothing outlives the session it came from. -/
+def Store.addRefreshFamily (s : Store) (family : ByteArray) (expires : Nat)
+    (session : Option SecretHash) (now : Nat) : IO Unit := s.atomically fun c => do
+  discard <| exec c
+    "INSERT INTO refresh_families (family, expires, session_hash) VALUES (?, ?, ?)"
+    #[family, expires, Value.opt session]
+  if let some h := session then
+    let live ← queryOne c "SELECT 1 FROM sessions WHERE id_hash = ?" #[h] (colInt · 0)
+    if live.isNone then
+      discard <| exec c "DELETE FROM refresh_tokens WHERE family = ?" #[family]
+      discard <| exec c
+        "INSERT OR IGNORE INTO revoked_families (family, revoked) VALUES (?, ?)" #[family, now]
+
+/-- The absolute expiry of the family a refresh token belongs to, if it has
+one: what rotation must not extend. -/
+def Store.familyExpiry (s : Store) (tokenHash : SecretHash) : IO (Option Nat) := s.run fun c =>
+  queryOne c
+    "SELECT f.expires FROM refresh_tokens t JOIN refresh_families f ON f.family = t.family \
+      WHERE t.token_hash = ?" #[tokenHash] (colNat · 0)
+
+/-! ## Device codes, by client -/
+
+/-- Poll with a device code on behalf of `clientId` (RFC 8628 §3.5), as
+`Store.pollDeviceCode` does, with two differences: only a code issued to
+`clientId` is touched, so a poll by another client changes and destroys
+nothing; and polling too fast grows the code's interval by five seconds, as
+§3.5 asks of `slow_down`.  `none` when the code exists but belongs to another
+client. -/
+def Store.pollDeviceCodeFor (s : Store) (deviceCodeHash : SecretHash) (clientId : String)
+    (now : Nat) : IO (Option DevicePoll) := s.atomically fun c => do
+  let decided ← queryOne c
+    "DELETE FROM device_codes \
+      WHERE device_code_hash = ? AND client_id = ? AND status IN ('approved', 'denied') \
+      AND expires > ? \
+      RETURNING status, client_id, scope, user_id, amr, auth_time"
+    #[deviceCodeHash, clientId, now] fun st =>
+      return (← colText st 0, ← colText st 1, ← colText st 2, ← colOpt colInt st 3,
+        ← colList st 4, ← colOpt colNat st 5)
+  match decided with
+  | some ("approved", cid, scope, some user, amr, some authTime) =>
+    return some (.approved cid scope ⟨user⟩ amr authTime)
+  | some _ => return some .denied
+  | none =>
+    let pending ← queryOne c
+      "SELECT interval, last_poll FROM device_codes \
+        WHERE device_code_hash = ? AND client_id = ? AND status = 'pending' AND expires > ?"
+      #[deviceCodeHash, clientId, now] fun st => return (← colNat st 0, ← colNat st 1)
+    match pending with
+    | some (interval, lastPoll) =>
+      if lastPoll + interval > now then
+        discard <| exec c
+          "UPDATE device_codes SET last_poll = ?, interval = interval + 5 \
+            WHERE device_code_hash = ?" #[now, deviceCodeHash]
+        return some .slowDown
+      discard <| exec c "UPDATE device_codes SET last_poll = ? WHERE device_code_hash = ?"
+        #[now, deviceCodeHash]
+      return some .pending
+    | none =>
+      let other ← queryOne c
+        "SELECT 1 FROM device_codes WHERE device_code_hash = ? AND client_id != ?"
+        #[deviceCodeHash, clientId] (colInt · 0)
+      return if other.isSome then none else some .expired
 
 end Store
 end Pyle

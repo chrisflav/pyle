@@ -1,4 +1,4 @@
-import Pyle.Session.Session
+import Pyle.Session.Policy
 import Pyle.Oidc.Jwk
 
 /-!
@@ -64,12 +64,6 @@ def signinUrl (returnTo : String) (maxAge : Option Nat := none) (phr : Bool := f
 def signinRedirect (returnTo : String) (maxAge : Option Nat := none) (phr : Bool := false) :
     Reply :=
   Reply.redirect (signinUrl returnTo maxAge phr)
-
-/-- The `acr` of a sign-in from its `amr`: `phr` (phishing-resistant) when a
-WebAuthn authenticator verified the user — `user` together with `hwk` or `swk`
-— and `mfa` otherwise.  The same rule as the sign-in policy's `Policy.acr`. -/
-def acrOf (amr : List String) : String :=
-  if amr.contains "user" && (amr.contains "hwk" || amr.contains "swk") then "phr" else "mfa"
 
 /-- The `sub` pyle gives a user: the base64url of the account's random user
 handle, stable for the account's life and saying nothing about its name. -/

@@ -28,7 +28,8 @@ open Http
 open Lean (Json)
 
 /-- The scopes pyle knows. -/
-def scopesSupported : List String := ["openid", "profile", "groups", "kleis"]
+def scopesSupported : List String :=
+  ["openid", "profile", "groups", "offline_access", "kleis"]
 
 /-- The claims ID tokens and `/userinfo` carry. -/
 def claimsSupported : List String :=
@@ -43,7 +44,7 @@ def discoveryDocument (issuer : String) : Json :=
     ("token_endpoint", Json.str (issuer ++ "/token")),
     ("userinfo_endpoint", Json.str (issuer ++ "/userinfo")),
     ("jwks_uri", Json.str (issuer ++ "/jwks")),
-    ("end_session_endpoint", Json.str (issuer ++ "/logout")),
+    ("end_session_endpoint", Json.str (issuer ++ "/end_session")),
     ("device_authorization_endpoint", Json.str (issuer ++ "/device_authorization")),
     ("biscuit_keys_uri", Json.str (issuer ++ "/biscuit/keys")),
     ("scopes_supported", strs scopesSupported),

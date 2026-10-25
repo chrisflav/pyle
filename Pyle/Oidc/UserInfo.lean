@@ -1,4 +1,4 @@
-import Pyle.Oidc.Common
+import Pyle.Oidc.IdToken
 import Pyle.Token.Biscuit
 
 /-!
@@ -6,10 +6,11 @@ import Pyle.Token.Biscuit
 
 `GET` or `POST /userinfo` (OpenID Connect Core §5.3) with an access token in
 the `Authorization: Bearer` header (RFC 6750 §2.1) answers the claims about
-its user: `sub`, `name` and `groups`.  The access token is a biscuit, verified
-here as any service verifies one (`Token.verify`), for the audience `pyle`,
-which every access token pyle issues includes.  The account is read afresh,
-so a disabled one gets nothing.
+its user: `sub`, and `name` and `groups` when the token's scope includes
+`profile` and `groups` (`scopedClaims`, as in the ID token).  The access
+token is a biscuit, verified here as any service verifies one
+(`Token.verify`), for the audience `pyle`, which every access token pyle
+issues includes.  The account is read afresh, so a disabled one gets nothing.
 
 A missing or bad token is answered `401` with a `WWW-Authenticate` challenge,
 naming `invalid_token` when there was a token (RFC 6750 §3).
@@ -51,10 +52,9 @@ def bearerUser (ctx : Ctx) (r : Req) : IO (Except Reply (Store.User × Token.Ide
 def userinfo : Handler := fun ctx r => do
   match ← bearerUser ctx r with
   | .error reply => return reply
-  | .ok (u, _) =>
-    return noStore <| Reply.json <| Json.mkObj
-      [("sub", Json.str (subjectOf u)), ("name", Json.str u.name),
-       ("groups", Json.arr (u.groups.map Json.str).toArray)]
+  | .ok (u, identity) =>
+    return noStore <| Reply.json <| Json.mkObj <|
+      [("sub", Json.str (subjectOf u))] ++ scopedClaims u identity.scopes
 
 end Oidc
 end Pyle

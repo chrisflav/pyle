@@ -36,8 +36,8 @@ def tokenResponse (ctx : Ctx) (r : Req) (client : Store.Client) (user : Store.Us
       audience := [client.id, Token.pyleAudience], scopes := words scope } now expires
   let idToken ← if (words scope).contains "openid" then
       let settings := (← ctx.store.clientSettings client.id).getD {}
-      let claims := idTokenClaims ctx.config.issuer client.id user amr (some authTime) nonce now
-        (now + ctx.config.idTokenSeconds)
+      let claims := idTokenClaims ctx.config.issuer client.id user (words scope) amr
+        (some authTime) nonce now (now + ctx.config.idTokenSeconds)
       some <$> signIdToken ctx.store ctx.rootKey settings claims now
     else pure none
   Audit.log ctx r .tokenIssued .success (userName := some user.name)
@@ -48,14 +48,25 @@ def tokenResponse (ctx : Ctx) (r : Req) (client : Store.Client) (user : Store.Us
     (idToken.map fun t => [("id_token", Json.str t)]).getD [] ++
     (refresh.map fun t => [("refresh_token", Json.str t)]).getD []
 
-/-- Start a refresh-token family for a grant and return its first token. -/
+/-- The scope that unties a refresh-token family from the browser session. -/
+def offlineAccess : String := "offline_access"
+
+/-- Start a refresh-token family for a grant and return its first token.
+
+The family expires `refreshTokenSeconds` from now however often it is
+rotated.  Unless the scope includes `offline_access`, it is tied to `session`,
+the pyle session the grant came from, and is revoked when that session ends —
+by sign-out, from the account page, by being replaced, or by expiring. -/
 def startRefresh (ctx : Ctx) (family : ByteArray) (client : Store.Client) (user : Store.User)
-    (scope : String) (amr : List String) (authTime : Nat) : IO String := do
+    (scope : String) (amr : List String) (authTime : Nat) (session : Option Store.SecretHash) :
+    IO String := do
   let now ← ctx.clock
   let token ← randomToken
+  let expires := now + ctx.config.refreshTokenSeconds
   ctx.store.startRefreshFamily (tokenHash token)
-    { family, clientId := client.id, user := user.id, scope, amr, authTime,
-      expires := now + ctx.config.refreshTokenSeconds } now
+    { family, clientId := client.id, user := user.id, scope, amr, authTime, expires } now
+  let tie := if (words scope).contains offlineAccess then none else session
+  ctx.store.addRefreshFamily family expires tie now
   return token
 
 end Oidc

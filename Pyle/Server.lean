@@ -3,6 +3,7 @@ import Std.Net
 import Pyle.Session.Session
 import Pyle.Audit
 import Pyle.Sys
+import Pyle.Oidc.Routes
 
 /-!
 # The server
@@ -25,6 +26,7 @@ The endpoints so far:
 
 * `GET /healthz` — `200` with `{"status":"ok"}` once the database answers.
 * `POST /logout` — ends the request's session, if any, and clears the cookie.
+* the protocols of DESIGN.md §5, listed in `Pyle.Oidc.Routes`.
 -/
 
 namespace Pyle
@@ -59,7 +61,7 @@ def logout : Http.Handler := fun ctx r => do
 def routes : List Route := [
   .mk' .get "/healthz" healthz,
   .mk' .post "/logout" logout
-]
+] ++ Oidc.routes
 
 /-- Answer one request. -/
 def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r
@@ -141,7 +143,7 @@ def toReq (config : Config) (req : Request Body.Stream) (body : ByteArray) : Req
     | some a => peerAddress a.addr
     | none => ""
   let xff := forwardedFor headers
-  { method := req.line.method, path, query, headers, body,
+  { method := req.line.method, path, query, headers, body, peer,
     clientAddress := Http.clientAddress config.trustedProxies peer xff }
 
 instance : Handler Adapter where

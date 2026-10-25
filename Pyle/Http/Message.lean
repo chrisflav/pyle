@@ -32,6 +32,10 @@ structure Req where
   is (`Http.clientAddress`).  This is what rate limits and the audit log
   record. -/
   clientAddress : String := ""
+  /-- The socket peer the request arrived from, before any `X-Forwarded-For`
+  is read: what forward authentication checks against the trusted proxies,
+  since only a trusted proxy's `X-Forwarded-Host` may be believed. -/
+  peer : String := ""
   /-- The values of the route pattern's `:name` segments, filled in by the
   router. -/
   params : List (String × String) := []

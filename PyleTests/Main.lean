@@ -5,6 +5,10 @@ import PyleTests.Session
 import PyleTests.Audit
 import PyleTests.Factor
 import PyleTests.WebAuthn
+import PyleTests.Oidc
+import PyleTests.Token
+import PyleTests.Device
+import PyleTests.ForwardAuth
 
 /-!
 # The test driver
@@ -24,4 +28,8 @@ def main : IO UInt32 := do
   auditTests
   factorTests
   webAuthnTests
+  providerTests
+  tokenTests
+  deviceGrantTests
+  forwardAuthTests
   report

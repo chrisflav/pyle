@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import LeanBiscuit.Parser
 
 /-!
 # Configuration
@@ -21,8 +22,10 @@ One JSON file, read at startup by every command:
 ```
 
 Only `issuer`, `rpId` and `origins` are required; the rest have the defaults
-shown.  Relative paths are relative to the directory the configuration file is
-in, so a deployment directory can be moved as a whole.
+shown, and the protocol settings (`accessTokenSeconds`, `forwardAuthHosts` and
+the others in the block below) have the defaults their fields give.  Relative
+paths are relative to the directory the configuration file is in, so a
+deployment directory can be moved as a whole.
 
 An unknown key is an error rather than ignored.  A misspelt
 `sessionIdleSecond` silently falling back to eight hours is the kind of
@@ -61,6 +64,26 @@ structure Config where
   then the client address is the socket's peer, and a header anyone can send
   decides nothing. -/
   trustedProxies : List String := []
+  -- Protocols (DESIGN.md §5): token lifetimes, the device grant, and the hosts
+  -- forward authentication answers for.
+  /-- How long an access token (a biscuit) is good for, in seconds. -/
+  accessTokenSeconds : Nat := 3600
+  /-- How long an ID token is good for, in seconds. -/
+  idTokenSeconds : Nat := 600
+  /-- How long a refresh token is good for after it is issued, in seconds. -/
+  refreshTokenSeconds : Nat := 30 * 86400
+  /-- How long a device code waits for the user, in seconds (RFC 8628 §3.2). -/
+  deviceCodeSeconds : Nat := 600
+  /-- The least seconds between two polls with a device code. -/
+  devicePollSeconds : Nat := 5
+  /-- How long a kleis attestation block is good for, in seconds (§5.4). -/
+  attestationSeconds : Nat := 300
+  /-- The hosts forward authentication answers for, each with the datalog
+  policy deciding who may reach it (§5.3).  A host not listed is refused. -/
+  forwardAuthHosts : List (String × String) := []
+  /-- How long the forward-authentication cookie a protected host is given
+  lives, in seconds; the session behind it is checked on every request. -/
+  forwardAuthCookieSeconds : Nat := 8 * 3600
   deriving Repr, Inhabited
 
 namespace Config
@@ -68,7 +91,9 @@ namespace Config
 /-- The keys a configuration file may contain. -/
 def knownKeys : List String :=
   ["issuer", "host", "port", "database", "rootKeyFile", "rpId", "origins",
-   "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies"]
+   "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies",
+   "accessTokenSeconds", "idTokenSeconds", "refreshTokenSeconds", "deviceCodeSeconds",
+   "devicePollSeconds", "attestationSeconds", "forwardAuthHosts", "forwardAuthCookieSeconds"]
 
 /-- A required string field. -/
 private def reqStr (j : Json) (k : String) : Except String String :=
@@ -97,6 +122,11 @@ private def asNat (v : Json) : Option Nat := (v.getNat?).toOption
 /-- A JSON array of strings. -/
 private def asStrs : Json → Option (List String)
   | .arr xs => xs.toList.mapM asStr
+  | _ => none
+
+/-- A JSON object of strings, in order. -/
+private def asStrMap : Json → Option (List (String × String))
+  | .obj kvs => kvs.toArray.toList.mapM fun (k, v) => (k, ·) <$> asStr v
   | _ => none
 
 /-- Split an `https://host[:port][/path]` URL into scheme, authority and path,
@@ -159,12 +189,35 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   if idle > absolute then
     throw "'sessionIdleSeconds' must not exceed 'sessionAbsoluteSeconds'"
   let trustedProxies ← opt j "trustedProxies" [] asStrs "an array of addresses"
+  let positive (k : String) (dflt : Nat) : Except String Nat := do
+    let n ← opt j k dflt asNat "a number of seconds"
+    if n == 0 then throw s!"'{k}' must be positive"
+    return n
+  let accessTokenSeconds ← positive "accessTokenSeconds" 3600
+  let idTokenSeconds ← positive "idTokenSeconds" 600
+  let refreshTokenSeconds ← positive "refreshTokenSeconds" (30 * 86400)
+  let deviceCodeSeconds ← positive "deviceCodeSeconds" 600
+  let devicePollSeconds ← positive "devicePollSeconds" 5
+  let attestationSeconds ← positive "attestationSeconds" 300
+  let forwardAuthCookieSeconds ← positive "forwardAuthCookieSeconds" (8 * 3600)
+  let forwardAuthHosts ← opt j "forwardAuthHosts" [] asStrMap
+    "an object from host names to datalog policies"
+  for (host, policy) in forwardAuthHosts do
+    if host.isEmpty || host.contains '/' || host.contains '@' then
+      throw s!"'{host}' in 'forwardAuthHosts' is not a host name"
+    match LeanBiscuit.Parser.parseAuthorizer policy with
+    | .ok src =>
+      if src.policies.isEmpty then
+        throw s!"the forward-auth policy for '{host}' has no allow or deny policy"
+    | .error e => throw s!"the forward-auth policy for '{host}' is not datalog: {e}"
   let resolve (p : String) : System.FilePath :=
     let fp : System.FilePath := p
     if fp.isAbsolute then fp else base / fp
   return { issuer, host, port := port.toUInt16, database := resolve database,
            rootKeyFile := resolve rootKeyFile, rpId, origins,
-           sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies }
+           sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies,
+           accessTokenSeconds, idTokenSeconds, refreshTokenSeconds, deviceCodeSeconds,
+           devicePollSeconds, attestationSeconds, forwardAuthHosts, forwardAuthCookieSeconds }
 
 /-- Read and check a configuration file. -/
 def load (path : System.FilePath) : IO Config := do

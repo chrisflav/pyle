@@ -188,8 +188,34 @@ def migration1 : Migration where
      ) STRICT"
   ]
 
+/-- What the protocols need beyond the first schema (DESIGN.md §5):
+
+* per client, the algorithm its ID tokens are signed with (`ES256` unless the
+  client was registered with `RS256`, OpenID Connect Registration's
+  `id_token_signed_response_alg`) and the URIs RP-initiated logout may return
+  to (`post_logout_redirect_uris`);
+* the one-time codes forward authentication hands a protected host to set its
+  own cookie with (§5.3), each bound to the session it was issued from, the
+  host, and the path to return to.  A session's identifier changes when it is
+  rotated, so the session is named by its hash without a foreign key. -/
+def migration2 : Migration where
+  version := 2
+  description := "client signing algorithm and logout URIs; forward-auth codes"
+  statements := [
+    "ALTER TABLE clients ADD COLUMN id_token_alg TEXT NOT NULL DEFAULT 'ES256'
+       CHECK (id_token_alg IN ('ES256', 'RS256'))",
+    "ALTER TABLE clients ADD COLUMN post_logout_redirect_uris TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE forward_auth_codes (
+       code_hash BLOB PRIMARY KEY,
+       session_hash BLOB NOT NULL,
+       host TEXT NOT NULL,
+       path TEXT NOT NULL,
+       expires INTEGER NOT NULL
+     ) STRICT"
+  ]
+
 /-- Every migration, in order.  Append only. -/
-def migrations : List Migration := [migration1]
+def migrations : List Migration := [migration1, migration2]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

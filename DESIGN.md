@@ -579,3 +579,11 @@ deployment.
 - **Synced passkeys.**  Passkeys synced by Apple, Google or a password manager
   are as strong as that account.  Whether to require device-bound credentials
   (backup-eligible flag clear) for administrators is a policy knob to decide.
+- **Replacing the root key, and ending every session.**  The root key never
+  changes, and there is no way to end every session at once.  So the
+  database together with the root key — a leaked backup, a stolen disk — is
+  beyond repair from within pyle: with both, an attacker can make
+  forward-authentication cookies for every live session and read every TOTP
+  secret, and `keys rotate` changes neither.  Wanted: re-sealing the secret
+  columns under a new root key, a new forward-auth MAC key with it, and a
+  command that ends every session and refresh-token family.

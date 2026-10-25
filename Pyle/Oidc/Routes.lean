@@ -41,8 +41,8 @@ def routes : List Route := [
   .mk' .post "/device" Device.pagePost,
   .mk' .post "/kleis/attest" Token.attestBearer (csrf := .exempt),
   .mk' .post "/kleis/attest/session" Token.attestSession,
-  .mk' .get "/forward-auth" ForwardAuth.check,
-  .mk' .get "/forward-auth/grant" ForwardAuth.grant
+  .mk' .get "/forward-auth" ForwardAuth.check (exact := true),
+  .mk' .get "/forward-auth/grant" ForwardAuth.grant (exact := true)
 ]
 
 end Oidc

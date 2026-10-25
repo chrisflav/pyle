@@ -12,6 +12,7 @@ import PyleTests.Oidc
 import PyleTests.Token
 import PyleTests.Device
 import PyleTests.ForwardAuth
+import PyleTests.EndToEnd
 
 /-!
 # The test driver
@@ -38,4 +39,5 @@ def main : IO UInt32 := do
   tokenTests
   deviceGrantTests
   forwardAuthTests
+  endToEndTests
   report

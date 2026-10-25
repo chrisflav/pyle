@@ -69,6 +69,11 @@ def signInConfigTests : IO Unit := do
   check "an AAGUID must be 32 hex digits"
     (!ok ",\"attestationRoots\":[\"r.pem\"],\"aaguidAllowList\":[\"f00d\"]")
   check "allowPasswords must be a boolean" (!ok ",\"allowPasswords\":\"yes\"")
+  let hosts := ",\"forwardAuthHosts\":{\"app.a.example\":\"allow if user($u);\"}"
+  check "forward-auth hosts need the proxy's secret" (!ok hosts)
+  check "and parse with it" (ok (hosts ++ ",\"forwardAuthSecret\":\"0123456789abcdef\""))
+  check "which is at least 16 characters"
+    (!ok (hosts ++ ",\"forwardAuthSecret\":\"0123456789abcde\""))
 
 /-- Assets and the policy every page lives under. -/
 def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := true })

@@ -22,7 +22,11 @@ a burst of concurrent guesses cannot all pass the check before any of them is
 counted.  The failure is provisional: `succeed` takes it back from the address
 and clears the account's count — it was the account's owner — but leaves the
 address's earlier failures, which would otherwise let an attacker with one
-working account reset their own address between guesses.
+working account reset their own address between guesses.  Taking it back
+restores the time of the address's last real failure too, when nothing else
+has been recorded against it since: a success is not a failure, and must
+neither start the back-off delay again for the next attempt nor keep earlier
+failures from being forgotten.
 
 **Memory is bounded.**  Keys have a fixed size — the first 16 bytes of the
 SHA-256 of the normalised account name or address — so a long name costs no
@@ -65,7 +69,11 @@ structure Entry where
   failures : Nat
   /-- When the last one was. -/
   lastFailure : Nat
-  deriving Repr, Inhabited
+  /-- Which recorded failure the entry is: a number the limiter never hands
+  out twice, so that an attempt can tell whether the entry is still the one it
+  left, even if another has since left one with the same count and time. -/
+  stamp : Nat := 0
+  deriving Repr, Inhabited, BEq
 
 /-- The delay a key with `e` must wait after its last failure: zero within the
 free failures, then `baseDelay * 2^k`, capped at `maxDelay`. -/
@@ -122,6 +130,8 @@ structure State where
   entries : Std.HashMap Key Entry := {}
   /-- When forgotten entries were last swept. -/
   lastSweep : Nat := 0
+  /-- The stamp the next recorded failure gets; it only increases. -/
+  nextStamp : Nat := 1
 
 /-- Drop forgotten entries, if a sweep is due; and if the table is full,
 the oldest quarter of what remains. -/
@@ -129,7 +139,7 @@ def State.prune (p : Policy) (st : State) (now : Nat) : State := Id.run do
   let mut st := st
   if st.lastSweep + p.sweepInterval ≤ now || st.entries.size ≥ p.maxEntries then
     let live := st.entries.filter fun _ e => e.lastFailure + p.forgetAfter > now
-    st := { entries := live, lastSweep := now }
+    st := { st with entries := live, lastSweep := now }
   if st.entries.size ≥ p.maxEntries then
     let byAge := st.entries.toArray.qsort (fun a b => a.2.lastFailure < b.2.lastFailure)
     let drop := max 1 (st.entries.size / 4)
@@ -142,7 +152,8 @@ def State.fail (p : Policy) (st : State) (k : Key) (now : Nat) : State :=
   let failures := match st.entries.get? k with
     | some e => if e.lastFailure + p.forgetAfter ≤ now then 1 else e.failures + 1
     | none => 1
-  { st with entries := st.entries.insert k { failures, lastFailure := now } }
+  let e := { failures, lastFailure := now, stamp := st.nextStamp }
+  { st with entries := st.entries.insert k e, nextStamp := st.nextStamp + 1 }
 
 /-- The limiter: the policy, and the state.  Every change is one
 `IO.Ref.modifyGet`, which is atomic. -/
@@ -163,6 +174,10 @@ structure Attempt where
   account : Option Key
   /-- The client key. -/
   client : Key
+  /-- The client key's entry before the provisional failure, if it had one. -/
+  clientBefore : Option Entry := none
+  /-- The stamp of the client key's entry the provisional failure left. -/
+  clientStamp : Nat := 0
 
 /-- Ask to make an attempt.  If any key of the request must still wait, the
 longest wait in seconds, and nothing is recorded.  Otherwise a failure is
@@ -178,11 +193,17 @@ def RateLimiter.tryAcquire (rl : RateLimiter) (account : Option String) (client 
       max w ((st.entries.get? k).elim 0 (p.wait · now))
     if wait > 0 then (.error wait, st)
     else
+      let ck := Key.client client
+      let before := st.entries.get? ck
       let st := keys.foldl (init := st) fun st k => st.fail p k now
-      (.ok { account := account.map Key.account, client := Key.client client }, st)
+      (.ok { account := account.map Key.account, client := ck, clientBefore := before,
+             clientStamp := (st.entries.get? ck).elim 0 (·.stamp) }, st)
 
 /-- An attempt succeeded: clear the account's count, and take back the
-provisional failure from the address, leaving its earlier ones. -/
+provisional failure from the address, leaving its earlier ones.  If the
+address's entry is still the one the attempt left — the same stamp, not merely
+the same count and time — it goes back to what it was before, time included;
+if another attempt has been counted since, only the count is taken back. -/
 def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
   rl.state.modify fun st =>
     let entries := match a.account with
@@ -190,7 +211,11 @@ def RateLimiter.succeed (rl : RateLimiter) (a : Attempt) : IO Unit :=
       | none => st.entries
     let entries := match entries.get? a.client with
       | some e =>
-        if e.failures ≤ 1 then entries.erase a.client
+        if e.stamp == a.clientStamp then
+          match a.clientBefore with
+          | some b => entries.insert a.client b
+          | none => entries.erase a.client
+        else if e.failures ≤ 1 then entries.erase a.client
         else entries.insert a.client { e with failures := e.failures - 1 }
       | none => entries
     { st with entries }

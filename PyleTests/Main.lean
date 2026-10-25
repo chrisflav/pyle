@@ -4,6 +4,7 @@ import PyleTests.Http
 import PyleTests.Session
 import PyleTests.Audit
 import PyleTests.Factor
+import PyleTests.WebAuthn
 
 /-!
 # The test driver
@@ -22,4 +23,5 @@ def main : IO UInt32 := do
   sessionTests
   auditTests
   factorTests
+  webAuthnTests
   report

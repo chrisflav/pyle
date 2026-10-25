@@ -304,31 +304,50 @@ def deviceTests : IO Unit := withCtx fun ctx _ => do
   s.addDeviceCode (.of dc)
     { userCode := "WDJB-MJHT", clientId := "cli", scope := "openid", interval := 5,
       expires := 1000 }
-  match ← s.pollDeviceCode (.of dc) 100 with
-  | .pending => check "a fresh code is pending" true
+  match ← s.pollDeviceCodeFor (.of dc) "cli" 100 with
+  | some .pending => check "a fresh code is pending" true
   | _ => check "a fresh code is pending" false
-  match ← s.pollDeviceCode (.of dc) 102 with
-  | .slowDown => check "polling too fast is slow_down" true
+  match ← s.pollDeviceCodeFor (.of dc) "cli" 102 with
+  | some .slowDown => check "polling too fast is slow_down" true
   | _ => check "polling too fast is slow_down" false
+  match ← s.pollDeviceCodeFor (.of dc) "cli" 108 with
+  | some .slowDown => check "slow_down grows the interval by five seconds" true
+  | _ => check "slow_down grows the interval by five seconds" false
+  match ← s.pollDeviceCodeFor (.of dc) "other" 109 with
+  | none => check "another client's poll is refused" true
+  | _ => check "another client's poll is refused" false
   checkEq "the user code finds it" ((← s.findPendingDeviceCode "WDJB-MJHT" 110).map (·.clientId))
     (some "cli")
   check "approved" (← s.decideDeviceCode "WDJB-MJHT" (.approved u.id ["hwk"] 110) 110)
   check "not twice" (!(← s.decideDeviceCode "WDJB-MJHT" .denied 111))
-  match ← s.pollDeviceCode (.of dc) 120 with
-  | .approved cl _ user amr _ =>
+  match ← s.pollDeviceCodeFor (.of dc) "other" 115 with
+  | none => check "another client cannot collect the approval" true
+  | _ => check "another client cannot collect the approval" false
+  match ← s.pollDeviceCodeFor (.of dc) "cli" 120 with
+  | some (.approved cl _ user amr _) =>
     check "the poll collects the approval" (cl == "cli" && user == u.id && amr == ["hwk"])
   | _ => check "the poll collects the approval" false
-  match ← s.pollDeviceCode (.of dc) 130 with
-  | .expired => check "and only once" true
+  match ← s.pollDeviceCodeFor (.of dc) "cli" 130 with
+  | some .expired => check "and only once" true
   | _ => check "and only once" false
   let dc2 ← Crypto.randomBytes 32
   s.addDeviceCode (.of dc2)
     { userCode := "AAAA-BBBB", clientId := "cli", scope := "openid", interval := 5,
       expires := 1000 }
   check "denied" (← s.decideDeviceCode "AAAA-BBBB" .denied 100)
-  match ← s.pollDeviceCode (.of dc2) 120 with
-  | .denied => check "the poll sees the denial" true
+  match ← s.pollDeviceCodeFor (.of dc2) "cli" 120 with
+  | some .denied => check "the poll sees the denial" true
   | _ => check "the poll sees the denial" false
+  let dc3 ← Crypto.randomBytes 32
+  s.addDeviceCode (.of dc3)
+    { userCode := "CCCC-DDDD", clientId := "cli", scope := "openid", interval := 5,
+      expires := 200 }
+  match ← s.pollDeviceCodeFor (.of dc3) "cli" 200 with
+  | some .expired => check "an expired code is expired" true
+  | _ => check "an expired code is expired" false
+  match ← s.pollDeviceCodeFor (.of dc3) "other" 200 with
+  | none => check "even an expired code is refused to another client" true
+  | _ => check "even an expired code is refused to another client" false
   let inv ← Crypto.randomBytes 32
   s.addInvitation (.of inv)
     { userName := "bob", groups := ["dev"], createdBy := "alice", created := 1, expires := 100 }

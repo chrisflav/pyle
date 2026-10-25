@@ -13,11 +13,12 @@ invitation — is stored as its SHA-256 and consumed atomically:
 * a code by one `DELETE … RETURNING`, so it is good once (§5.1, §9.4);
 * a refresh token by `rotateRefreshToken`, one transaction that marks it used
   and stores its successor, or revokes its whole family when the token
-  presented was already used (§5.1); a revoked family is recorded, and the
-  schema refuses any token added to one;
-* a device code by one `DELETE … RETURNING` that only matches once it has been
-  approved;
-* an invitation by one `DELETE … RETURNING`.
+  presented was already used (§5.1), as `refreshDecision` decides; a revoked
+  family is recorded, and the schema refuses any token added to one;
+* a device code by `Store.pollDeviceCodeFor`, one transaction that reads it
+  and deletes it once it has been decided, as `deviceDecision` decides;
+* an invitation by `Store.redeemInvitation`, one transaction that reads it,
+  checks it, and deletes it as it creates the account.
 
 The binding checks (client, redirect URI, PKCE) belong to the OIDC modules;
 the store returns the bound fields so that they can be checked, and makes sure
@@ -185,49 +186,84 @@ inductive RefreshOutcome where
   /-- No such token for this client, or it has expired. -/
   | invalid
 
-/-- Present refresh token `old` on behalf of `clientId`, and rotate it to
-`new`, valid until `expires`.  One `BEGIN IMMEDIATE` transaction:
+/-- A refresh-token row as rotation reads it: the grant it carries, when it
+was used, if it was, and whether its family has been revoked. -/
+structure RefreshRow where
+  /-- The grant, with the token's own expiry. -/
+  grant : RefreshGrant
+  /-- When the token was used, if it was. -/
+  usedAt : Option Nat
+  /-- Whether its family is recorded in `revoked_families`. -/
+  familyRevoked : Bool
 
-* if `old` is this client's, unused, unexpired, and its family not revoked,
-  mark it used and insert `new` in the same family — the successor exists
-  exactly when its predecessor was used, and never in a revoked family;
-* if `old` is this client's and was used before, revoke its family: delete
-  every token in it and record the family as revoked, so nothing can be added
-  to it afterwards;
-* otherwise the token is invalid, and nothing changes.  A token presented by
-  the wrong client revokes nothing, so one client cannot end another's
-  sessions by replaying a value it should never have seen. -/
+/-- What presenting a refresh token is to do to the store. -/
+inductive RefreshDecision where
+  /-- Mark the token used and store its successor with this grant. -/
+  | rotate (grant : RefreshGrant)
+  /-- The token was used before: revoke this family. -/
+  | revoke (family : ByteArray)
+  /-- Change nothing: the token is unknown, another client's, expired, or of a
+  revoked family. -/
+  | invalid
+
+/-- Decide what presenting a refresh token on behalf of `clientId` at `now`
+comes to, given its row, if there is one; a successor would be valid until
+`expires`.
+
+* A token of another client is invalid, so one client cannot end another's
+  sessions by replaying a value it should never have seen.
+* A token used before revokes its family, whether or not it has expired since.
+* An unused token is rotated if it has not expired and its family is not
+  revoked; otherwise it is invalid. -/
+def refreshDecision (row : Option RefreshRow) (clientId : String) (now expires : Nat) :
+    RefreshDecision :=
+  match row with
+  | none => .invalid
+  | some r =>
+    if r.grant.clientId ≠ clientId then .invalid
+    else if r.usedAt.isSome then .revoke r.grant.family
+    else if r.familyRevoked ∨ ¬ now < r.grant.expires then .invalid
+    else .rotate { r.grant with expires }
+
+/-- Present refresh token `old` on behalf of `clientId`, and rotate it to
+`new`, valid until `expires`.  One `BEGIN IMMEDIATE` transaction reads the
+row of `old`, lets `refreshDecision` decide, and carries the decision out:
+
+* `rotate`: mark `old` used and insert `new` in the same family — the
+  successor exists exactly when its predecessor was used, and never in a
+  revoked family;
+* `revoke`: delete every token in the family and record the family as
+  revoked, so nothing can be added to it afterwards;
+* `invalid`: nothing changes. -/
 def Store.rotateRefreshToken (s : Store) (old new : SecretHash) (clientId : String)
     (now expires : Nat) : IO RefreshOutcome := s.atomically fun c => do
-  let used ← queryOne c
-    "UPDATE refresh_tokens SET used_at = ? \
-      WHERE token_hash = ? AND client_id = ? AND used_at IS NULL AND expires > ? \
-      AND family NOT IN (SELECT family FROM revoked_families) \
-      RETURNING family, client_id, user_id, scope, amr, auth_time, expires"
-    #[now, old, clientId, now] fun st => do
+  let row ← queryOne c
+    "SELECT family, client_id, user_id, scope, amr, auth_time, expires, used_at, \
+      EXISTS (SELECT 1 FROM revoked_families r WHERE r.family = refresh_tokens.family) \
+      FROM refresh_tokens WHERE token_hash = ?"
+    #[old] fun st => do
       return {
-        family := ← colBlob st 0
-        clientId := ← colText st 1
-        user := ⟨← colInt st 2⟩
-        scope := ← colText st 3
-        amr := ← colList st 4
-        authTime := ← colNat st 5
-        expires := ← colNat st 6 : RefreshGrant }
-  if let some g := used then
-    let g := { g with expires }
+        grant := {
+          family := ← colBlob st 0
+          clientId := ← colText st 1
+          user := ⟨← colInt st 2⟩
+          scope := ← colText st 3
+          amr := ← colList st 4
+          authTime := ← colNat st 5
+          expires := ← colNat st 6 }
+        usedAt := ← colOpt colNat st 7
+        familyRevoked := (← colInt st 8) != 0 : RefreshRow }
+  match refreshDecision row clientId now expires with
+  | .rotate g =>
+    discard <| exec c "UPDATE refresh_tokens SET used_at = ? WHERE token_hash = ?" #[now, old]
     insertRefreshToken c new g now
     return .rotated g
-  let family ← queryOne c
-    "SELECT family FROM refresh_tokens \
-      WHERE token_hash = ? AND client_id = ? AND used_at IS NOT NULL"
-    #[old, clientId] (colBlob · 0)
-  match family with
-  | some f =>
+  | .revoke f =>
     discard <| exec c "DELETE FROM refresh_tokens WHERE family = ?" #[f]
     discard <| exec c
       "INSERT OR IGNORE INTO revoked_families (family, revoked) VALUES (?, ?)" #[f, now]
     return .reused
-  | none => return .invalid
+  | .invalid => return .invalid
 
 /-- Revoke a whole family, as RP-initiated logout or an administrator does:
 delete its tokens and record it as revoked.  How many tokens it had. -/
@@ -308,34 +344,6 @@ inductive DevicePoll where
   | denied
   /-- No such code, or it has expired. -/
   | expired
-
-/-- Poll with a device code.  An approved or denied authorization is deleted by
-the poll that sees it, in one `DELETE … RETURNING`, so a device code yields
-tokens at most once. -/
-def Store.pollDeviceCode (s : Store) (deviceCodeHash : SecretHash) (now : Nat) :
-    IO DevicePoll := s.atomically fun c => do
-  let decided ← queryOne c
-    "DELETE FROM device_codes \
-      WHERE device_code_hash = ? AND status IN ('approved', 'denied') AND expires > ? \
-      RETURNING status, client_id, scope, user_id, amr, auth_time"
-    #[deviceCodeHash, now] fun st =>
-      return (← colText st 0, ← colText st 1, ← colText st 2, ← colOpt colInt st 3,
-        ← colList st 4, ← colOpt colNat st 5)
-  match decided with
-  | some ("approved", clientId, scope, some user, amr, some authTime) =>
-    return .approved clientId scope ⟨user⟩ amr authTime
-  | some _ => return .denied
-  | none =>
-    let pending ← queryOne c
-      "SELECT interval, last_poll FROM device_codes \
-        WHERE device_code_hash = ? AND status = 'pending' AND expires > ?"
-      #[deviceCodeHash, now] fun st => return (← colNat st 0, ← colNat st 1)
-    match pending with
-    | none => return .expired
-    | some (interval, lastPoll) =>
-      discard <| exec c "UPDATE device_codes SET last_poll = ? WHERE device_code_hash = ?"
-        #[now, deviceCodeHash]
-      if lastPoll + interval > now then return .slowDown else return .pending
 
 /-- Remove expired device authorizations; how many. -/
 def Store.purgeDeviceCodes (s : Store) (now : Nat) : IO Nat := s.run fun c =>

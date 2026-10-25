@@ -400,6 +400,111 @@ As in kleis, the point of Lean is that some of these become theorems.
 1, 3 and 7 are design constraints from the first commit; 2, 4 and 5 are the
 theorems worth proving; 6 is inherited.
 
+### 9.1 What is proved
+
+Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
+`Quot.sound`, and none uses `sorry` or `native_decide`.
+
+1. **Assertion soundness**: `verifyAssertion_sound` against `AssertionChecks`,
+   in `WebAuthn/Assertion.lean`.  **Registration soundness** likewise:
+   `verifyRegistration_sound` against `RegistrationChecks`, one conjunct per
+   item of §2.2 numbered as the steps of WebAuthn L3 §7.1 (7–10, with 11
+   folded into 10, 13–17, 20–22 and 25), in `WebAuthn/Registration.lean`.
+   Steps 17 (backup state only with backup eligibility) and 25 (credential id
+   at most 1023 bytes) are enforced by `AuthenticatorData.parse` and proved
+   from it (`parse_backup`, `parse_credentialId`); `AssertionChecks` carries
+   the backup-flag check too.  Step 22 is the implementation's own
+   `verifyAttestation` call, written down, and step 21 follows from it.  Not
+   in the theorem: 12 (the hash is computed), 18 and 19 (the backup flags are
+   reported for policy), 23 and 24 (the attestation policy, the caller's),
+   26 (the credential id is not already registered, which needs the store
+   and is the caller's), and 28 (extensions, not acted on).
+
+   What the challenge conjunct is worth: both theorems take the challenge as
+   a parameter, and the server takes it from the same client data
+   (`Policy.challengeOf`), so the conjunct says only that the client data
+   names it in canonical base64url.  That the ceremony answers a challenge
+   the server issued, for this purpose, unexpired and not used before, comes
+   from the caller: `Policy.checkAssertion` and
+   `SignIn.consumeRegistrationChallenge` go on only when
+   `Store.consumeChallenge` hands back a row, which part 2 covers.
+2. **Single use**, in two parts.
+   * *The decisions.*  Each table hands the row it deleted or read to a pure
+     function, and the store or handler only carries out what that function
+     returns: `Store.challengeDecision` (in `Store.consumeChallenge`),
+     `Oidc.codeDecision` (in `Oidc.codeGrant`), `Store.refreshDecision` (in
+     `Store.rotateRefreshToken`) and `Store.deviceDecision` (in
+     `Store.pollDeviceCodeFor`).  `Proofs/Decisions.lean`: a row the store did
+     not hand back is refused (`challengeDecision_none`, `codeDecision_none`,
+     `deviceDecision_none`); a refresh token is rotated only if it is the
+     client's, unused, unexpired and of an unrevoked family
+     (`refreshDecision_rotate`, `refreshDecision_revoked`); a used one revokes
+     its family and is never rotated (`refreshDecision_reused`); another
+     client's changes nothing (`refreshDecision_otherClient`,
+     `deviceDecision_otherClient`); a device code yields tokens only for its
+     client, unexpired, once approved, for the approving user
+     (`deviceDecision_approved`, `deviceDecision_collect`); a challenge comes
+     back only for its purpose, unexpired (`challengeDecision_some`), and a
+     challenge issued to a user admits only that user's credential
+     (`Challenge.admits_user`).
+   * *The state machines.*  `Proofs/SingleUse.lean` models each consume-once
+     table as `Table`, a finite map with `add`, `update`, `take` and `purge`,
+     where `take` returns and removes a row: from the empty table no sequence
+     of operations returns a key twice (`Table.run_nodup`,
+     `Table.run_consumed`).  The refresh-token store is `Families`, whose
+     rotation step calls `Store.refreshDecision` itself: no token is rotated
+     twice (`Families.run_rotated_nodup`), presenting a used token revokes its
+     family (`Families.step_reused`), and a revoked family stays revoked,
+     never holds a token again, and is never rotated into
+     (`Families.run_revoked`).
+   * *Assumptions.*  The models are linked to the SQL, not derived from it.
+     Each operation is atomic: one `DELETE … RETURNING` statement
+     (`consumeChallenge`, `consumeCode`, `consumeForwardAuthCode`) or one
+     `BEGIN IMMEDIATE` transaction (`pollDeviceCodeFor` and
+     `redeemInvitation`, each a read and a conditional delete;
+     `rotateRefreshToken`, `startRefreshFamily`, and the family revocations of
+     `revokeRefreshFamily`, `revokeUserClientFamilies` and
+     `addRefreshFamily`), under the store's lock.  An insert into a revoked
+     family is refused by the trigger `refresh_tokens_not_revoked`
+     (migration 1), the trigger `sessions_end_families` (migration 4) is one
+     more family revocation, and nothing deletes from `revoked_families`.
+     Values handed out never repeat: each is 32 random bytes — a challenge
+     stored as it is, every other value as its SHA-256 — and the models
+     refuse to add a key that has been added before.  The docstrings of
+     `Table` and `Families` name the statements.
+   * *A known gap.*  A code presented again revokes the refresh-token family
+     its first exchange began (RFC 6749 §4.1.2), but that revocation
+     (`Oidc.codeGrant`: `familyExists`, then `revokeRefreshFamily`) runs in
+     transactions separate from the `consumeCode` of the first exchange and
+     from its `startRefreshFamily`.  A replay that lands after the first
+     exchange consumed the code and before it began the family finds no
+     family and revokes nothing; the replay itself is still refused.  This
+     predates the proofs, and nothing above claims otherwise.
+3. **No session without the policy**: structural, as above; `password_alone`,
+   `totp_alone`, `recovery_alone` and the `ofFactors_*` theorems in
+   `Session/Policy.lean` say what the policy rules out.
+4. **Authorization codes**: `codeDecision_issue` — tokens are issued for a
+   code only if the store handed back its row, it was issued to this client,
+   for this `redirect_uri`, the verifier is well formed and its `S256`
+   challenge is the code's, and it has not expired.  That it has not been
+   used is part 2: `consumeCode` is a `take` on `codes`.
+5. **TOTP replay**: `Totp.verify_increasing` and `Totp.verify_near`, in
+   `Factor/Totp.lean`; the last accepted step is stored per user.
+6. **Attenuation**: inherited from `lean-biscuit`.
+7. **Parsers**: base64url (`Base64Url.decode_encode`,
+   `Base64Url.encode_decode`) and CBOR (`Cbor.decode_encode`, for well-formed
+   items within the depth and size bounds) round-trip.  COSE, in
+   `Proofs/Cose.lean`: the key an authenticator writes for a P-256 point on
+   the curve is read back, through CBOR bytes, as that point compressed
+   (`cose_roundTrip_es256`), and a stored Ed25519 key that decompresses is
+   read back as itself (`cose_roundTrip_edDsa`).  A stored P-256 key cannot
+   be written out again without the square root that recovers `y`, which pyle
+   never computes, so that round trip starts from the coordinates.
+
+Not proved: anything about SQLite itself, the triggers or the lock — they are
+the assumptions of part 2; the parsers' totality beyond being total Lean
+functions; and the curve arithmetic (below).
+
 Out of scope for proofs: constant-time behaviour (§6.2), TLS, the browser, and
 the correctness of the curve arithmetic itself, which rests on test vectors
 until someone proves it.
@@ -418,6 +523,7 @@ Pyle/
   Store/       SQLite schema, migrations
   Crypto/      Ffi (sign, random, constant-time compare, Argon2id), Keys
   Http/        routes, cookies, CSRF, rate limiting
+  Proofs/      Decisions, SingleUse, Cose: the theorems of §9 that need no private access
   Audit.lean
 web/           sign-in and account pages (no framework needed; a few hundred lines)
 ```

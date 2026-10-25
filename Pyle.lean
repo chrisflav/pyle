@@ -65,3 +65,6 @@ import Pyle.WebAuthn.AuthenticatorData
 import Pyle.WebAuthn.ClientData
 import Pyle.WebAuthn.Cose
 import Pyle.WebAuthn.Registration
+import Pyle.Proofs.Decisions
+import Pyle.Proofs.SingleUse
+import Pyle.Proofs.Cose

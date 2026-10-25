@@ -1,4 +1,5 @@
 import PyleTests.Crypto
+import PyleTests.WebAuthn
 
 /-!
 # The test driver
@@ -12,4 +13,5 @@ open PyleTests
 
 def main : IO UInt32 := do
   cryptoTests
+  webAuthnTests
   report

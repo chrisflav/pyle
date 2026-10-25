@@ -1,4 +1,8 @@
 import PyleTests.Crypto
+import PyleTests.Store
+import PyleTests.Http
+import PyleTests.Session
+import PyleTests.Audit
 
 /-!
 # The test driver
@@ -12,4 +16,8 @@ open PyleTests
 
 def main : IO UInt32 := do
   cryptoTests
+  storeTests
+  httpTests
+  sessionTests
+  auditTests
   report

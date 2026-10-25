@@ -41,11 +41,15 @@ private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.Fi
 and constant-time comparison, backing `Pyle.Crypto.Ffi`. -/
 extern_lib PyleFfi pkg := ffiStaticLib pkg "PyleFfi"
 
+/-- The POSIX calls behind `Pyle.Sys`: creating the root key with `O_EXCL` and
+mode 0600, and `umask`. -/
+extern_lib PyleSys pkg := ffiStaticLib pkg "PyleSys"
+
 @[default_target]
 lean_lib Pyle
 
 lean_lib PyleTests where
-  globs := #[.andSubmodules `PyleTests]
+  globs := #[.submodules `PyleTests]
 
 /-- The server and its administration commands. -/
 @[default_target]

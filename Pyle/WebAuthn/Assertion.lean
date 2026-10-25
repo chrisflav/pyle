@@ -194,8 +194,10 @@ def AssertionChecks (rp : RelyingParty) (challenge : ByteArray)
     ad.rpIdHash = Sha256.hash rp.id.toUTF8 ∧
     -- 6. the user was present, and verified if the policy says so
     (ad.userPresent = true ∧ (rp.requireUserVerification = true → ad.userVerified = true)) ∧
-    -- 7. backup eligibility is what it was at registration
-    ad.backupEligible = cred.backupEligible ∧
+    -- 7. backup eligibility is what it was at registration, and the backup
+    --    state is not set without it (WebAuthn L3 §7.2 step 18)
+    (ad.backupEligible = cred.backupEligible ∧
+      (ad.backupEligible = false → ad.backupState = false)) ∧
     -- 8. the signature verifies under the stored key
     SignatureValid cred.publicKey (r.authenticatorData ++ Sha256.hash r.clientDataJSON)
       r.signature ∧
@@ -250,7 +252,8 @@ theorem verifyAssertion_sound {rp : RelyingParty} {challenge : ByteArray}
   obtain ⟨c9, h⟩ := ok_of_ite_error h
   cases h
   simp only [ne_eq, Decidable.not_not] at c1 c2 c2' c3 c3' c3'' c4 c5 c6 c6' c7 c8 c9 c1'
-  exact ⟨cd, ad, hcd, had, ⟨c1, c1'⟩, ⟨c2, c2'⟩, ⟨c3, c3', c3''⟩, c4, c5, ⟨c6, c6'⟩, c7, c8, c9,
+  exact ⟨cd, ad, hcd, had, ⟨c1, c1'⟩, ⟨c2, c2'⟩, ⟨c3, c3', c3''⟩, c4, c5, ⟨c6, c6'⟩,
+    ⟨c7, AuthenticatorData.parse_backup had⟩, c8, c9,
     rfl, rfl, rfl, rfl, rfl⟩
 
 end WebAuthn

@@ -38,7 +38,37 @@ open Http
 def liveUser (ctx : Ctx) (id : Store.UserId) : IO (Option Store.User) := do
   return (← ctx.store.findUser id).filter (!·.disabled)
 
-/-- The authorization-code grant. -/
+/-- What exchanging an authorization code comes to. -/
+inductive CodeDecision where
+  /-- Issue tokens for the grant the code carries. -/
+  | issue (code : Store.AuthCode)
+  /-- The code is unknown, was used before, or has expired. -/
+  | unusable
+  /-- The code was issued to another client or for another redirect URI. -/
+  | wrongBinding
+  /-- The code verifier does not answer the code's PKCE challenge. -/
+  | badVerifier
+
+/-- Decide an authorization-code exchange (DESIGN.md §9.4), given the row the
+store deleted for the code, if any, the authenticated client, and the
+`redirect_uri` and `code_verifier` of the request.  Tokens are issued only for
+a code that was there, has not expired at `now`, was issued to this client
+for this redirect URI, and whose challenge the verifier answers.
+
+The store already refuses an expired code; the expiry is checked again here
+so that what `codeGrant` decides rests on this function alone. -/
+def codeDecision (row : Option Store.AuthCode) (clientId redirectUri verifier : String)
+    (now : Nat) : CodeDecision :=
+  match row with
+  | none => .unusable
+  | some a =>
+    if ¬ now < a.expires then .unusable
+    else if a.clientId ≠ clientId ∨ a.redirectUri ≠ redirectUri then .wrongBinding
+    else if Pkce.verifies verifier a.codeChallenge = false then .badVerifier
+    else .issue a
+
+/-- The authorization-code grant.  The code is deleted first, whatever comes
+next, and `codeDecision` decides on what was deleted. -/
 def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × String)) :
     IO Reply := do
   let some code := lookupOnce form "code" | return oauthError "invalid_request" "code is required"
@@ -49,20 +79,23 @@ def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String
   let now ← ctx.clock
   let h := tokenHash code
   let session ← ctx.store.codeSession h
-  let some a ← ctx.store.consumeCode h now
-    | let family := familyOfCode h
-      if ← ctx.store.familyExists family then
-        discard <| ctx.store.revokeRefreshFamily family now
-        Audit.log ctx r .refreshReuse .refused (detail := s!"code reused by {client.id}")
-      return oauthError "invalid_grant" "the code is unknown, used or expired"
-  if a.clientId != client.id || a.redirectUri != redirectUri then
+  let row ← ctx.store.consumeCode h now
+  match codeDecision row client.id redirectUri verifier now with
+  | .unusable =>
+    let family := familyOfCode h
+    if ← ctx.store.familyExists family then
+      discard <| ctx.store.revokeRefreshFamily family now
+      Audit.log ctx r .refreshReuse .refused (detail := s!"code reused by {client.id}")
+    return oauthError "invalid_grant" "the code is unknown, used or expired"
+  | .wrongBinding =>
     return oauthError "invalid_grant" "the code was issued for another client or redirect URI"
-  unless Pkce.verifies verifier a.codeChallenge do
+  | .badVerifier =>
     return oauthError "invalid_grant" "the code verifier does not match the challenge"
-  let some user ← liveUser ctx a.user | return oauthError "invalid_grant" "the account is gone"
-  let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime session
-  tokenResponse ctx r client user a.scope a.amr a.authTime a.nonce (some refresh)
-    "authorization_code"
+  | .issue a =>
+    let some user ← liveUser ctx a.user | return oauthError "invalid_grant" "the account is gone"
+    let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime session
+    tokenResponse ctx r client user a.scope a.amr a.authTime a.nonce (some refresh)
+      "authorization_code"
 
 /-- The refresh-token grant. -/
 def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)

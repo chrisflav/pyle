@@ -147,21 +147,49 @@ def Store.addChallenge (s : Store) (ch : Challenge) : IO Unit := s.run fun c => 
     "INSERT INTO challenges (challenge, purpose, user_id, expires) VALUES (?, ?, ?, ?)"
     #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires]
 
+/-- A challenge row as `consumeChallenge` deletes it: the stored purpose, the
+user it was issued to, and its expiry. -/
+structure ChallengeRow where
+  /-- The `purpose` column, as stored. -/
+  purpose : String
+  /-- The `user_id` column. -/
+  user : Option Int
+  /-- The `expires` column. -/
+  expires : Nat
+
+/-- Whether a deleted challenge row may be used: the challenge `value`, if
+the row was there, was issued for `purpose`, and had not expired at `now`.
+This is the whole of the decision `consumeChallenge` makes; the store only
+deletes the row and hands it here. -/
+def challengeDecision (value : ByteArray) (purpose : ChallengePurpose) (now : Nat) :
+    Option ChallengeRow → Option Challenge
+  | some r =>
+    if r.purpose == purpose.toString && now < r.expires then
+      some { value, purpose, user := r.user.map (⟨·⟩), expires := r.expires }
+    else none
+  | none => none
+
+/-- Whether a consumed challenge may be answered by `user`'s credential: a
+challenge issued to a user admits only that user, and one issued to no one —
+the discoverable flow — admits anyone. -/
+def Challenge.admits (ch : Challenge) (user : UserId) : Bool :=
+  match ch.user with
+  | some u => u == user
+  | none => true
+
 /-- Consume a challenge: delete it and return it if it was pending, issued for
 `purpose`, and not expired at `now`.  A challenge that exists but fails the
 purpose or expiry test is deleted all the same — the first attempt that names
-a challenge uses it up, whatever happens next. -/
+a challenge uses it up, whatever happens next.  The test is
+`challengeDecision`. -/
 def Store.consumeChallenge (s : Store) (value : ByteArray) (purpose : ChallengePurpose)
     (now : Nat) : IO (Option Challenge) := s.run fun c => do
   let row ← queryOne c
     "DELETE FROM challenges WHERE challenge = ? RETURNING purpose, user_id, expires"
-    #[value] fun st => return (← colText st 0, ← colOpt colInt st 1, ← colNat st 2)
-  match row with
-  | some (p, u, expires) =>
-    if p == purpose.toString && now < expires then
-      return some { value, purpose, user := u.map (⟨·⟩), expires }
-    else return none
-  | none => return none
+    #[value] fun st => do
+      return { purpose := ← colText st 0, user := ← colOpt colInt st 1,
+               expires := ← colNat st 2 : ChallengeRow }
+  return challengeDecision value purpose now row
 
 /-- Remove every expired challenge; how many. -/
 def Store.purgeChallenges (s : Store) (now : Nat) : IO Nat := s.run fun c =>

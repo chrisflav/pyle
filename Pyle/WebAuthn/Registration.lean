@@ -14,8 +14,12 @@ attached; its algorithm must be one the relying party offered; and the
 attestation statement must be one of the formats of `Attestation`.
 
 As with `VerifiedAssertion`, a `NewCredential` can only come out of
-`verifyRegistration`.  One check of §2.2 needs the store and is the caller's:
-that the credential id is not already registered to anyone.
+`verifyRegistration`, and the checks are written down twice: as
+`verifyRegistration` and as `RegistrationChecks`, and
+`verifyRegistration_sound` says the first never accepts what the second does
+not describe.  One check of §2.2 needs the store and is the caller's: that
+the credential id is not already registered to anyone.  So does binding the
+registration to a challenge the server issued: see `RegistrationChecks`.
 -/
 
 namespace Pyle
@@ -107,25 +111,146 @@ def AttestationObject.parse (b : ByteArray) : Except String AttestationObject :=
 given the algorithms the relying party offered. -/
 def verifyRegistration (rp : RelyingParty) (challenge : ByteArray)
     (algorithms : List CoseAlgorithm) (r : RegistrationResponse) :
-    Except RegistrationError NewCredential := do
-  let cd ← (ClientData.parse r.clientDataJSON).mapError .clientData
-  if cd.type ≠ "webauthn.create" then throw .wrongType
-  if cd.challenge ≠ Base64Url.encode challenge then throw .challengeMismatch
-  if cd.origin ∉ rp.origins then throw .originMismatch
+    Except RegistrationError NewCredential :=
+  match ClientData.parse r.clientDataJSON with
+  | .error e => .error (.clientData e)
+  | .ok cd =>
+  if cd.type ≠ "webauthn.create" then .error .wrongType else
+  if cd.challenge ≠ Base64Url.encode challenge then .error .challengeMismatch else
+  if cd.origin ∉ rp.origins then .error .originMismatch else
   if ¬ ((cd.topOrigin = none → cd.crossOrigin ≠ some true) ∧
       ∀ t ∈ cd.topOrigin, cd.crossOrigin = some true ∧ t ∈ rp.allowedTopOrigins) then
-    throw .crossOrigin
-  let obj ← (AttestationObject.parse r.attestationObject).mapError .attestationObject
-  let ad ← (AuthenticatorData.parse obj.authData).mapError .authenticatorData
-  if ad.rpIdHash ≠ rp.idHash then throw .rpIdHashMismatch
-  if ad.userPresent ≠ true then throw .userNotPresent
-  if rp.requireUserVerification = true ∧ ad.userVerified ≠ true then throw .userNotVerified
-  let some cred := ad.attestedCredential | throw .noAttestedCredential
-  if cred.publicKey.algorithm ∉ algorithms then throw .algorithmNotOffered
-  let attestation ← (verifyAttestation obj.fmt obj.attStmt obj.authData
-    (Sha256.hash r.clientDataJSON) cred).mapError .attestation
-  pure ⟨cred.credentialId, cred.publicKey, ad.signCount, cred.aaguid, ad.userVerified,
+    .error .crossOrigin else
+  match AttestationObject.parse r.attestationObject with
+  | .error e => .error (.attestationObject e)
+  | .ok obj =>
+  match AuthenticatorData.parse obj.authData with
+  | .error e => .error (.authenticatorData e)
+  | .ok ad =>
+  if ad.rpIdHash ≠ rp.idHash then .error .rpIdHashMismatch else
+  if ad.userPresent ≠ true then .error .userNotPresent else
+  if rp.requireUserVerification = true ∧ ad.userVerified ≠ true then
+    .error .userNotVerified else
+  match ad.attestedCredential with
+  | none => .error .noAttestedCredential
+  | some cred =>
+  if cred.publicKey.algorithm ∉ algorithms then .error .algorithmNotOffered else
+  match verifyAttestation obj.fmt obj.attStmt obj.authData (Sha256.hash r.clientDataJSON) cred with
+  | .error e => .error (.attestation e)
+  | .ok attestation =>
+  .ok ⟨cred.credentialId, cred.publicKey, ad.signCount, cred.aaguid, ad.userVerified,
     ad.backupEligible, ad.backupState, attestation⟩
+
+/-- The checks of DESIGN §2.2, as a proposition about an accepted registration
+`v`, one conjunct per item, numbered as the steps of WebAuthn Level 3 §7.1
+they implement: the client data, the attestation object and its authenticator
+data parse, each item holds of them, and `v` reports the credential they
+carry.  Step 11 (`topOrigin`) is folded into step 10.
+
+What two of the conjuncts are worth:
+
+* step 8 says the client data names `challenge`, canonically encoded.  The
+  server takes `challenge` from the same client data (`Policy.challengeOf`),
+  so it is the caller that binds the registration to a challenge it issued:
+  `SignIn.consumeRegistrationChallenge` goes on only if
+  `Store.consumeChallenge` hands back a pending row for it;
+* step 22 is the implementation's own `verifyAttestation` call, written down
+  rather than restated; step 21 follows from it
+  (`verifyAttestation_format`).
+
+Steps of §7.1 that are not here: 12 (the client data hash) is computed, not
+checked; 18 and 19 evaluate the backup flags, which `v` reports for the
+caller's policy; 23 and 24 (trust anchors and the attestation's
+trustworthiness) are the caller's attestation policy; 26 (the credential id
+is not registered to anyone) needs the store and is the caller's; and 28
+(extensions) is not acted on, since pyle asks for no extensions. -/
+def RegistrationChecks (rp : RelyingParty) (challenge : ByteArray)
+    (algorithms : List CoseAlgorithm) (r : RegistrationResponse) (v : NewCredential) : Prop :=
+  ∃ cd obj ad cred, ClientData.parse r.clientDataJSON = .ok cd ∧
+    -- 13. the attestation object and its authenticator data decode
+    AttestationObject.parse r.attestationObject = .ok obj ∧
+    AuthenticatorData.parse obj.authData = .ok ad ∧
+    -- 7. the client data is from `navigator.credentials.create`
+    cd.type = "webauthn.create" ∧
+    -- 8. with our challenge
+    cd.challenge = Base64Url.encode challenge ∧
+    -- 9. from one of our origins
+    cd.origin ∈ rp.origins ∧
+    -- 10, 11. not from a cross-origin frame, unless the browser names the
+    --     top-level origin and the deployment allows framing by it
+    ((cd.topOrigin = none → cd.crossOrigin ≠ some true) ∧
+      ∀ t ∈ cd.topOrigin, cd.crossOrigin = some true ∧ t ∈ rp.allowedTopOrigins) ∧
+    -- 14. the credential is scoped to our relying party id
+    ad.rpIdHash = Sha256.hash rp.id.toUTF8 ∧
+    -- 15. the user was present
+    ad.userPresent = true ∧
+    -- 16. and verified, if the policy says so
+    (rp.requireUserVerification = true → ad.userVerified = true) ∧
+    -- 17. the backup state is not set without backup eligibility
+    (ad.backupEligible = false → ad.backupState = false) ∧
+    -- 13. the attested-credential flag is set and the data it announces is there
+    ad.attestedCredential = some cred ∧
+    -- 20. the credential's algorithm is one we offered
+    cred.publicKey.algorithm ∈ algorithms ∧
+    -- 21. the attestation statement is of a format we accept
+    (obj.fmt = "none" ∨ obj.fmt = "packed") ∧
+    -- 22. and verifies over the authenticator data and the client data hash
+    verifyAttestation obj.fmt obj.attStmt obj.authData (Sha256.hash r.clientDataJSON) cred =
+      .ok v.attestation ∧
+    -- 25. the credential id is at most 1023 bytes
+    cred.credentialId.size ≤ 1023 ∧
+    -- and the result reports the credential and the authenticator data
+    (v.id = cred.credentialId ∧ v.publicKey = cred.publicKey ∧ v.signCount = ad.signCount ∧
+      v.aaguid = cred.aaguid ∧ v.userVerified = ad.userVerified ∧
+      v.backupEligible = ad.backupEligible ∧ v.backupState = ad.backupState)
+
+/-- **Registration soundness**: `verifyRegistration` accepts only
+registrations for which every check of §2.2 holds. -/
+theorem verifyRegistration_sound {rp : RelyingParty} {challenge : ByteArray}
+    {algorithms : List CoseAlgorithm} {r : RegistrationResponse} {v : NewCredential}
+    (h : verifyRegistration rp challenge algorithms r = .ok v) :
+    RegistrationChecks rp challenge algorithms r v := by
+  rw [verifyRegistration] at h
+  cases hcd : ClientData.parse r.clientDataJSON with
+  | error e => rw [hcd] at h; cases h
+  | ok cd =>
+  rw [hcd] at h
+  dsimp only at h
+  obtain ⟨c7, h⟩ := ok_of_ite_error h
+  obtain ⟨c8, h⟩ := ok_of_ite_error h
+  obtain ⟨c9, h⟩ := ok_of_ite_error h
+  obtain ⟨c10, h⟩ := ok_of_ite_error h
+  cases hobj : AttestationObject.parse r.attestationObject with
+  | error e => rw [hobj] at h; cases h
+  | ok obj =>
+  rw [hobj] at h
+  dsimp only at h
+  cases had : AuthenticatorData.parse obj.authData with
+  | error e => rw [had] at h; cases h
+  | ok ad =>
+  rw [had] at h
+  dsimp only at h
+  obtain ⟨c14, h⟩ := ok_of_ite_error h
+  obtain ⟨c15, h⟩ := ok_of_ite_error h
+  obtain ⟨c16, h⟩ := ok_of_ite_error h
+  cases hcred : ad.attestedCredential with
+  | none => rw [hcred] at h; cases h
+  | some cred =>
+  rw [hcred] at h
+  dsimp only at h
+  obtain ⟨c20, h⟩ := ok_of_ite_error h
+  cases hatt : verifyAttestation obj.fmt obj.attStmt obj.authData
+      (Sha256.hash r.clientDataJSON) cred with
+  | error e => rw [hatt] at h; cases h
+  | ok attestation =>
+  rw [hatt] at h
+  cases h
+  simp only [ne_eq, Decidable.not_not] at c7 c8 c9 c10 c14 c15 c20
+  have c16 : rp.requireUserVerification = true → ad.userVerified = true :=
+    fun hr => Decidable.byContradiction fun hu => c16 ⟨hr, hu⟩
+  exact ⟨cd, obj, ad, cred, hcd, hobj, had, c7, c8, c9, c10, c14, c15, c16,
+    AuthenticatorData.parse_backup had, hcred, c20, verifyAttestation_format hatt, hatt,
+    AuthenticatorData.parse_credentialId had hcred, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- The stored form of a new credential, for the user with the given handle. -/
 def NewCredential.toStored (c : NewCredential) (userHandle : ByteArray) : StoredCredential :=

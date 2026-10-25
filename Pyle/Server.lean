@@ -1,6 +1,7 @@
 import Std.Http
 import Std.Net
 import Pyle.Session.Session
+import Pyle.SignIn.Routes
 import Pyle.Audit
 import Pyle.Sys
 
@@ -25,6 +26,8 @@ The endpoints so far:
 
 * `GET /healthz` — `200` with `{"status":"ok"}` once the database answers.
 * `POST /logout` — ends the request's session, if any, and clears the cookie.
+* `SignIn.routes` — the sign-in, account and invitation pages and their
+  endpoints (`Pyle.SignIn.Routes`).
 -/
 
 namespace Pyle
@@ -59,7 +62,7 @@ def logout : Http.Handler := fun ctx r => do
 def routes : List Route := [
   .mk' .get "/healthz" healthz,
   .mk' .post "/logout" logout
-]
+] ++ SignIn.routes
 
 /-- Answer one request. -/
 def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r

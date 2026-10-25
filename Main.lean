@@ -11,6 +11,8 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
 * `pyle serve` answers HTTP until it is stopped.
 * `pyle user add <name> [--group <group>]…` creates an account.
 * `pyle user list` lists the accounts.
+* `pyle invite <name> [--group <group>]… [--ttl <7d>]` prints a link that
+  creates the account `<name>` with its first passkey.
 * `pyle audit verify` checks the audit log's hash chain.
 -/
 
@@ -24,6 +26,8 @@ def usage : String :=
   "  serve                             answer HTTP until stopped\n" ++
   "  user add <name> [--group <g>]...  create an account\n" ++
   "  user list                         list the accounts\n" ++
+  "  invite <name> [--group <g>]... [--ttl <7d>]\n" ++
+  "                                    print a link that creates an account\n" ++
   "  audit verify                      check the audit log's hash chain\n" ++
   "  version                           print the version\n\n" ++
   "The configuration file defaults to $PYLE_CONFIG, then ./pyle.json."
@@ -86,6 +90,27 @@ def userList (path : System.FilePath) : IO UInt32 := do
     IO.println s!"{u.name}\tgroups: {groups}\tauthenticators: {n}{state}"
   return 0
 
+/-- `pyle invite`: issue an invitation and print its link.  `ttl` is a
+lifetime such as `7d` or `12h`; seven days if not given. -/
+def invite (path : System.FilePath) (name : String) (groups : List String)
+    (ttl : Option String) : IO UInt32 := do
+  let seconds ← match ttl with
+    | none => pure (7 * 86400)
+    | some t => match SignIn.parseDuration t with
+      | some n => pure n
+      | none =>
+        IO.eprintln s!"pyle: '{t}' is not a lifetime (a number followed by d, h, m or s)"
+        return 2
+  let config ← Config.load path
+  let store ← Store.Store.openAt config.database (← Http.systemClock)
+  let now ← Http.systemClock
+  let url ← SignIn.createInvitation store config.issuer name groups seconds now
+  discard <| Audit.append store now
+    { event := .userChanged, outcome := .success, userName := some name,
+      clientAddress := "cli", detail := "invited" }
+  IO.println url
+  return 0
+
 /-- `pyle audit verify`. -/
 def auditVerify (path : System.FilePath) : IO UInt32 := do
   match ← Audit.verify (← openStore path) with
@@ -103,6 +128,7 @@ def main (args : List String) : IO UInt32 := do
   Server.restrictFileModes
   let (configs, args) := takeFlag "--config" args
   let (groups, args) := takeFlag "--group" args
+  let (ttls, args) := takeFlag "--ttl" args
   try
     match args with
     | ["version"] =>
@@ -114,6 +140,7 @@ def main (args : List String) : IO UInt32 := do
       return 0
     | ["user", "add", name] => userAdd (← configPath configs) name groups
     | ["user", "list"] => userList (← configPath configs)
+    | ["invite", name] => invite (← configPath configs) name groups ttls.getLast?
     | ["audit", "verify"] => auditVerify (← configPath configs)
     | _ =>
       IO.eprintln usage

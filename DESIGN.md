@@ -373,10 +373,12 @@ As in kleis, the point of Lean is that some of these become theorems.
 2. **Single use.**  The challenge, code and refresh-token stores are state
    machines; a value that has been consumed is never accepted again.
    Invariant over every sequence of operations.
-3. **No session without the policy.**  `Session.establish` takes a
-   `StrongAuthentication`, whose only constructors are private to the ceremony
-   modules — a type-level guarantee in the style of kleis's
-   `AuthorizedRequest`, not a theorem to maintain.
+3. **No session without the policy.**  `Policy.establish` takes a
+   `StrongAuthentication`, whose constructor is private to
+   `Pyle.Session.Policy`, as is the constructor of the per-factor evidence it
+   is built from and the SQL that writes a session row — a type-level
+   guarantee in the style of kleis's `AuthorizedRequest`, not a theorem to
+   maintain.
 4. **Authorization codes.**  A token is issued for a code only if the code was
    issued to that client, for that redirect URI, with a challenge the verifier
    hashes to, and has not expired or been used.

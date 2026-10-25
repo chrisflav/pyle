@@ -1,0 +1,94 @@
+import Pyle.Store.Oidc
+
+/-!
+# What sign-in adds to the store
+
+Passwords, for deployments that allow them, and the two invitation
+operations the invitation page needs: looking an invitation up without using
+it (to greet the person by the name they are invited as), and redeeming it.
+
+**Redeeming is one transaction.**  An invitation is consumed when its first
+credential is stored (DESIGN §1): the account and its credential are created
+in the same `BEGIN IMMEDIATE` transaction that deletes the invitation, after
+checking that the invitation is still live, the name still free and the
+credential id not registered to anyone.  Two browsers racing with the same
+invitation therefore cannot both create an account, and a registration that
+fails part-way leaves the invitation as it was.
+-/
+
+namespace Pyle
+namespace Store
+
+/-! ## Passwords -/
+
+/-- Store (or replace) a user's password, as the PHC string of its hash. -/
+def Store.setPassword (s : Store) (user : UserId) (phc : String) (now : Nat) : IO Unit :=
+  s.run fun c => do
+    discard <| exec c
+      "INSERT INTO passwords (user_id, phc, created) VALUES (?, ?, ?) \
+        ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, created = excluded.created"
+      #[user, phc, now]
+
+/-- A user's password hash, if they have set one. -/
+def Store.findPassword (s : Store) (user : UserId) : IO (Option String) := s.run fun c =>
+  queryOne c "SELECT phc FROM passwords WHERE user_id = ?" #[user] (colText · 0)
+
+/-- Remove a user's password.  Whether there was one. -/
+def Store.removePassword (s : Store) (user : UserId) : IO Bool := s.run fun c => do
+  return (← exec c "DELETE FROM passwords WHERE user_id = ?" #[user]) > 0
+
+/-! ## Invitations -/
+
+/-- Read an invitation row: `user_name, groups, created_by, created, expires`. -/
+def readInvitation (st : SQLite.Stmt) : IO Invitation := do
+  return { userName := ← colText st 0, groups := ← colList st 1, createdBy := ← colText st 2,
+           created := ← colNat st 3, expires := ← colNat st 4 }
+
+/-- The live invitation with this token hash, without using it up. -/
+def Store.findInvitation (s : Store) (tokenHash : SecretHash) (now : Nat) :
+    IO (Option Invitation) := s.run fun c => do
+  let row ← queryOne c
+    "SELECT user_name, groups, created_by, created, expires FROM invitations \
+      WHERE token_hash = ?" #[tokenHash] readInvitation
+  return row.filter (now < ·.expires)
+
+/-- Redeem an invitation by storing its first credential: in one transaction,
+check that the invitation is live, its name free and the credential id
+unused, then delete the invitation, create the account with the given
+WebAuthn user handle, and store the credential `cred` makes for it.  The new
+account, or why nothing was done. -/
+def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteArray)
+    (cred : UserId → Credential) (now : Nat) : IO (Except String User) :=
+  s.atomically fun c => do
+    let some inv ← queryOne c
+        "SELECT user_name, groups, created_by, created, expires FROM invitations \
+          WHERE token_hash = ?" #[tokenHash] readInvitation
+      | return .error "no such invitation"
+    if inv.expires ≤ now then return .error "the invitation has expired"
+    if (← queryOne c "SELECT 1 FROM users WHERE name = ?" #[inv.userName] (colInt · 0)).isSome
+    then return .error "the name is taken"
+    if (← queryOne c "SELECT 1 FROM users WHERE handle = ?" #[handle] (colInt · 0)).isSome then
+      return .error "the user handle is taken"
+    let probe := cred ⟨0⟩
+    if (← queryOne c "SELECT 1 FROM webauthn_credentials WHERE id = ?" #[probe.id]
+        (colInt · 0)).isSome then
+      return .error "the credential is already registered"
+    discard <| exec c "DELETE FROM invitations WHERE token_hash = ?" #[tokenHash]
+    let some u ← queryOne c
+        s!"INSERT INTO users (handle, name, groups, created) VALUES (?, ?, ?, ?) \
+          RETURNING {userColumns}"
+        #[handle, inv.userName, encodeList inv.groups, now] readUser
+      | throw (.userError "store: the new user was not returned")
+    let k := cred u.id
+    discard <| exec c
+      "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
+        backup_eligible, backup_state, aaguid, transports, name, created) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      #[k.id, u.id, k.algorithm, k.publicKey, k.signCount,
+        Value.int (if k.backupEligible then 1 else 0),
+        Value.int (if k.backupState then 1 else 0), k.aaguid,
+        encodeList k.transports, k.name, k.created]
+    return .ok u
+
+end Store
+end Pyle

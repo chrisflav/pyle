@@ -16,12 +16,16 @@ One JSON file, read at startup by every command:
   "origins": ["https://auth.example.org"],
   "sessionIdleSeconds": 28800,
   "sessionAbsoluteSeconds": 2592000,
-  "trustedProxies": ["127.0.0.1"]
+  "trustedProxies": ["127.0.0.1"],
+  "allowPasswords": false,
+  "attestationRoots": [],
+  "aaguidAllowList": []
 }
 ```
 
 Only `issuer`, `rpId` and `origins` are required; the rest have the defaults
-shown.  Relative paths are relative to the directory the configuration file is
+shown.  `aaguidAllowList` needs `attestationRoots`, since an AAGUID is only
+worth checking in an attestation whose chain is verified.  Relative paths are relative to the directory the configuration file is
 in, so a deployment directory can be moved as a whole.
 
 An unknown key is an error rather than ignored.  A misspelt
@@ -61,6 +65,21 @@ structure Config where
   then the client address is the socket's peer, and a header anyone can send
   decides nothing. -/
   trustedProxies : List String := []
+  -- Sign-in (DESIGN §1–§4).
+  /-- Whether a user may set a password as one of their factors.  Off by
+  default (§1): a password is never alone sufficient, and most deployments
+  have no device without a platform authenticator. -/
+  allowPasswords : Bool := false
+  /-- Files holding the trust anchors for `packed` full attestation, each in
+  DER or PEM.  Empty by default: then an attestation chain is not validated
+  and counts for nothing. -/
+  attestationRoots : List System.FilePath := []
+  /-- The authenticator models (AAGUIDs, as hex with or without hyphens) that
+  may be registered.  Empty by default, meaning any.  When it is set, a
+  registration must carry `packed` full attestation whose chain ends in one of
+  `attestationRoots` and whose AAGUID is listed; without a verified chain the
+  AAGUID is only the authenticator's word. -/
+  aaguidAllowList : List String := []
   deriving Repr, Inhabited
 
 namespace Config
@@ -68,7 +87,8 @@ namespace Config
 /-- The keys a configuration file may contain. -/
 def knownKeys : List String :=
   ["issuer", "host", "port", "database", "rootKeyFile", "rpId", "origins",
-   "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies"]
+   "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies",
+   "allowPasswords", "attestationRoots", "aaguidAllowList"]
 
 /-- A required string field. -/
 private def reqStr (j : Json) (k : String) : Except String String :=
@@ -93,6 +113,20 @@ private def asStr : Json → Option String
 
 /-- A JSON non-negative integer. -/
 private def asNat (v : Json) : Option Nat := (v.getNat?).toOption
+
+/-- A JSON boolean. -/
+private def asBool : Json → Option Bool
+  | .bool b => some b
+  | _ => none
+
+/-- An AAGUID as written in the configuration: 32 hexadecimal digits, with or
+without the hyphens of the UUID form, in either case.  The normalised form is
+lower-case hex without hyphens. -/
+def normaliseAaguid (s : String) : Option String :=
+  let cs := s.toList.filter (· != '-') |>.map Char.toLower
+  if cs.length == 32 && cs.all (fun c => c.isDigit || ('a' ≤ c && c ≤ 'f')) then
+    some (String.ofList cs)
+  else none
 
 /-- A JSON array of strings. -/
 private def asStrs : Json → Option (List String)
@@ -159,12 +193,21 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   if idle > absolute then
     throw "'sessionIdleSeconds' must not exceed 'sessionAbsoluteSeconds'"
   let trustedProxies ← opt j "trustedProxies" [] asStrs "an array of addresses"
+  let allowPasswords ← opt j "allowPasswords" false asBool "true or false"
+  let attestationRoots ← opt j "attestationRoots" [] asStrs "an array of paths"
+  let aaguids ← opt j "aaguidAllowList" [] asStrs "an array of AAGUIDs"
+  let aaguidAllowList ← aaguids.mapM fun a => match normaliseAaguid a with
+    | some n => pure n
+    | none => throw s!"'{a}' is not an AAGUID (32 hexadecimal digits)"
+  if !aaguidAllowList.isEmpty && attestationRoots.isEmpty then
+    throw "'aaguidAllowList' needs 'attestationRoots': without them no AAGUID can be trusted"
   let resolve (p : String) : System.FilePath :=
     let fp : System.FilePath := p
     if fp.isAbsolute then fp else base / fp
   return { issuer, host, port := port.toUInt16, database := resolve database,
            rootKeyFile := resolve rootKeyFile, rpId, origins,
-           sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies }
+           sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies,
+           allowPasswords, attestationRoots := attestationRoots.map resolve, aaguidAllowList }
 
 /-- Read and check a configuration file. -/
 def load (path : System.FilePath) : IO Config := do

@@ -113,6 +113,67 @@ def parse (b : ByteArray) : Except String AuthenticatorData := do
     else pure none
   pure { rpIdHash, flags, signCount, attestedCredential, extensions }
 
+/-- What every successful parse guarantees: the flags are the byte at offset
+32, the backup state is not set without backup eligibility, and an attested
+credential is what `parseAttested` read after the fixed header. -/
+theorem parse_spec {b : ByteArray} {ad : AuthenticatorData} (h : parse b = .ok ad) :
+    ad.flags = b[32]?.getD 0 ∧
+      ¬(b[32]?.getD 0 &&& 0x10 != 0 && b[32]?.getD 0 &&& 0x08 == 0) = true ∧
+      ∀ c, ad.attestedCredential = some c →
+        ∃ r, parseAttested (b.extract 37 b.size) = .ok (c, r) := by
+  unfold parse at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  · cases h
+  split at h
+  · cases h
+  rename_i hf
+  rcases hp : parseAttested (b.extract 37 b.size) with e | ⟨c, r⟩ <;> simp only [hp] at h <;>
+    refine ⟨?_, hf, ?_⟩ <;>
+    repeat' (first | (split at h) | cases h)
+  all_goals
+    first
+    | rfl
+    | (intro c' hc; cases hc; exact ⟨_, rfl⟩)
+    | (intro c' hc; cases hc; done)
+
+/-- An attested credential's id is at most `maxCredentialIdLength` bytes. -/
+theorem parseAttested_size {rest : ByteArray} {c : AttestedCredential} {r : ByteArray}
+    (h : parseAttested rest = .ok (c, r)) : c.credentialId.size ≤ maxCredentialIdLength := by
+  unfold parseAttested at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  · cases h
+  split at h
+  · cases h
+  split at h
+  · cases h
+  repeat' (first | (split at h) | cases h)
+  all_goals
+    simp only [ByteArray.size_extract]
+    omega
+
+/-- Parsed authenticator data never shows the backup state without backup
+eligibility (WebAuthn L3 §6.1.3). -/
+theorem parse_backup {b : ByteArray} {ad : AuthenticatorData} (h : parse b = .ok ad) :
+    ad.backupEligible = false → ad.backupState = false := by
+  obtain ⟨hfl, hf, -⟩ := parse_spec h
+  intro hbe
+  simp only [backupEligible, backupState, hfl] at hbe ⊢
+  revert hf hbe
+  generalize (b[32]?.getD 0 &&& 0x08) = x
+  generalize (b[32]?.getD 0 &&& 0x10) = y
+  intro hf hbe
+  cases hx : x == 0 <;> cases hy : y == 0 <;> simp_all [bne]
+
+/-- The id of a parsed attested credential is at most 1023 bytes. -/
+theorem parse_credentialId {b : ByteArray} {ad : AuthenticatorData} (h : parse b = .ok ad)
+    {c : AttestedCredential} (hc : ad.attestedCredential = some c) :
+    c.credentialId.size ≤ maxCredentialIdLength := by
+  obtain ⟨-, -, hp⟩ := parse_spec h
+  obtain ⟨r, hr⟩ := hp c hc
+  exact parseAttested_size hr
+
 end AuthenticatorData
 end WebAuthn
 end Pyle

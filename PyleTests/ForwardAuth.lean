@@ -220,6 +220,15 @@ def secretTests : IO Unit := withCtx fun ctx0 _ => do
     ).status.toCode 403
   checkEq "with it, answered" (← ask [("X-Pyle-Forward-Auth", "s3cret-s3cret-s3cret")]
     ).status.toCode 302
+  -- The proxy keeps `/forward-auth` off the public host by its path, so no
+  -- other spelling of that path may reach it.
+  for path in ["/forward-auth/", "//forward-auth", "/forward-auth//", "/forward-auth/grant/",
+      "//forward-auth/grant"] do
+    let r ← Server.route ctx { Req.mk' .get path
+      [("X-Forwarded-Host", "app.example.org"), ("X-Forwarded-Uri", "/"),
+       ("X-Pyle-Forward-Auth", "s3cret-s3cret-s3cret")] (clientAddress := proxy) with
+      peer := proxy }
+    checkEq s!"{path} is not /forward-auth" r.status.toCode 404
 
 /-- Forward authentication. -/
 def forwardAuthTests : IO Unit := do

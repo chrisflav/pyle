@@ -105,8 +105,11 @@ structure Config where
   lives, in seconds; the session behind it is checked on every request. -/
   forwardAuthCookieSeconds : Nat := 8 * 3600
   /-- A secret the proxy must send in `X-Pyle-Forward-Auth` for `/forward-auth`
-  to answer, compared in constant time; none by default.  Set it unless
-  `/forward-auth` is unreachable through the public virtual host. -/
+  to answer, compared in constant time.  Required as soon as
+  `forwardAuthHosts` names a host: a proxy rule that keeps `/forward-auth`
+  off the public virtual host is one spelling of the path away from not
+  doing so, and without the secret anyone who reaches it can ask pyle about
+  any session cookie they hold. -/
   forwardAuthSecret : Option String := none
   deriving Repr, Inhabited
 
@@ -254,6 +257,9 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
     "a string"
   if forwardAuthSecret.any (·.length < 16) then
     throw "'forwardAuthSecret' must be at least 16 characters"
+  if !forwardAuthHosts.isEmpty && forwardAuthSecret.isNone then
+    throw "'forwardAuthHosts' needs 'forwardAuthSecret', the secret the proxy sends in \
+      X-Pyle-Forward-Auth"
   for (host, policy) in forwardAuthHosts do
     if host.isEmpty || host.contains '/' || host.contains '@' then
       throw s!"'{host}' in 'forwardAuthHosts' is not a host name"

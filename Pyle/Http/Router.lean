@@ -86,13 +86,20 @@ structure Route where
   pattern : List Segment
   /-- Whether it takes part in the `Origin` check. -/
   csrf : Csrf := .checkOrigin
+  /-- The only spelling of the path the route answers, if it insists on one.
+  Matching by segments ignores empty ones, so `/forward-auth/` and
+  `//forward-auth` reach `/forward-auth`; a route that a reverse proxy must be
+  able to block by path is reached by its exact path or not at all. -/
+  exactPath : Option String := none
   /-- The handler. -/
   handler : Handler
 
-/-- A route from a pattern string. -/
+/-- A route from a pattern string.  With `exact`, only the pattern itself
+reaches it, spelt as it is written. -/
 def Route.mk' (method : Method) (pattern : String) (handler : Handler)
-    (csrf : Csrf := .checkOrigin) : Route :=
-  { method, pattern := parsePattern pattern, csrf, handler }
+    (csrf : Csrf := .checkOrigin) (exact : Bool := false) : Route :=
+  { method, pattern := parsePattern pattern, csrf, handler,
+    exactPath := if exact then some pattern else none }
 
 /-- The segments of a path.  `none` if the path is not absolute, or names `.`
 or `..` in any spelling, which no route uses and which only path confusion
@@ -124,7 +131,9 @@ where
   go : IO Reply := do
     let some segs := pathSegments r.path
       | return Reply.error .notFound "not_found"
-    let matching := routes.filterMap fun rt => (rt, ·) <$> matchPattern rt.pattern segs
+    let matching := routes.filterMap fun rt =>
+      if rt.exactPath.all (· == r.path) then (rt, ·) <$> matchPattern rt.pattern segs
+      else none
     if matching.isEmpty then return Reply.error .notFound "not_found"
     let some (rt, params) := matching.find? (·.1.method == r.method)
       | let allow := ", ".intercalate (matching.map (methodName ·.1.method)).eraseDups

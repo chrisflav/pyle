@@ -143,8 +143,8 @@ statement is one of the formats we accept.
 **Attestation.**  The default is `none`: we do not ask authenticators to prove
 their make.  `packed` self-attestation is checked when it is sent.  An
 administrator may configure an AAGUID allow-list, in which case `packed` full
-attestation is verified against the configured roots — this is where kleis's
-X.509 parser is reused.
+attestation is verified against the configured roots, the chain by OpenSSL
+(§6.1).
 
 ### 2.3 What the ceremony needs
 
@@ -279,12 +279,16 @@ an `amr` and an expiry like everything else.
 | SHA-1, HMAC-SHA1 | TOTP only | `lean-crypto-hash` for SHA-1; HMAC-SHA1 is a few lines here, or upstream |
 | ES256, EdDSA **verification** | WebAuthn assertions | `lean-biscuit` (P-256, Ed25519) |
 | Biscuit format and datalog | tokens, policies | `lean-biscuit` |
-| ChaCha20-Poly1305 | encrypting TOTP secrets and signing keys at rest | kleis's `Kleis.Crypto.Aead`, moved to a shared package |
-| DER, X.509 | attestation roots | kleis's `Kleis.Ca` |
-| **Signing** (ID tokens, biscuits) | everything we issue | FFI, constant-time (OpenSSL or libsodium) |
-| Argon2id | passwords, if enabled | FFI (libsodium) |
-| Randomness | challenges, session ids, secrets | `getrandom(2)` via FFI |
+| ChaCha20-Poly1305 | encrypting TOTP secrets and signing keys at rest | FFI (OpenSSL): it handles the root key |
+| X.509 chain validation | attestation roots, if configured | FFI (OpenSSL); the Lean side reads the AAGUID extension |
+| **Signing** (ID tokens, biscuits) | everything we issue | FFI (OpenSSL), constant-time |
+| Argon2id | passwords, if enabled | FFI (OpenSSL 3.2 and later) |
+| Randomness | challenges, session ids, secrets | FFI (OpenSSL's DRBG, seeded by the OS) |
+| HTTP | the server | `Std.Http`, from Lean itself |
 | TLS | | terminated by the reverse proxy |
+
+All of the FFI is one OpenSSL: the static `libcrypto` the Lean toolchain ships,
+3.6 at the time of writing.  Nothing has to be installed where pyle runs.
 
 ### 6.2 Verification in Lean, signing outside it
 
@@ -330,7 +334,9 @@ before it takes effect.
 
 ## 8. State
 
-SQLite, one file, as diff-reviewer does.
+SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
+`db` package diff-reviewer and orchestra use does not build on the toolchain
+`lean-biscuit` needs.)
 
 | Table | Contents |
 | --- | --- |
@@ -399,8 +405,8 @@ Pyle/
 web/           sign-in and account pages (no framework needed; a few hundred lines)
 ```
 
-kleis's HTTP stack, AEAD, DER/X.509 and audit chain are wanted here too.  They
-should move into a shared package rather than be copied (§12).
+pyle does not depend on kleis: what it might have borrowed — HTTP, the AEAD,
+X.509 — it takes from `Std.Http` and OpenSSL instead (§12).
 
 ## 11. Milestones
 
@@ -434,9 +440,10 @@ deployment.
 - **Account recovery when every authenticator is lost.**  Recovery codes cover
   most of it.  Beyond them: an administrator re-invites, which is honest about
   being a human process.  Anything automatic is a way in for someone else.
-- **A shared package.**  kleis and pyle both want HTTP, the AEAD, DER and the
-  audit chain.  Extracting them is the right move and changes kleis's module
-  layout; it should happen before M1, not after.
+- **A shared package.**  kleis and pyle overlap in the audit chain and in what
+  they want from OpenSSL.  Decided for now: no shared package, and no
+  dependency of pyle on kleis; the overlap is small, and `Std.Http` and OpenSSL
+  cover the rest.  Revisit if the two FFI shims grow towards each other.
 - **Upstream identity providers.**  Signing in *with* GitHub at pyle would
   make migrating taxis users easy and would make GitHub a way into everything.
   Leaning towards linking a GitHub account only to import a profile, never to

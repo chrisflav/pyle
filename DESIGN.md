@@ -408,10 +408,26 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
 1. **Assertion soundness**: `verifyAssertion_sound` against `AssertionChecks`,
    in `WebAuthn/Assertion.lean`.  **Registration soundness** likewise:
    `verifyRegistration_sound` against `RegistrationChecks`, one conjunct per
-   item of §2.2 numbered as the steps of WebAuthn L3 §7.1, in
-   `WebAuthn/Registration.lean`.  Step 22 (the credential id is not already
-   registered) needs the store and is the caller's; step 17 (extensions) is
-   not acted on.
+   item of §2.2 numbered as the steps of WebAuthn L3 §7.1 (7–10, with 11
+   folded into 10, 13–17, 20–22 and 25), in `WebAuthn/Registration.lean`.
+   Steps 17 (backup state only with backup eligibility) and 25 (credential id
+   at most 1023 bytes) are enforced by `AuthenticatorData.parse` and proved
+   from it (`parse_backup`, `parse_credentialId`); `AssertionChecks` carries
+   the backup-flag check too.  Step 22 is the implementation's own
+   `verifyAttestation` call, written down, and step 21 follows from it.  Not
+   in the theorem: 12 (the hash is computed), 18 and 19 (the backup flags are
+   reported for policy), 23 and 24 (the attestation policy, the caller's),
+   26 (the credential id is not already registered, which needs the store
+   and is the caller's), and 28 (extensions, not acted on).
+
+   What the challenge conjunct is worth: both theorems take the challenge as
+   a parameter, and the server takes it from the same client data
+   (`Policy.challengeOf`), so the conjunct says only that the client data
+   names it in canonical base64url.  That the ceremony answers a challenge
+   the server issued, for this purpose, unexpired and not used before, comes
+   from the caller: `Policy.checkAssertion` and
+   `SignIn.consumeRegistrationChallenge` go on only when
+   `Store.consumeChallenge` hands back a row, which part 2 covers.
 2. **Single use**, in two parts.
    * *The decisions.*  Each table hands the row it deleted or read to a pure
      function, and the store or handler only carries out what that function
@@ -443,16 +459,27 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
      (`Families.run_revoked`).
    * *Assumptions.*  The models are linked to the SQL, not derived from it.
      Each operation is atomic: one `DELETE … RETURNING` statement
-     (`consumeChallenge`, `consumeCode`, `consumeForwardAuthCode`,
-     `consumeInvitation`) or one `BEGIN IMMEDIATE` transaction
-     (`pollDeviceCodeFor`, `rotateRefreshToken`, `startRefreshFamily`, the
-     family revocations), under the store's lock.  An insert into a revoked
+     (`consumeChallenge`, `consumeCode`, `consumeForwardAuthCode`) or one
+     `BEGIN IMMEDIATE` transaction (`pollDeviceCodeFor` and
+     `redeemInvitation`, each a read and a conditional delete;
+     `rotateRefreshToken`, `startRefreshFamily`, and the family revocations of
+     `revokeRefreshFamily`, `revokeUserClientFamilies` and
+     `addRefreshFamily`), under the store's lock.  An insert into a revoked
      family is refused by the trigger `refresh_tokens_not_revoked`
      (migration 1), the trigger `sessions_end_families` (migration 4) is one
      more family revocation, and nothing deletes from `revoked_families`.
-     Values handed out never repeat: each is 32 random bytes stored as its
-     SHA-256, and the models refuse to add a key that has been added before.
-     The docstrings of `Table` and `Families` name the statements.
+     Values handed out never repeat: each is 32 random bytes — a challenge
+     stored as it is, every other value as its SHA-256 — and the models
+     refuse to add a key that has been added before.  The docstrings of
+     `Table` and `Families` name the statements.
+   * *A known gap.*  A code presented again revokes the refresh-token family
+     its first exchange began (RFC 6749 §4.1.2), but that revocation
+     (`Oidc.codeGrant`: `familyExists`, then `revokeRefreshFamily`) runs in
+     transactions separate from the `consumeCode` of the first exchange and
+     from its `startRefreshFamily`.  A replay that lands after the first
+     exchange consumed the code and before it began the family finds no
+     family and revokes nothing; the replay itself is still refused.  This
+     predates the proofs, and nothing above claims otherwise.
 3. **No session without the policy**: structural, as above; `password_alone`,
    `totp_alone`, `recovery_alone` and the `ofFactors_*` theorems in
    `Session/Policy.lean` say what the policy rules out.

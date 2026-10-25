@@ -13,8 +13,8 @@ A session is a row on the server and an opaque random identifier in a cookie
 * a session lapses after `sessionIdleSeconds` without use and
   `sessionAbsoluteSeconds` after it began, whichever comes first;
 * the identifier is rotated whenever the session's authentication changes
-  (`rotate`, `reauthenticate`), so an identifier planted in a browser before
-  sign-in is worthless after it;
+  (`rotate`, and `Policy.stepUp`), so an identifier planted in a browser
+  before sign-in is worthless after it;
 * it records the user, the `amr` values, `auth_time` and the authenticators
   used, and a user can list theirs and end any of them.
 
@@ -23,12 +23,13 @@ SHA-256 of a 256-bit random value leaks nothing a timing attacker could build
 on, because learning that a guessed hash is "close" to a stored one says
 nothing about any identifier.
 
-**Creating a session.**  There is exactly one function that does it,
-`Session.create`, in its own section at the end of this file.  It takes the
-outcome of an authentication as plain values today; in round 2 it becomes
-private and is reached only through a `StrongAuthentication`, the type whose
-constructors belong to the ceremony modules (§9.3).  Nothing else in pyle
-inserts a session row.
+**Creating a session** is not here.  It happens in exactly one function,
+`Policy.establish`, and recording a fresh authentication on a session in
+exactly one other, `Policy.stepUp`; both take a `StrongAuthentication`, whose
+constructor is private to `Pyle.Session.Policy` (§9.3), and the SQL that
+inserts or re-authenticates a session row is private to that file too.  This
+module reads, rotates and ends sessions, none of which can raise what a
+session is worth.
 -/
 
 namespace Pyle
@@ -108,19 +109,6 @@ def rotate (ctx : Ctx) (s : Session) : IO (Option (Session × String)) := do
     return some ({ s with idHash := newHash, lastSeen := now }, encodeId id)
   return none
 
-/-- Record a fresh authentication (a step-up) on a session, rotating its
-identifier.  Like `create`, round 2 makes this reachable only with a
-`StrongAuthentication`. -/
-def reauthenticate (ctx : Ctx) (s : Session) (amr factors : List String) :
-    IO (Option (Session × String)) := do
-  let id ← Crypto.randomBytes idBytes.toUSize
-  let now ← ctx.clock
-  let newHash := Store.SecretHash.of id
-  if ← ctx.store.reauthenticateSession s.idHash newHash amr factors now then
-    return some ({ s with idHash := newHash, amr, factors, authTime := now, lastSeen := now },
-      encodeId id)
-  return none
-
 /-- A user's sessions, most recently used first. -/
 def list (ctx : Ctx) (user : Store.UserId) : IO (Array Session) :=
   return (← ctx.store.listSessions user).map ofRow
@@ -143,38 +131,6 @@ def authenticatedWithin (s : Session) (now seconds : Nat) : Bool :=
 /-- Set the cookie for a session on a reply. -/
 def setCookie (ctx : Ctx) (s : Session) (id : String) (now : Nat) (r : Reply) : Reply :=
   r.setSession id (cookieMaxAge ctx s now)
-
-end Session
-
-/-! ## Creating a session
-
-Kept apart on purpose; see the module documentation. -/
-
-namespace Session
-
-/-- Start a session for `user`, authenticated at the current time with `amr`
-and `factors`, from the request `r`.  Returns the session and the identifier to
-set as its cookie.
-
-The session the request already carries, if any, is ended first: signing in
-replaces it rather than leaving it live beside the new one, so an identifier
-planted in the browser before sign-in is worthless after it.
-
-This is the only function that creates a session.  It checks nothing about how
-the user authenticated: that is what round 2's `StrongAuthentication` argument
-will carry. -/
-def create (ctx : Ctx) (r : Req) (user : Store.UserId) (amr factors : List String) :
-    IO (Session × String) := do
-  if let some old := (r.cookie sessionCookieName).bind decodeId then
-    discard <| ctx.store.endSession (.of old)
-  let id ← Crypto.randomBytes idBytes.toUSize
-  let now ← ctx.clock
-  let row : Store.SessionRow :=
-    { idHash := .of id, user, amr, factors, authTime := now, created := now,
-      lastSeen := now, clientAddress := r.clientAddress,
-      userAgent := ((r.header "user-agent").getD "").take 256 |>.toString }
-  ctx.store.insertSession row
-  return (ofRow row, encodeId id)
 
 end Session
 

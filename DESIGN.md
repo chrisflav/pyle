@@ -144,7 +144,8 @@ statement is one of the formats we accept.
 their make.  `packed` self-attestation is checked when it is sent.  An
 administrator may configure an AAGUID allow-list, in which case `packed` full
 attestation is verified against the configured roots, the chain by OpenSSL
-(§6.1).
+(§6.1).  An allow-list therefore admits only authenticators that attest: it
+rules out synced platform passkeys, which send none.
 
 ### 2.3 What the ceremony needs
 
@@ -186,6 +187,13 @@ session's `auth_time` is too old, or its factors too weak, pyle asks for a
 fresh WebAuthn assertion without ending the session.  Removing an
 authenticator, adding one and minting long-lived tokens always require a
 step-up within the last five minutes.
+
+A step-up need not be WebAuthn: two factors through the code form (a
+password and a TOTP code, or a recovery code and another factor) are accepted
+for account changes too, because recovery needs them — someone who has lost
+every authenticator signs in with a recovery code and a second factor and must
+then be able to register a new one.  The cost is that a real-time phisher who
+relays both codes can register a passkey of their own.  §12 keeps this open.
 
 Sessions are listed to their user, with the device and the time last used, and
 can be ended individually.
@@ -373,10 +381,12 @@ As in kleis, the point of Lean is that some of these become theorems.
 2. **Single use.**  The challenge, code and refresh-token stores are state
    machines; a value that has been consumed is never accepted again.
    Invariant over every sequence of operations.
-3. **No session without the policy.**  `Session.establish` takes a
-   `StrongAuthentication`, whose only constructors are private to the ceremony
-   modules — a type-level guarantee in the style of kleis's
-   `AuthorizedRequest`, not a theorem to maintain.
+3. **No session without the policy.**  `Policy.establish` takes a
+   `StrongAuthentication`, whose constructor is private to
+   `Pyle.Session.Policy`, as is the constructor of the per-factor evidence it
+   is built from and the SQL that writes a session row — a type-level
+   guarantee in the style of kleis's `AuthorizedRequest`, not a theorem to
+   maintain.
 4. **Authorization codes.**  A token is issued for a code only if the code was
    issued to that client, for that redirect URI, with a challenge the verifier
    hashes to, and has not expired or been used.
@@ -455,6 +465,11 @@ deployment.
   make migrating taxis users easy and would make GitHub a way into everything.
   Leaning towards linking a GitHub account only to import a profile, never to
   sign in.
+- **Step-up for adding authenticators.**  Whether adding an authenticator
+  should require a WebAuthn step-up whenever the account still has a usable
+  WebAuthn credential, so that relayed codes (§4) can no longer add one, at
+  the price of a recovery path that must tell "lost every key" from "chose
+  not to use it".
 - **Synced passkeys.**  Passkeys synced by Apple, Google or a password manager
   are as strong as that account.  Whether to require device-bound credentials
   (backup-eligible flag clear) for administrators is a policy knob to decide.

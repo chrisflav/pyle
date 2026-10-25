@@ -188,8 +188,34 @@ def migration1 : Migration where
      ) STRICT"
   ]
 
+/-- Passwords, for deployments that allow them (DESIGN §1, §3).  One per
+user, as the PHC string of its Argon2id hash; the table is empty unless
+`allowPasswords` is set. -/
+def migration2 : Migration where
+  version := 2
+  description := "passwords"
+  statements := [
+    "CREATE TABLE passwords (
+       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+       phc TEXT NOT NULL,
+       created INTEGER NOT NULL
+     ) STRICT"
+  ]
+
+/-- Where each pending challenge was asked for, so that one client address
+cannot fill the table (DESIGN §7): the begin endpoints refuse a client with
+too many challenges pending.  Challenges written before this migration have
+no address and count only towards the overall cap. -/
+def migration3 : Migration where
+  version := 3
+  description := "challenge client addresses"
+  statements := [
+    "ALTER TABLE challenges ADD COLUMN client_address TEXT",
+    "CREATE INDEX challenges_client ON challenges(client_address)"
+  ]
+
 /-- Every migration, in order.  Append only. -/
-def migrations : List Migration := [migration1]
+def migrations : List Migration := [migration1, migration2, migration3]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

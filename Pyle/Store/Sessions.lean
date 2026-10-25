@@ -6,7 +6,9 @@ import Pyle.Store.Users
 The rows behind `Pyle.Session` and behind every WebAuthn ceremony.
 
 A session row is keyed by the SHA-256 of its identifier; the identifier itself
-lives only in the browser's cookie.  A challenge is consumed by the first
+lives only in the browser's cookie.  Nothing here inserts a session row or
+records an authentication on one: those two statements are private to
+`Pyle.Policy`, behind `StrongAuthentication` (DESIGN §9.3).  A challenge is consumed by the first
 request that names it, whatever that request's outcome (§2.1), with one
 `DELETE … RETURNING`: there is no moment between reading a challenge and
 removing it at which a second request could read it too.
@@ -53,13 +55,6 @@ def readSession (stmt : SQLite.Stmt) : IO SessionRow := do
     clientAddress := ← colText stmt 7
     userAgent := ← colText stmt 8 }
 
-/-- Insert a session row. -/
-def Store.insertSession (s : Store) (r : SessionRow) : IO Unit := s.run fun c => do
-  discard <| exec c
-    s!"INSERT INTO sessions ({sessionColumns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    #[r.idHash, r.user, encodeList r.amr, encodeList r.factors, r.authTime, r.created,
-      r.lastSeen, r.clientAddress, r.userAgent]
-
 /-- Look up the session with this identifier hash that is still live at `now`
 — idle for at most `idle` seconds, and at most `absolute` seconds old, and
 belonging to an account that is not disabled — and mark it used.  A session
@@ -85,16 +80,6 @@ def Store.rotateSession (s : Store) (old new : SecretHash) (now : Nat) : IO Bool
   s.run fun c => do
     return (← exec c "UPDATE sessions SET id_hash = ?, last_seen = ? WHERE id_hash = ?"
       #[new, now, old]) > 0
-
-/-- Give a session a new identifier and record a fresh authentication on it:
-the step-up of §4, which raises the session's assurance without ending it.
-Whether it applied. -/
-def Store.reauthenticateSession (s : Store) (old new : SecretHash) (amr factors : List String)
-    (now : Nat) : IO Bool := s.run fun c => do
-  return (← exec c
-    "UPDATE sessions SET id_hash = ?, amr = ?, factors = ?, auth_time = ?, last_seen = ? \
-      WHERE id_hash = ?"
-    #[new, encodeList amr, encodeList factors, now, now, old]) > 0
 
 /-- A user's sessions, most recently used first. -/
 def Store.listSessions (s : Store) (user : UserId) : IO (Array SessionRow) :=

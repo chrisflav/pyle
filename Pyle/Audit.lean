@@ -7,15 +7,30 @@ One append-only record per authentication event (DESIGN.md §7), in the shape
 of kleis's §9.3: who, which factor, from where, the outcome.  Each record
 carries the SHA-256 of the previous record's hash and its own fields, so
 changing, removing or reordering any record breaks every hash after it, and
-`verifyChain` finds where.  What the chain does not show is the newest records
-being cut off the end; anchoring the latest hash somewhere else is a
-deployment's job.
+`verifyChain` finds where.
+
+**What the chain does not show.**  It detects a record being modified,
+removed from the middle or reordered.  It does not detect someone with write
+access to the database cutting off the newest records and appending new ones
+in their place: they can recompute every hash from the cut onwards, and the
+result is a valid chain.  Only an anchor outside the database closes that:
+periodically exporting the head hash (the last entry's `hash`) somewhere the
+database's writer cannot rewrite, and checking that the chain still passes
+through it.
 
 **Never a secret.**  A record has no field for one: the event is a fixed name,
 the factor is a kind of authenticator or a credential id, the user is a name.
 `detail` is free text for a reason ("unknown credential", "counter went
 backwards"); callers put reasons there, never a code, a challenge or a token,
 and nothing in pyle passes a secret to `append`.
+
+**Bounded and sanitised.**  What a client typed reaches the log — a failed
+sign-in records the name that was tried — so `append` cleans every field
+first (`sanitise`).  A user name that is not a valid one is never logged
+verbatim: it becomes `invalidUserName`, since it may be a password typed into
+the wrong box.  Other fields lose control characters and are cut to a fixed
+length, so a request cannot make a record unbounded or break a terminal that
+displays it.
 
 **The hash.**  `SHA-256(prev ‖ field₁ ‖ … ‖ fieldₙ)`, where every field is
 written with an explicit length (or a presence tag for an optional one) so
@@ -186,9 +201,27 @@ def readEntry (st : SQLite.Stmt) : IO Entry := do
     clientAddress := ← colText st 5, outcome := ← colText st 6, detail := ← colText st 7,
     prev := ← colBlob st 8, hash := ← colBlob st 9 }
 
-/-- Append a record at time `now`.  Reading the last hash and inserting the
+/-- What is logged in place of a user name that is not a valid one. -/
+def invalidUserName : String := "<invalid user name>"
+
+/-- A field without control characters, at most `max` characters long. -/
+def clean (max : Nat) (s : String) : String :=
+  (String.ofList (s.toList.filter fun c => c.toNat ≥ 0x20 && c.toNat != 0x7f)).take max
+    |>.toString
+
+/-- A record as it is logged: the user name kept only if it is a valid one,
+every other field cleaned and bounded. -/
+def sanitise (r : Record) : Record :=
+  { r with
+    userName := r.userName.map fun n => if validUserName n then n else invalidUserName
+    factor := r.factor.map (clean 128)
+    clientAddress := clean 64 r.clientAddress
+    detail := clean 256 r.detail }
+
+/-- Append a record at time `now`, after `sanitise`.  Reading the last hash and inserting the
 next entry are one transaction, so concurrent appends cannot fork the chain. -/
 def append (s : Store) (now : Nat) (r : Record) : IO Entry := s.atomically fun c => do
+  let r := sanitise r
   let last ← queryOne c "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1" #[]
     fun st => return (← colNat st 0, ← colBlob st 1)
   let (seq, prev) := match last with

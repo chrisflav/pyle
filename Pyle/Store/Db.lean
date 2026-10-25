@@ -50,11 +50,18 @@ def Value.opt {α : Type} [Coe α Value] : Option α → Value
   | none => .null
   | some a => (a : Value)
 
-/-- Bind a value to the 1-based parameter `i` of a statement. -/
+/-- Bind a value to the 1-based parameter `i` of a statement.
+
+Text containing a NUL character is refused.  `leansqlite` binds text as a
+C string, so SQLite would see only the part before the NUL: `alice\0x` would
+look up `alice`, and a value stored that way would not read back as written.
+Refusing here closes that for every query at once. -/
 def Value.bindTo (stmt : SQLite.Stmt) (i : Int32) : Value → IO Unit
   | .null => stmt.bindNull i
   | .int n => stmt.bindInt64 i (Int64.ofInt n)
-  | .text s => stmt.bindText i s
+  | .text s =>
+    if s.contains '\x00' then throw (.userError "store: text containing NUL is refused")
+    else stmt.bindText i s
   | .blob b => stmt.bindBlob i b
 
 /-- The SHA-256 of a bearer secret: what the database stores in its place.
@@ -187,13 +194,27 @@ def colList (stmt : SQLite.Stmt) (i : Nat) : IO (List String) := do
 
 /-! ## Opening -/
 
+/-- Switch a connection to WAL mode.  Changing the journal mode needs an
+exclusive lock, and SQLite answers `SQLITE_BUSY` at once rather than through
+the busy handler when another connection holds one — which happens when two
+processes open a new database together — so this retries for up to five
+seconds itself. -/
+def enableWal (conn : SQLite) : IO Unit := do
+  for attempt in [0:50] do
+    try
+      conn.exec "PRAGMA journal_mode = WAL"
+      return
+    catch e =>
+      if attempt == 49 then throw e
+      IO.sleep 100
+
 /-- Open (creating if needed) the database file.  Foreign keys are switched on,
 since SQLite leaves them off by default, and the journal is put in WAL mode so
 that readers do not block the writer. -/
 def Store.openFile (path : System.FilePath) : IO Store := do
   let conn ← SQLite.openWith path .readWriteCreate (busyTimeoutMs := 5000)
   conn.exec "PRAGMA foreign_keys = ON"
-  conn.exec "PRAGMA journal_mode = WAL"
+  enableWal conn
   conn.exec "PRAGMA synchronous = NORMAL"
   return { conn, lock := ← Std.Mutex.new () }
 

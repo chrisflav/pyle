@@ -99,6 +99,29 @@ private def asStrs : Json → Option (List String)
   | .arr xs => xs.toList.mapM asStr
   | _ => none
 
+/-- Split an `https://host[:port][/path]` URL into scheme, authority and path,
+if it is one pyle accepts as an issuer or origin: `https` with a non-empty
+host, or `http` only when the host is exactly `localhost` or `127.0.0.1` (for
+development).  The host is compared whole, so `http://localhost.evil.example`
+is refused.  No userinfo, query, fragment, or trailing `/`. -/
+def parseUrlBase (url : String) : Option (String × String × String) := do
+  let (scheme, rest) ← match url.splitOn "://" with
+    | [scheme, rest] => some (scheme, rest)
+    | _ => none
+  let (authority, path) := match rest.splitOn "/" with
+    | a :: segs => (a, if segs.isEmpty then "" else "/" ++ "/".intercalate segs)
+    | [] => ("", "")
+  guard (!authority.isEmpty && !url.contains '?' && !url.contains '#' &&
+    !authority.contains '@' && !url.endsWith "/")
+  let host := match authority.splitOn ":" with
+    | [h, p] => if !p.isEmpty && p.all Char.isDigit then some h else none
+    | [h] => some h
+    | _ => none
+  let host ← host
+  guard (!host.isEmpty)
+  guard (scheme == "https" || (scheme == "http" && (host == "localhost" || host == "127.0.0.1")))
+  return (scheme, authority, path)
+
 /-- Read a configuration from its JSON, resolving relative paths against
 `base`.  Checks what can be checked without the network: the issuer is
 `https://` (or `http://localhost` for development), the origins are origins,
@@ -109,10 +132,9 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   for (k, _) in kvs.toArray do
     unless knownKeys.contains k do throw s!"unknown configuration key '{k}'"
   let issuer ← reqStr j "issuer"
-  unless issuer.startsWith "https://" || issuer.startsWith "http://localhost" ||
-      issuer.startsWith "http://127.0.0.1" do
-    throw "'issuer' must be an https:// URL (http:// only for localhost)"
-  if issuer.endsWith "/" then throw "'issuer' must not end with '/'"
+  unless (parseUrlBase issuer).isSome do
+    throw "'issuer' must be an https:// URL with no query or fragment and no trailing '/' \
+      (http:// only for localhost or 127.0.0.1)"
   let rpId ← reqStr j "rpId"
   if rpId.isEmpty then throw "'rpId' must not be empty"
   let origins ← match j.getObjVal? "origins" with
@@ -122,10 +144,10 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
     | .error _ => throw "'origins' is required"
   if origins.isEmpty then throw "'origins' must name at least one origin"
   for o in origins do
-    let hostPart := ((o.splitOn "://").drop 1).headD ""
-    unless (o.startsWith "https://" || o.startsWith "http://localhost") &&
-        !hostPart.isEmpty && !hostPart.contains '/' do
-      throw s!"'{o}' is not an origin (scheme://host[:port], no path)"
+    match parseUrlBase o with
+    | some (_, _, "") => pure ()
+    | _ => throw s!"'{o}' is not an origin (scheme://host[:port], no path; \
+        http:// only for localhost or 127.0.0.1)"
   let host ← opt j "host" "127.0.0.1" asStr "a string"
   let port ← opt j "port" 8420 asNat "a port number"
   if port ≥ 65536 then throw "'port' must be below 65536"

@@ -2,6 +2,7 @@ import Std.Http
 import Std.Net
 import Pyle.Session.Session
 import Pyle.Audit
+import Pyle.Sys
 
 /-!
 # The server
@@ -69,18 +70,20 @@ def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r
 def rootKeyBytes : Nat := 32
 
 /-- Write a new random root key to `path`, readable only by its owner.  The
-file is created empty, restricted, and only then written, so the key is never
-in a file anyone else may read.  Refuses to replace an existing file: losing
-the root key loses every secret sealed under it. -/
+file is created by one `open` with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+0600 and written through that descriptor (`Sys.writeNewPrivate`), so it is
+never readable by anyone else, is not reached through a planted symbolic link,
+and an existing file is never replaced: losing the root key loses every secret
+sealed under it. -/
 def createRootKey (path : System.FilePath) : IO Unit := do
-  if ← path.pathExists then
-    throw (.userError s!"{path} already exists; refusing to replace a root key")
   if let some dir := path.parent then
     if !dir.toString.isEmpty then IO.FS.createDirAll dir
-  IO.FS.withFile path .writeNew fun _ => pure ()
-  IO.setAccessRights path
-    { user := { read := true, write := true }, group := {}, other := {} }
-  IO.FS.writeBinFile path (← Crypto.randomBytes rootKeyBytes.toUSize)
+  try Sys.writeNewPrivate path.toString (← Crypto.randomBytes rootKeyBytes.toUSize)
+  catch e => throw (.userError s!"cannot create the root key {path} (it must not exist): {e}")
+
+/-- Make every file the process creates from now on private to its owner
+(`umask 077`): the database and the journal files SQLite creates beside it. -/
+def restrictFileModes : IO Unit := discard <| Sys.umask 0o077
 
 /-- Read the root key, checking its length. -/
 def loadRootKey (path : System.FilePath) : IO ByteArray := do
@@ -93,6 +96,7 @@ def loadRootKey (path : System.FilePath) : IO ByteArray := do
 /-- Open the database (migrating it) and read the root key: everything a
 handler needs. -/
 def openCtx (config : Config) (clock : IO Nat := systemClock) : IO Ctx := do
+  restrictFileModes
   let rootKey ← loadRootKey config.rootKeyFile
   let store ← Store.Store.openAt config.database (← clock)
   return { config, store, limiter := ← RateLimiter.new, rootKey, clock }
@@ -136,7 +140,7 @@ def toReq (config : Config) (req : Request Body.Stream) (body : ByteArray) : Req
   let peer := match req.extensions.get Std.Http.Server.RemoteAddr with
     | some a => peerAddress a.addr
     | none => ""
-  let xff := (headers.find? (·.1 == "x-forwarded-for")).map (·.2)
+  let xff := forwardedFor headers
   { method := req.line.method, path, query, headers, body,
     clientAddress := Http.clientAddress config.trustedProxies peer xff }
 

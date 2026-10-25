@@ -64,6 +64,26 @@ def schemaTests : IO Unit := do
       "INSERT INTO schema_version (version, description, applied) VALUES (?, ?, ?)"
       #[.int (schemaVersion + 1), "from the future", (3 : Nat)]
     check "a database from a newer pyle is refused" (← throws (Store.openAt path 3))
+  -- Two processes starting on one new file: the version is read inside the
+  -- migration's transaction, so the second sees the first's work.
+  IO.FS.withTempDir fun dir => do
+    let path := dir / "pyle.db"
+    let opens ← (List.range 4).mapM fun _ => IO.asTask (Store.openAt path 1)
+    let mut ok := true
+    for t in opens do
+      if let .error e ← IO.wait t then
+        ok := false
+        say s!"  open failed: {e}"
+    check "concurrent first opens all succeed" ok
+    let s ← Store.openAt path 1
+    checkEq "and the migration is applied once"
+      (← s.run fun c => query c "SELECT COUNT(*) FROM schema_version" #[] (colNat · 0))
+      #[migrations.length]
+
+/-- A client for the OIDC tests. -/
+def sampleClient (id : String) : Client :=
+  { id, name := "Example", secretHash := some (.of "secret".toUTF8),
+    redirectUris := ["https://app.example.org/cb"], scopes := ["openid"], created := 1 }
 
 /-- Accounts. -/
 def userTests : IO Unit := withCtx fun ctx _ => do
@@ -81,6 +101,10 @@ def userTests : IO Unit := withCtx fun ctx _ => do
   checkEq "found by handle" ((← s.findUserByHandle bob.handle).map (·.name)) (some "bob")
   checkEq "groups round-trip" ((← s.findUser alice.id).map (·.groups)) (some ["admin", "dev"])
   checkEq "an unknown name is none" ((← s.findUserByName "carol").isNone) true
+  -- leansqlite binds text as a C string; a NUL would truncate the value.
+  check "a name with NUL is refused, not truncated to alice"
+    (← throws (s.findUserByName "alice\x00whatever"))
+  check "and cannot be stored" (← throws (s.putClient (sampleClient "app\x00x")))
   checkEq "listed by name" ((← s.listUsers).map (·.name)) #["alice", "bob"]
   check "disabled" (← s.setUserDisabled bob.id true)
   checkEq "and reads back disabled" ((← s.findUser bob.id).map (·.disabled)) (some true)
@@ -141,6 +165,11 @@ def factorTests : IO Unit := withCtx fun ctx _ => do
   check "a good code is refused while locked" (!(← s.acceptTotpStep u.id 300 7100))
   check "and accepted after" (← s.acceptTotpStep u.id 300 7900)
   checkEq "the secret reads back" ((← s.findTotp u.id).map (·.sealedSecret)) (some "sealed".toUTF8)
+  s.addCredential (sampleCredential u.id "c1".toUTF8)
+  check "TOTP as one of two authenticators cannot be removed" (!(← s.removeTotp u.id))
+  s.addCredential (sampleCredential u.id "c2".toUTF8)
+  check "as one of three it can" (← s.removeTotp u.id)
+  check "and then it is gone" ((← s.findTotp u.id).isNone)
   let codes := ["a", "b", "c"].map (·.toUTF8)
   s.setRecoveryCodes u.id codes
   checkEq "three unspent" (← s.unspentRecoveryCodes u.id) 3
@@ -173,11 +202,6 @@ def challengeTests : IO Unit := withCtx fun ctx _ => do
   s.addChallenge { value := ← Crypto.randomBytes 32, purpose := .register, user := none,
                    expires := 5 }
   checkEq "expired ones are purged" (← s.purgeChallenges 10) 1
-
-/-- A client for the OIDC tests. -/
-def sampleClient (id : String) : Client :=
-  { id, name := "Example", secretHash := some (.of "secret".toUTF8),
-    redirectUris := ["https://app.example.org/cb"], scopes := ["openid"], created := 1 }
 
 /-- Clients, codes, refresh tokens. -/
 def oidcTests : IO Unit := withCtx fun ctx _ => do
@@ -222,27 +246,50 @@ def oidcTests : IO Unit := withCtx fun ctx _ => do
       authTime := 90, expires := 10000 }
   let t1 ← Crypto.randomBytes 32
   let t2 ← Crypto.randomBytes 32
-  s.addRefreshToken (.of t1) g 100
-  match ← s.useRefreshToken (.of t1) 200 with
-  | .rotated g' => checkEq "a current token rotates with its grant" g'.clientId "app"
-  | _ => check "a current token rotates" false
-  s.addRefreshToken (.of t2) g 200
-  match ← s.useRefreshToken (.of t1) 300 with
-  | .reused => check "presenting it again is reuse" true
-  | _ => check "presenting it again is reuse" false
-  match ← s.useRefreshToken (.of t2) 301 with
-  | .invalid => check "and the family, including its newest token, is revoked" true
-  | _ => check "and the family, including its newest token, is revoked" false
-  match ← s.useRefreshToken (.of (← Crypto.randomBytes 32)) 302 with
-  | .invalid => check "an unknown token is invalid" true
-  | _ => check "an unknown token is invalid" false
   let t3 ← Crypto.randomBytes 32
-  s.addRefreshToken (.of t3) { g with family := ← Crypto.randomBytes 16 } 400
+  s.startRefreshFamily (.of t1) g 100
+  check "a family is begun once" (← throws (s.startRefreshFamily (.of t2) g 100))
+  let isInvalid (o : RefreshOutcome) : Bool := o matches .invalid
+  check "another client's presentation is invalid"
+    (isInvalid (← s.rotateRefreshToken (.of t1) (.of t2) "other" 150 20000))
+  match ← s.rotateRefreshToken (.of t1) (.of t2) "app" 200 20000 with
+  | .rotated g' =>
+    checkEq "a current token rotates with its grant" (g'.clientId, g'.expires) ("app", 20000)
+  | _ => check "a current token rotates" false
+  match ← s.rotateRefreshToken (.of t2) (.of t3) "app" 250 20000 with
+  | .rotated _ => check "the successor was stored with it, and rotates in turn" true
+  | _ => check "the successor was stored with it, and rotates in turn" false
+  check "another client replaying a used token revokes nothing"
+    (isInvalid (← s.rotateRefreshToken (.of t1) (.of (← Crypto.randomBytes 32)) "other" 260
+      20000))
+  match ← s.rotateRefreshToken (.of t1) (.of (← Crypto.randomBytes 32)) "app" 300 20000 with
+  | .reused => check "presenting a used token is reuse" true
+  | _ => check "presenting a used token is reuse" false
+  check "and the family, including its newest token, is revoked"
+    (isInvalid (← s.rotateRefreshToken (.of t3) (.of (← Crypto.randomBytes 32)) "app" 301
+      20000))
+  check "a revoked family cannot be begun again"
+    (← throws (s.startRefreshFamily (.of (← Crypto.randomBytes 32)) g 302))
+  let stray ← Crypto.randomBytes 32
+  check "nor can anything be inserted into it, by any path" (← throws (s.run fun c => exec c
+    "INSERT INTO refresh_tokens (token_hash, family, client_id, user_id, scope, amr, \
+      auth_time, created, expires) VALUES (?, ?, 'app', ?, 'openid', '[]', 0, 0, 99999)"
+    #[.blob stray, .blob family, .int u.id.val]))
+  check "an unknown token is invalid"
+    (isInvalid (← s.rotateRefreshToken (.of (← Crypto.randomBytes 32))
+      (.of (← Crypto.randomBytes 32)) "app" 302 20000))
+  let family2 ← Crypto.randomBytes 16
+  let t4 ← Crypto.randomBytes 32
+  s.startRefreshFamily (.of t4) { g with family := family2 } 400
   checkEq "racing with one refresh token: one rotation"
     (← raceCount 8 do
-      match ← s.useRefreshToken (.of t3) 500 with
+      match ← s.rotateRefreshToken (.of t4) (.of (← Crypto.randomBytes 32)) "app" 500 20000 with
       | .rotated _ => return true
       | _ => return false) 1
+  checkEq "and the losers' reuse leaves no live token in the family"
+    (← s.run fun c => query c
+      "SELECT COUNT(*) FROM refresh_tokens WHERE family = ? AND used_at IS NULL"
+      #[.blob family2] (colNat · 0)) #[0]
   check "removing a client" (← s.removeClient "app")
   check "removes its tokens too" ((← s.run fun c =>
     query c "SELECT 1 FROM refresh_tokens WHERE client_id = ?" #[.text "app"] (colInt · 0)).isEmpty)
@@ -328,6 +375,13 @@ def configTests : IO Unit := do
     "\"rpId\": \"a.org\", \"origins\": [\"https://a.org\"], \"sessionIdleSeconds\": 10, " ++
     "\"sessionAbsoluteSeconds\": 5}")
   bad "a missing issuer is refused" "{\"rpId\": \"a.org\", \"origins\": [\"https://a.org\"]}"
+  bad "a host that only starts with localhost is refused" ("{\"issuer\": " ++
+    "\"http://localhost.evil.example\", \"rpId\": \"a.org\", \"origins\": [\"https://a.org\"]}")
+  bad "an origin that only starts with localhost is refused" ("{\"issuer\": \"https://a.org\", " ++
+    "\"rpId\": \"a.org\", \"origins\": [\"http://localhostile.example\"]}")
+  check "http on localhost with a port is accepted" ((parse ("{\"issuer\": " ++
+    "\"http://localhost:8080\", \"rpId\": \"localhost\", " ++
+    "\"origins\": [\"http://localhost:8080\"]}")) matches .ok _)
 
 /-- The store. -/
 def storeTests : IO Unit := do

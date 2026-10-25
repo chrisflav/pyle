@@ -132,6 +132,15 @@ def migration1 : Migration where
        used_at INTEGER
      ) STRICT",
     "CREATE INDEX refresh_tokens_family ON refresh_tokens(family)",
+    -- A family, once revoked, stays revoked: the trigger refuses any token
+    -- added to it, whichever code path tries.
+    "CREATE TABLE revoked_families (
+       family BLOB PRIMARY KEY,
+       revoked INTEGER NOT NULL
+     ) STRICT",
+    "CREATE TRIGGER refresh_tokens_not_revoked BEFORE INSERT ON refresh_tokens
+       WHEN EXISTS (SELECT 1 FROM revoked_families WHERE family = NEW.family)
+       BEGIN SELECT RAISE(ABORT, 'refresh-token family revoked'); END",
     "CREATE TABLE keys (
        kid TEXT PRIMARY KEY,
        algorithm TEXT NOT NULL,
@@ -198,15 +207,18 @@ def currentVersion (c : SQLite) : IO Nat := do
   return v.getD 0
 
 /-- Bring the database up to `schemaVersion`.  Refuses a database from a newer
-pyle. -/
+pyle.  Each migration reads the version and applies itself inside one
+`BEGIN IMMEDIATE` transaction, so two processes starting on the same file
+cannot both apply it: the second waits for the write lock and then sees the
+version the first recorded. -/
 def Store.migrate (s : Store) (now : Nat) : IO Unit := s.run fun c => do
-  let atVersion ← currentVersion c
-  if atVersion > schemaVersion then
-    throw (.userError s!"the database is at schema version {atVersion}, newer than this pyle \
-      understands ({schemaVersion}); refusing to touch it")
   for m in migrations do
-    if m.version > atVersion then
-      c.transaction (mode := .immediate) do
+    c.transaction (mode := .immediate) do
+      let atVersion ← currentVersion c
+      if atVersion > schemaVersion then
+        throw (.userError s!"the database is at schema version {atVersion}, newer than this \
+          pyle understands ({schemaVersion}); refusing to touch it")
+      if m.version > atVersion then
         for stmt in m.statements do
           discard <| exec c stmt
         discard <| exec c

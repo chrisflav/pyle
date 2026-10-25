@@ -108,6 +108,17 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   discard <| ctx.store.setUserDisabled bob.id true
   check "a disabled account has no session" ((← Session.current ctx (withCookie bid)).isNone)
 
+/-- Signing in replaces the request's session. -/
+def replaceTests : IO Unit := withCtx fun ctx _ => do
+  group "session: replacement"
+  let alice ← ctx.store.addUser "alice" [] 1
+  let (_, planted) ← Session.create ctx (Req.mk' .post "/") alice.id ["hwk"] []
+  let (_, fresh) ← Session.create ctx (withCookie planted .post) alice.id ["hwk", "user"] []
+  check "the session the request carried is ended"
+    ((← Session.current ctx (withCookie planted)).isNone)
+  check "the new one works" ((← Session.current ctx (withCookie fresh)).isSome)
+  checkEq "and it is the only one" (← Session.list ctx alice.id).size 1
+
 /-- Signing out through the route. -/
 def logoutTests : IO Unit := withCtx fun ctx _ => do
   group "session: sign-out"
@@ -129,6 +140,7 @@ def logoutTests : IO Unit := withCtx fun ctx _ => do
 def sessionTests : IO Unit := do
   idTests
   lifecycleTests
+  replaceTests
   logoutTests
 
 end PyleTests

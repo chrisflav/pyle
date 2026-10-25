@@ -11,9 +11,10 @@ Every bearer value here — a code, a refresh token, a device code, an
 invitation — is stored as its SHA-256 and consumed atomically:
 
 * a code by one `DELETE … RETURNING`, so it is good once (§5.1, §9.4);
-* a refresh token by one conditional `UPDATE … RETURNING` that marks it used,
-  inside a transaction that revokes its whole family when the token presented
-  was already used (§5.1);
+* a refresh token by `rotateRefreshToken`, one transaction that marks it used
+  and stores its successor, or revokes its whole family when the token
+  presented was already used (§5.1); a revoked family is recorded, and the
+  schema refuses any token added to one;
 * a device code by one `DELETE … RETURNING` that only matches once it has been
   approved;
 * an invitation by one `DELETE … RETURNING`.
@@ -150,35 +151,60 @@ structure RefreshGrant where
   /-- When this token stops being accepted. -/
   expires : Nat
 
-/-- Record an issued refresh token under its hash. -/
-def Store.addRefreshToken (s : Store) (tokenHash : SecretHash) (g : RefreshGrant)
-    (now : Nat) : IO Unit := s.run fun c => do
+/-- Insert a refresh token row.  Internal: a successor is only ever inserted by
+`rotateRefreshToken`, in the transaction that used its predecessor, and the
+first token of a family only by `startRefreshFamily`. -/
+private def insertRefreshToken (c : SQLite) (tokenHash : SecretHash) (g : RefreshGrant)
+    (now : Nat) : IO Unit := do
   discard <| exec c
     "INSERT INTO refresh_tokens (token_hash, family, client_id, user_id, scope, amr, auth_time, \
       created, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     #[tokenHash, g.family, g.clientId, g.user, g.scope, encodeList g.amr, g.authTime, now,
       g.expires]
 
+/-- Issue the first refresh token of a new family, after a code exchange or a
+device grant.  Refused if the family already has tokens or has been revoked:
+a family is begun once.  (A trigger in the schema refuses any insert into a
+revoked family as well.) -/
+def Store.startRefreshFamily (s : Store) (tokenHash : SecretHash) (g : RefreshGrant)
+    (now : Nat) : IO Unit := s.atomically fun c => do
+  let used ← queryOne c
+    "SELECT 1 FROM refresh_tokens WHERE family = ? \
+      UNION ALL SELECT 1 FROM revoked_families WHERE family = ?"
+    #[g.family, g.family] (colInt · 0)
+  if used.isSome then throw (.userError "store: that refresh-token family is not new")
+  insertRefreshToken c tokenHash g now
+
 /-- What presenting a refresh token came to. -/
 inductive RefreshOutcome where
-  /-- The token was current: it is now used, and here is its grant.  The
-  caller issues the next token in `grant.family`. -/
+  /-- The token was current for this client: it is now used, its successor
+  has been stored, and here is the grant both carry. -/
   | rotated (grant : RefreshGrant)
   /-- The token had already been used: its whole family has been revoked. -/
   | reused
-  /-- No such token, or it has expired. -/
+  /-- No such token for this client, or it has expired. -/
   | invalid
 
-/-- Present a refresh token.  In one transaction: mark it used if it is unused
-and unexpired, returning its grant; or, if it exists and was used before,
-delete its family. -/
-def Store.useRefreshToken (s : Store) (tokenHash : SecretHash) (now : Nat) :
-    IO RefreshOutcome := s.atomically fun c => do
+/-- Present refresh token `old` on behalf of `clientId`, and rotate it to
+`new`, valid until `expires`.  One `BEGIN IMMEDIATE` transaction:
+
+* if `old` is this client's, unused, unexpired, and its family not revoked,
+  mark it used and insert `new` in the same family — the successor exists
+  exactly when its predecessor was used, and never in a revoked family;
+* if `old` is this client's and was used before, revoke its family: delete
+  every token in it and record the family as revoked, so nothing can be added
+  to it afterwards;
+* otherwise the token is invalid, and nothing changes.  A token presented by
+  the wrong client revokes nothing, so one client cannot end another's
+  sessions by replaying a value it should never have seen. -/
+def Store.rotateRefreshToken (s : Store) (old new : SecretHash) (clientId : String)
+    (now expires : Nat) : IO RefreshOutcome := s.atomically fun c => do
   let used ← queryOne c
     "UPDATE refresh_tokens SET used_at = ? \
-      WHERE token_hash = ? AND used_at IS NULL AND expires > ? \
+      WHERE token_hash = ? AND client_id = ? AND used_at IS NULL AND expires > ? \
+      AND family NOT IN (SELECT family FROM revoked_families) \
       RETURNING family, client_id, user_id, scope, amr, auth_time, expires"
-    #[now, tokenHash, now] fun st => do
+    #[now, old, clientId, now] fun st => do
       return {
         family := ← colBlob st 0
         clientId := ← colText st 1
@@ -187,19 +213,30 @@ def Store.useRefreshToken (s : Store) (tokenHash : SecretHash) (now : Nat) :
         amr := ← colList st 4
         authTime := ← colNat st 5
         expires := ← colNat st 6 : RefreshGrant }
-  if let some g := used then return .rotated g
+  if let some g := used then
+    let g := { g with expires }
+    insertRefreshToken c new g now
+    return .rotated g
   let family ← queryOne c
-    "SELECT family FROM refresh_tokens WHERE token_hash = ? AND used_at IS NOT NULL"
-    #[tokenHash] (colBlob · 0)
+    "SELECT family FROM refresh_tokens \
+      WHERE token_hash = ? AND client_id = ? AND used_at IS NOT NULL"
+    #[old, clientId] (colBlob · 0)
   match family with
   | some f =>
     discard <| exec c "DELETE FROM refresh_tokens WHERE family = ?" #[f]
+    discard <| exec c
+      "INSERT OR IGNORE INTO revoked_families (family, revoked) VALUES (?, ?)" #[f, now]
     return .reused
   | none => return .invalid
 
-/-- Revoke a whole family, as RP-initiated logout or an administrator does. -/
-def Store.revokeRefreshFamily (s : Store) (family : ByteArray) : IO Nat := s.run fun c =>
-  exec c "DELETE FROM refresh_tokens WHERE family = ?" #[family]
+/-- Revoke a whole family, as RP-initiated logout or an administrator does:
+delete its tokens and record it as revoked.  How many tokens it had. -/
+def Store.revokeRefreshFamily (s : Store) (family : ByteArray) (now : Nat) : IO Nat :=
+  s.atomically fun c => do
+    let n ← exec c "DELETE FROM refresh_tokens WHERE family = ?" #[family]
+    discard <| exec c
+      "INSERT OR IGNORE INTO revoked_families (family, revoked) VALUES (?, ?)" #[family, now]
+    return n
 
 /-! ## Device codes (RFC 8628) -/
 

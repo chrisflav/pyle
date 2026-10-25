@@ -37,6 +37,7 @@ def bodyTests : IO Unit := do
   checkEq "a truncated escape fails" (percentDecode "a%2") none
   checkEq "a bad hex digit fails" (percentDecode "%zz") none
   checkEq "an escape that is not UTF-8 fails" (percentDecode "%FF") none
+  checkEq "an escaped NUL fails" (percentDecode "alice%00x") none
   checkEq "plus is a plus outside forms" (percentDecode "a+b" (plusIsSpace := false)) (some "a+b")
   checkEq "forms parse" (parseUrlEncoded "a=1&b=&c&&d=x%3Dy")
     (some [("a", "1"), ("b", ""), ("c", ""), ("d", "x=y")])
@@ -55,6 +56,12 @@ def bodyTests : IO Unit := do
     some 1)
   let badJson := Req.mk' .post "/x" [("Content-Type", "application/json")] "{".toUTF8
   check "malformed JSON is refused" badJson.json.toOption.isNone
+  let nul := Req.mk' .post "/x" [("Content-Type", "application/json")]
+    "{\"name\": \"alice\\u0000x\"}".toUTF8
+  check "JSON with NUL in a string is refused" nul.json.toOption.isNone
+  let nulKey := Req.mk' .post "/x" [("Content-Type", "application/json")]
+    "{\"a\": [{\"x\\u0000\": 1}]}".toUTF8
+  check "and in a nested key" nulKey.json.toOption.isNone
   let notUtf8 := Req.mk' .post "/x" [("Content-Type", "application/json")] ⟨#[0xff, 0xfe]⟩
   check "a body that is not UTF-8 is refused" notUtf8.json.toOption.isNone
   checkEq "query strings parse" ((Req.mk' .get "/a?x=1&y=%20").queryParams.toOption)
@@ -76,6 +83,13 @@ def securityTests : IO Unit := do
     (clientAddress ["127.0.0.1"] "127.0.0.1" (some "6.6.6.6, 1.2.3.4")) "1.2.3.4"
   checkEq "trusted hops are skipped from the right"
     (clientAddress ["127.0.0.1", "10.0.0.2"] "127.0.0.1" (some "1.2.3.4, 10.0.0.2"))
+    "1.2.3.4"
+  checkEq "repeated X-Forwarded-For fields are joined in order"
+    (forwardedFor [("x-forwarded-for", "6.6.6.6"), ("x-forwarded-for", "1.2.3.4, 5.5.5.5")])
+    (some "6.6.6.6, 1.2.3.4, 5.5.5.5")
+  checkEq "so a client's own field cannot hide the proxy's"
+    (clientAddress ["127.0.0.1"] "127.0.0.1"
+      (forwardedFor [("x-forwarded-for", "6.6.6.6"), ("x-forwarded-for", "1.2.3.4")]))
     "1.2.3.4"
   checkEq "a trusted proxy without the header is the client"
     (clientAddress ["127.0.0.1"] "127.0.0.1" none) "127.0.0.1"
@@ -99,19 +113,51 @@ def rateLimitTests : IO Unit := do
   checkEq "up to the cap" (p.delay ⟨100, 0⟩) 60
   checkEq "a forgotten key waits for nothing" (p.wait ⟨100, 0⟩ 600) 0
   let rl ← RateLimiter.new p
-  for _ in [0:5] do rl.recordFailure (some "alice") "1.2.3.4" 1000
-  checkEq "five failures: two seconds" (← rl.retryAfter (some "alice") "1.2.3.4" 1000) 2
-  checkEq "the account is limited from elsewhere" (← rl.retryAfter (some "alice") "9.9.9.9" 1000)
-    2
-  checkEq "the address is limited for other accounts" (← rl.retryAfter (some "bob") "1.2.3.4" 1000)
-    2
-  checkEq "others are not" (← rl.retryAfter (some "bob") "9.9.9.9" 1000) 0
-  checkEq "the wait runs out" (← rl.retryAfter (some "alice") "1.2.3.4" 1002) 0
-  rl.recordSuccess (some "alice")
-  checkEq "a success clears the account" (← rl.retryAfter (some "alice") "9.9.9.9" 1000) 0
-  checkEq "but not the address" (← rl.retryAfter none "1.2.3.4" 1000) 2
-  rl.recordFailure none "1.2.3.4" 2000
-  checkEq "after forgetAfter, counting starts again" (← rl.retryAfter none "1.2.3.4" 2000) 0
+  let acquire (a : Option String) (c : String) (now : Nat) : IO (Option Nat) := do
+    match ← rl.tryAcquire a c now with
+    | .ok _ => return none
+    | .error w => return some w
+  for _ in [0:5] do discard <| acquire (some "alice") "1.2.3.4" 1000
+  -- Five attempts: four went ahead (three free, the fourth after a zero wait),
+  -- the fifth was refused and not counted.
+  checkEq "after four failures: one second" (← acquire (some "alice") "1.2.3.4" 1000) (some 1)
+  checkEq "the account is limited from elsewhere" (← acquire (some "alice") "9.9.9.9" 1000)
+    (some 1)
+  checkEq "the address is limited for other accounts" (← acquire (some "bob") "1.2.3.4" 1000)
+    (some 1)
+  checkEq "names are normalised" (← acquire (some " Alice") "9.9.9.9" 1000) (some 1)
+  checkEq "others are not" (← acquire (some "carol") "8.8.8.8" 1000) none
+  let rl2 ← RateLimiter.new p
+  let mut last : Option Attempt := none
+  for _ in [0:3] do
+    if let .ok a ← rl2.tryAcquire (some "dave") "5.5.5.5" 1000 then last := some a
+  if let some a := last then rl2.succeed a
+  checkEq "a success clears the account"
+    ((← rl2.tryAcquire (some "dave") "6.6.6.6" 1000) matches .ok _) true
+  checkEq "and takes back only its own failure from the address"
+    ((← rl2.state.get).entries.get? (Key.client "5.5.5.5") |>.map (·.failures)) (some 2)
+  -- Check and record are one step: a burst gets exactly the free attempts.
+  let rl3 ← RateLimiter.new p
+  checkEq "sixteen concurrent attempts: four go ahead"
+    (← raceCount 16 do return (← rl3.tryAcquire (some "eve") "7.7.7.7" 1000) matches .ok _) 4
+  -- IPv6 addresses share a count per /64.
+  let rl4 ← RateLimiter.new p
+  for i in [0:4] do discard <| rl4.tryAcquire none s!"2001:db8:1:2::{i + 1}" 1000
+  checkEq "one /64 shares a count" (← rl4.tryAcquire none "2001:db8:1:2:ffff::9" 1000 |>.map
+    (· matches .error _)) true
+  checkEq "another /64 does not" (← rl4.tryAcquire none "2001:db8:1:3::1" 1000 |>.map
+    (· matches .ok _)) true
+  -- Memory is bounded, whatever the keys.
+  let small : Policy := { p with maxEntries := 64, sweepInterval := 1000000 }
+  let rl5 ← RateLimiter.new small
+  for i in [0:500] do
+    discard <| rl5.tryAcquire (some (String.ofList (List.replicate 1000 'x') ++ toString i))
+      s!"10.0.{i / 256}.{i % 256}" (1000 + i)
+  check "the table never exceeds its cap" ((← rl5.size) ≤ 64) s!"{← rl5.size}"
+  let rl6 ← RateLimiter.new { p with sweepInterval := 10 }
+  for i in [0:20] do discard <| rl6.tryAcquire none s!"10.1.0.{i}" 1000
+  discard <| rl6.tryAcquire none "10.2.0.1" 5000
+  checkEq "forgotten entries are swept" (← rl6.size) 1
 
 /-- Whether `sub` occurs in `s`. -/
 def containsStr (s sub : String) : Bool := (s.splitOn sub).length > 1
@@ -124,7 +170,8 @@ def hasHeader (r : Reply) (name : String) (value : String) : Bool :=
 def testRoutes : List Route := [
   .mk' .get "/hello/:name" fun _ r => return .text s!"hello {(r.param "name").getD "?"}",
   .mk' .post "/hello/:name" fun _ _ => return .noContent,
-  .mk' .post "/token" (csrf := .exempt) fun _ _ => return .json (Lean.Json.mkObj []),
+  .mk' .post "/token" (csrf := .exempt) fun _ r =>
+    return .text (toString (r.cookie sessionCookieName).isSome),
   .mk' .get "/boom" fun _ _ => throw (.userError "secret internals")
 ]
 
@@ -153,6 +200,15 @@ def routerTests : IO Unit := withCtx fun ctx _ => do
     (← post [("Origin", "https://auth.example.org")]).status.toCode 204
   checkEq "an exempt route needs no Origin"
     (← dispatch testRoutes ctx (Req.mk' .post "/token")).status.toCode 200
+  checkEq "and never sees the session cookie"
+    (← dispatch testRoutes ctx (Req.mk' .post "/token" [("Cookie", "__Host-pyle=abc")])).bodyText
+    "false"
+  check "an https issuer gets HSTS"
+    (hasHeader r "Strict-Transport-Security" "max-age=63072000; includeSubDomains")
+  let plain : Ctx := { ctx with config := { ctx.config with issuer := "http://localhost:8420" } }
+  check "a plain-http development issuer does not"
+    (!(← dispatch testRoutes plain (Req.mk' .get "/hello/x")).headers.any
+      (·.1 == "Strict-Transport-Security"))
   let boom ← get "/boom"
   checkEq "an exception is a 500" boom.status.toCode 500
   check "that says nothing of why" (!containsStr boom.bodyText "secret")
@@ -185,6 +241,29 @@ def socketTests : IO Unit := withCtx fun ctx _ => do
     (text.toLower.splitOn "\r\n" |>.contains "x-content-type-options: nosniff") text
   stop
 
+/-- The mode bits of a file. -/
+def modeOf (p : System.FilePath) : IO Nat := do
+  let out ← IO.Process.output { cmd := "stat", args := #["-c", "%a", p.toString] }
+  return out.stdout.trimAscii.toString.toNat!
+
+/-- The root key and the database are created private. -/
+def fileModeTests : IO Unit := IO.FS.withTempDir fun dir => do
+  group "server: file modes"
+  let key := dir / "root.key"
+  Server.createRootKey key
+  checkEq "the root key is 32 bytes" (← IO.FS.readBinFile key).size 32
+  checkEq "the root key is mode 600" (← modeOf key) 600
+  check "an existing key is never replaced" (← throws (Server.createRootKey key))
+  let target := dir / "elsewhere"
+  let link := dir / "link.key"
+  discard <| IO.Process.output { cmd := "ln", args := #["-s", target.toString, link.toString] }
+  check "a planted symbolic link is refused" (← throws (Server.createRootKey link))
+  check "and nothing was written through it" (!(← target.pathExists))
+  Server.restrictFileModes
+  let s ← Store.Store.openAt (dir / "pyle.db") 1
+  discard <| s.addUser "alice" [] 1
+  checkEq "the database is created mode 600" (← modeOf (dir / "pyle.db")) 600
+
 /-- HTTP. -/
 def httpTests : IO Unit := do
   cookieTests
@@ -193,5 +272,6 @@ def httpTests : IO Unit := do
   rateLimitTests
   routerTests
   socketTests
+  fileModeTests
 
 end PyleTests

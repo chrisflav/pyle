@@ -57,6 +57,24 @@ def chainTests : IO Unit := withCtx fun ctx _ => do
     check "the untouched list verifies" (verifyChain [a, b, c] matches .ok 3)
   | _ => check "three entries were read back" false
 
+/-- What a client typed is bounded and cleaned before it is logged. -/
+def sanitiseTests : IO Unit := withCtx fun ctx _ => do
+  group "audit: sanitising"
+  let s := ctx.store
+  let base : Record := { event := .signIn, outcome := .failure, clientAddress := "1.2.3.4" }
+  let e ← append s 1 { base with userName := some "hunter2 is my password" }
+  checkEq "an invalid user name is logged as a marker" e.userName (some invalidUserName)
+  let e ← append s 2
+    { base with userName := some "alice\x00x", clientAddress := "1.2.3.4\x00",
+                detail := "a\x00b\nc" }
+  checkEq "a name with NUL is not a name" e.userName (some invalidUserName)
+  checkEq "control characters are removed" (e.clientAddress, e.detail) ("1.2.3.4", "abc")
+  let e ← append s 3 { base with detail := String.ofList (List.replicate 10000 'd') }
+  checkEq "fields are bounded" e.detail.length 256
+  let e ← append s 4 { base with outcome := .success, userName := some "alice" }
+  checkEq "a valid name is kept" e.userName (some "alice")
+  checkEq "and the chain still verifies" (← verify s).toOption (some 4)
+
 /-- Concurrent appends do not fork the chain. -/
 def concurrencyTests : IO Unit := withCtx fun ctx _ => do
   group "audit: concurrent appends"
@@ -70,6 +88,7 @@ def concurrencyTests : IO Unit := withCtx fun ctx _ => do
 def auditTests : IO Unit := do
   encodingTests
   chainTests
+  sanitiseTests
   concurrencyTests
 
 end PyleTests

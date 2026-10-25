@@ -98,6 +98,9 @@ def auditVerify (path : System.FilePath) : IO UInt32 := do
 
 /-- Run a command, reporting an error as one line rather than a trace. -/
 def main (args : List String) : IO UInt32 := do
+  -- Everything pyle writes — the database, its journals, the root key — is
+  -- for its owner only.
+  Server.restrictFileModes
   let (configs, args) := takeFlag "--config" args
   let (groups, args) := takeFlag "--group" args
   try

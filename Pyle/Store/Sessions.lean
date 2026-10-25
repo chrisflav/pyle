@@ -109,6 +109,12 @@ def Store.deleteSession (s : Store) (user : UserId) (idHash : SecretHash) : IO B
     return (← exec c "DELETE FROM sessions WHERE id_hash = ? AND user_id = ?"
       #[idHash, user]) > 0
 
+/-- End the session with this identifier hash, whoever's it is.  For a
+request's own session, whose identifier the request has just presented.
+Whether there was one. -/
+def Store.endSession (s : Store) (idHash : SecretHash) : IO Bool := s.run fun c => do
+  return (← exec c "DELETE FROM sessions WHERE id_hash = ?" #[idHash]) > 0
+
 /-- End every session of a user; how many there were. -/
 def Store.deleteUserSessions (s : Store) (user : UserId) : IO Nat := s.run fun c =>
   exec c "DELETE FROM sessions WHERE user_id = ?" #[user]

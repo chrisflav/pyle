@@ -223,14 +223,23 @@ def countAuthenticators (c : SQLite) (user : UserId) : IO Nat := do
 def Store.authenticatorCount (s : Store) (user : UserId) : IO Nat :=
   s.run (countAuthenticators · user)
 
-/-- Remove a credential, unless it would leave the user with fewer than
-`keep` authenticators (§1: a user cannot remove their second-to-last).  The
-count and the delete are one transaction.  Whether it was removed. -/
-def Store.removeCredential (s : Store) (user : UserId) (id : ByteArray) (keep : Nat := 2) :
-    IO Bool := s.atomically fun c => do
+/-- Run `delete` (which removes one authenticator of `user` and returns how
+many rows it removed) only if `user` has more than `keep` authenticators.  The
+caller runs this inside `Store.atomically`, so the count and the delete are one
+transaction and two concurrent removals cannot both pass the count.  Whether
+something was removed. -/
+def removeAuthenticatorKeeping (c : SQLite) (user : UserId) (keep : Nat) (delete : IO Nat) :
+    IO Bool := do
   if (← countAuthenticators c user) ≤ keep then return false
-  return (← exec c "DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?"
-    #[id, user]) > 0
+  return (← delete) > 0
+
+/-- Remove a credential, unless it would leave the user with fewer than
+`keep` authenticators (§1: a user cannot remove their second-to-last).
+Whether it was removed. -/
+def Store.removeCredential (s : Store) (user : UserId) (id : ByteArray) (keep : Nat := 2) :
+    IO Bool := s.atomically fun c =>
+  removeAuthenticatorKeeping c user keep <|
+    exec c "DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?" #[id, user]
 
 /-! ## TOTP -/
 
@@ -265,9 +274,13 @@ def Store.findTotp (s : Store) (user : UserId) : IO (Option TotpRecord) := s.run
              lastStep := ← colOpt colNat st 2, failures := ← colNat st 3,
              lockedUntil := ← colNat st 4 }
 
-/-- Remove a user's TOTP secret.  Whether there was one. -/
-def Store.removeTotp (s : Store) (user : UserId) : IO Bool := s.run fun c => do
-  return (← exec c "DELETE FROM totp WHERE user_id = ?" #[user]) > 0
+/-- Remove a user's TOTP secret, under the same rule as `removeCredential`:
+not if it would leave fewer than `keep` authenticators.  Whether it was
+removed. -/
+def Store.removeTotp (s : Store) (user : UserId) (keep : Nat := 2) : IO Bool :=
+  s.atomically fun c =>
+    removeAuthenticatorKeeping c user keep <|
+      exec c "DELETE FROM totp WHERE user_id = ?" #[user]
 
 /-- Record an accepted code for time step `step`.  Applies only if `step` is
 strictly later than the last accepted one and TOTP is not locked, in one

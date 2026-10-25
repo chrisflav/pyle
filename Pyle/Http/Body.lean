@@ -27,7 +27,9 @@ private def hexVal (c : Char) : Option Nat :=
   else none
 
 /-- Percent-decode a component, reading `+` as a space when `plusIsSpace` (the
-form encoding).  `none` for a malformed escape or a result that is not UTF-8. -/
+form encoding).  `none` for a malformed escape, a result that is not UTF-8, or
+one containing NUL, which nothing legitimate sends and which C-string layers
+below (SQLite's text binding) would silently truncate at. -/
 def percentDecode (s : String) (plusIsSpace : Bool := true) : Option String :=
   let rec go : List Char → ByteArray → Option ByteArray
     | [], acc => some acc
@@ -38,7 +40,7 @@ def percentDecode (s : String) (plusIsSpace : Bool := true) : Option String :=
     | '%' :: _, _ => none
     | '+' :: rest, acc => go rest (acc.push (if plusIsSpace then 0x20 else 0x2b))
     | c :: rest, acc => go rest (acc ++ c.toString.toUTF8)
-  (go s.toList .empty).bind String.fromUTF8?
+  (go s.toList .empty).bind String.fromUTF8? |>.filter (!·.contains '\x00')
 
 /-- Parse `a=1&b=2`.  An empty string is no pairs; a pair without `=` has an
 empty value; empty pairs (`a=1&&b=2`) are skipped.  `none` if any part fails
@@ -84,12 +86,22 @@ def Req.form (r : Req) : Except String (List (String × String)) := do
   | some ps => return ps
   | none => throw "the form is not well-formed"
 
-/-- The body as JSON, if the request says it is. -/
+/-- Whether a JSON value contains a NUL character in any string or key. -/
+partial def jsonHasNul : Json → Bool
+  | .str s => s.contains '\x00'
+  | .arr xs => xs.any jsonHasNul
+  | .obj kvs => kvs.toArray.any fun (k, v) => k.contains '\x00' || jsonHasNul v
+  | _ => false
+
+/-- The body as JSON, if the request says it is.  A body with NUL in any
+string is refused, for the reason `percentDecode` gives. -/
 def Req.json (r : Req) : Except String Json := do
   unless mediaType ((r.header "content-type").getD "") == "application/json" do
     throw "the body must be application/json"
   match Json.parse (← r.bodyText) with
-  | .ok j => return j
+  | .ok j =>
+    if jsonHasNul j then throw "the body contains a NUL character"
+    return j
   | .error _ => throw "the body is not valid JSON"
 
 end Http

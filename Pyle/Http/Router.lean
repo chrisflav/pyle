@@ -18,7 +18,9 @@ one place, so that no handler can forget it:
 3. run the handler, turning an exception into a `500` whose body says nothing
    about why — the reason goes to the log, since it may quote SQL or stored
    values;
-4. add the security headers.
+4. add the security headers, and HSTS when the issuer is `https://`.
+
+An exempt route never sees the request's cookies (see `Csrf.exempt`).
 
 Handlers are `Ctx → Req → IO Reply`, so a test builds a `Ctx` over a temporary
 database and calls `dispatch` directly.  To add an endpoint, add a `Route` to
@@ -57,8 +59,8 @@ inductive Csrf where
   | checkOrigin
   /-- For endpoints called by servers and command-line clients rather than
   browsers, which authenticate the caller themselves (the OAuth token
-  endpoint, a device-code poll).  Such a route must not act on the session
-  cookie. -/
+  endpoint, a device-code poll).  The router removes the `Cookie` header
+  before such a route sees the request, so it cannot act on the session. -/
   | exempt
   deriving BEq, Repr
 
@@ -116,7 +118,7 @@ def methodName (m : Method) : String := toString m
 /-- Answer one request with the first route that matches it. -/
 def dispatch (routes : List Route) (ctx : Ctx) (r : Req) : IO Reply := do
   let reply ← go
-  return withSecurityHeaders reply
+  return withSecurityHeaders reply (hsts := ctx.config.issuer.startsWith "https://")
 where
   /-- Everything but the headers. -/
   go : IO Reply := do
@@ -130,7 +132,10 @@ where
     if isStateChanging r.method && rt.csrf == .checkOrigin &&
         !originAllowed ctx.config.origins r then
       return Reply.error .forbidden "forbidden" "cross-origin request refused"
-    try rt.handler ctx { r with params }
+    -- An exempt route is reached without the Origin check, so it must not
+    -- be able to act on the session: it does not get to see the cookie.
+    let headers := if rt.csrf == .exempt then r.headers.filter (·.1 != "cookie") else r.headers
+    try rt.handler ctx { r with params, headers }
     catch e =>
       IO.eprintln s!"pyle: {methodName r.method} {r.path}: {e}"
       return Reply.error .internalServerError "server_error"

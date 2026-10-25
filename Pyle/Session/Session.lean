@@ -156,11 +156,17 @@ namespace Session
 and `factors`, from the request `r`.  Returns the session and the identifier to
 set as its cookie.
 
+The session the request already carries, if any, is ended first: signing in
+replaces it rather than leaving it live beside the new one, so an identifier
+planted in the browser before sign-in is worthless after it.
+
 This is the only function that creates a session.  It checks nothing about how
 the user authenticated: that is what round 2's `StrongAuthentication` argument
 will carry. -/
 def create (ctx : Ctx) (r : Req) (user : Store.UserId) (amr factors : List String) :
     IO (Session × String) := do
+  if let some old := (r.cookie sessionCookieName).bind decodeId then
+    discard <| ctx.store.endSession (.of old)
   let id ← Crypto.randomBytes idBytes.toUSize
   let now ← ctx.clock
   let row : Store.SessionRow :=

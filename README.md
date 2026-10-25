@@ -58,5 +58,14 @@ pyle version
 ```
 
 Keep a copy of the root key: the secrets sealed under it cannot be read
-without it.  The server so far answers `GET /healthz` and `POST /logout`;
-sign-in and OpenID Connect follow (DESIGN.md §11).
+without it.
+
+Every reply pyle makes carries its security headers (a strict CSP with
+`frame-ancestors 'none'`, `nosniff`, `Referrer-Policy: no-referrer`, and
+`Strict-Transport-Security` when the issuer is `https://`).  The exception is
+the replies `Std.Http` makes on its own before a request reaches pyle — `400`
+for a malformed request, `413` for an oversized body — which carry none of
+them; have the reverse proxy add the headers if that matters.
+
+The server so far answers `GET /healthz` and `POST /logout`; sign-in and
+OpenID Connect follow (DESIGN.md §11).

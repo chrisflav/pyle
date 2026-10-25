@@ -41,11 +41,17 @@ def securityHeaders : List (String × String) :=
    ("Cross-Origin-Opener-Policy", "same-origin"),
    ("Cross-Origin-Resource-Policy", "same-origin")]
 
-/-- Add the security headers to a reply, and `Cache-Control: no-store` unless
-the handler chose its own: a reply about who someone is should not sit in a
-shared cache. -/
-def withSecurityHeaders (r : Reply) : Reply :=
-  let r := { r with headers := r.headers ++ securityHeaders }
+/-- `Strict-Transport-Security`, sent when the issuer is `https://`: two years,
+subdomains included, so a browser that has seen pyle once never again asks for
+it over plain HTTP. -/
+def strictTransportSecurity : String := "max-age=63072000; includeSubDomains"
+
+/-- Add the security headers to a reply — with HSTS when `hsts` — and
+`Cache-Control: no-store` unless the handler chose its own: a reply about who
+someone is should not sit in a shared cache. -/
+def withSecurityHeaders (r : Reply) (hsts : Bool := false) : Reply :=
+  let hstsHeader := if hsts then [("Strict-Transport-Security", strictTransportSecurity)] else []
+  let r := { r with headers := r.headers ++ securityHeaders ++ hstsHeader }
   if (r.header "cache-control").isSome then r else r.withHeader "Cache-Control" "no-store"
 
 /-- Methods that may change state.  Everything except `GET`, `HEAD` and
@@ -66,6 +72,14 @@ IPv6 addresses bare, so the port is the part after the last `:` only for
 IPv4. -/
 def stripPort (peer : String) : String :=
   if peer.contains '.' then ((peer.splitOn ":").headD peer) else peer
+
+/-- Every `X-Forwarded-For` value of a request, joined in the order they
+arrived, as RFC 9110 §5.3 says repeated fields combine.  Reading only the
+first would let a client put its own field after the proxy's. -/
+def forwardedFor (headers : List (String × String)) : Option String :=
+  match headers.filter (·.1 == "x-forwarded-for") with
+  | [] => none
+  | hs => some (", ".intercalate (hs.map (·.2)))
 
 /-- The client address of a request that arrived from `peer`.  If `peer` is a
 trusted proxy, the rightmost `X-Forwarded-For` entry that is not itself a

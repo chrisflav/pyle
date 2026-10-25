@@ -17,7 +17,7 @@ package pyle where
 -- branch of chrisflav/lean-biscuit#2 (signing through an external signer) until it
 -- merges.
 require «lean-biscuit» from git
-  "https://github.com/chrisflav/lean-biscuit" @ "c8fa96fe3cecd52be682cd6fa5b6829f3e56f750"
+  "https://github.com/chrisflav/lean-biscuit" @ "a94832b43b212baf0566e418df22b2149ce55365"
 
 -- SHA-1, SHA-2 and HMAC.
 require «lean-crypto-hash» from git

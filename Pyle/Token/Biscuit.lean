@@ -117,8 +117,10 @@ def attest (store : Store.Store) (rootKey : ByteArray) (request : Proto.ThirdPar
   let block ← match BlockBuilder.code {} source with
     | .ok b => pure b
     | .error e => throw (.userError s!"token: the attestation does not parse: {repr e}")
-  let contents ← Biscuit.signThirdPartyBlockWith (rootPublicKey root) (signer root) request block
-  return (contents, rootPublicKey root)
+  let signed := Biscuit.signThirdPartyBlockWith (rootPublicKey root) (signer root) request block
+  match ← signed.run with
+  | .ok contents => return (contents, rootPublicKey root)
+  | .error e => throw (.userError s!"token: cannot sign an attestation: {repr e}")
 
 end Token
 end Pyle

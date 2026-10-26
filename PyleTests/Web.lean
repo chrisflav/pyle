@@ -120,7 +120,28 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
   -- elements; render that too.
   let v ← ctx.store.addUser "vic" [] 1
   let (vid, _) ← sessionFor ctx v
-  pages := (← getPage ctx "/account" vid).bodyText :: pages
+  let setup := (← getPage ctx "/account" vid).bodyText
+  pages := setup :: pages
+  -- The TOTP set-up: the QR code, then the link with a label of its own, then
+  -- the key to type in.
+  let posOf (s : String) : Nat := ((setup.splitOn s).headD setup).length
+  check "the set-up has a hidden QR code with alternative text"
+    (containsStr setup "<img id=\"totp-qr\" class=\"qr\" \
+      alt=\"QR code for your authenticator app\" hidden>")
+  check "and says it can be scanned or typed"
+    (containsStr setup "Scan this with your authenticator app, or enter the key by hand")
+  check "the link to the app is labelled in the page"
+    (containsStr setup ">On your phone? Open in your authenticator app</a>")
+  check "the QR code, the link and the key, in that order"
+    (posOf "id=\"totp-qr\"" < posOf "id=\"totp-uri\"" &&
+      posOf "id=\"totp-uri\"" < posOf "id=\"totp-secret\"" &&
+      posOf "id=\"totp-secret\"" < setup.length)
+  check "the script shows the QR code and sets the link's target, not its text"
+    (containsStr Web.script "qr.src = data.qr" && containsStr Web.script "qr.hidden = false" &&
+      containsStr Web.script "getElementById('totp-uri').setAttribute('href', data.uri)" &&
+      !containsStr Web.script "textContent = data.uri")
+  check "the stylesheet gives the QR code a white ground"
+    (containsStr Web.stylesheet "img.qr {" && containsStr Web.stylesheet "background: #fff")
   let all := String.join pages
   -- The script against the pages.
   let script := Web.script
@@ -154,7 +175,7 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
     check s!"GET {p} is a route" (routed .get p)
   for k in ["challenge", "rpId", "timeout", "userVerification", "allowCredentials", "rp",
       "user", "pubKeyCredParams", "attestation", "authenticatorSelection",
-      "excludeCredentials", "redirect", "pending", "secret", "uri", "codes"] do
+      "excludeCredentials", "redirect", "pending", "secret", "uri", "qr", "codes"] do
     check s!"the script reads {k}" (containsStr script s!"o.{k}" ||
       containsStr script s!"data.{k}")
 

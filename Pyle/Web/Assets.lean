@@ -281,12 +281,17 @@ function setupAccount() {
     try {
       const data = await act('/account/totp/begin', {});
       pending = data.pending;
+      const qr = document.getElementById('totp-qr');
+      if (data.qr) {
+        qr.src = data.qr;
+        qr.hidden = false;
+      } else {
+        qr.hidden = true;
+      }
+      document.getElementById('totp-uri').setAttribute('href', data.uri);
       document.getElementById('totp-secret').textContent = data.secret;
-      const link = document.getElementById('totp-uri');
-      link.textContent = data.uri;
-      link.setAttribute('href', data.uri);
       document.getElementById('totp-setup').hidden = false;
-      say('Add the secret to your app, then enter the code it shows.');
+      say('Add the account to your app, then enter the code it shows.');
     } catch (e) { failed(e); }
   });
   on('totp-confirm', 'click', async function () {
@@ -421,7 +426,9 @@ ul.items li { padding: 0.6rem 0; border-bottom: 1px solid var(--line); }
 .meta, .hint { color: var(--muted); font-size: 0.9rem; }
 .notice { background: var(--notice); padding: 0.75rem 1rem; border-radius: 0.35rem; }
 code, #recovery-list { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; word-break: break-all; }
-#status { min-height: 1.5rem; font-weight: 600; }"##
+#status { min-height: 1.5rem; font-weight: 600; }
+/* White in either scheme: a phone camera reads dark modules on light. */
+img.qr { display: block; width: 100%; max-width: 16rem; height: auto; background: #fff; padding: 0.5rem; border-radius: 0.35rem; }"##
 
 /-- A reply with an asset. -/
 def asset (body contentType : String) : Reply :=

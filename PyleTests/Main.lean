@@ -13,6 +13,7 @@ import PyleTests.Token
 import PyleTests.Device
 import PyleTests.ForwardAuth
 import PyleTests.EndToEnd
+import PyleTests.QrCode
 
 /-!
 # The test driver
@@ -40,4 +41,5 @@ def main : IO UInt32 := do
   deviceGrantTests
   forwardAuthTests
   endToEndTests
+  qrCodeTests
   report

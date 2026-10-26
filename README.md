@@ -112,7 +112,7 @@ base64url):
 | `/invite/<token>/begin`, `/invite/<token>/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"name"}` |
 | `/account/authenticators/register/begin`, `…/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"id"}` |
 | `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` for the last two) |
-| `/account/totp/begin`, `…/confirm`, `…/remove` | `{}`; `{"pending", "code"}`; `{}` | `{"secret", "uri", "pending"}`; `204`; `204` |
+| `/account/totp/begin`, `…/confirm`, `…/remove` | `{}`; `{"pending", "code"}`; `{}` | `{"secret", "uri", "qr", "pending"}`; `204`; `204` |
 | `/account/recovery-codes` | `{}` | `{"codes"}`, shown once |
 | `/account/password`, `/account/password/remove` | `{"password"}`; `{}` | `204` |
 | `/account/sessions/end` | `{"handle"}` | `204` |

@@ -124,7 +124,12 @@ pyle has does.  `phrh` asks that the information needed to authenticate be
 held in a hardware-protected device; a credential that is not backup-eligible
 is one the authenticator promises never to export, which is as close as
 WebAuthn comes without attestation (§2.2, where an AAGUID allow-list makes it
-closer).
+closer).  So without `attestationRoots` and an allow-list, `phrh` rests on the
+authenticator's own word about its backup-eligible flag.
+
+Passwords are a deployment switch: an account whose only way in is a password
+is stranded, unable to sign in at all, if `allowPasswords` is turned off, and
+needs a new invitation.
 
 **Account safety.**  What an account has registered bounds the level it can
 reach: `phrh` or `phr` with a credential that has verified the user
@@ -290,7 +295,11 @@ session).  The ID token's `acr` is the session's level, except when `claims`
 marks `acr` essential: then it is the first requested value the session meets,
 as Core §5.5.1.1 requires and as REFEDS MFA §4.2.2.1 asks of an OP that
 performed more than was requested, and a request none of whose values pyle
-knows is refused with `unmet_authentication_requirements`.  `amr` stays RFC
+knows is refused with `unmet_authentication_requirements`.  The token
+endpoint checks the client's minimum again, as it stands then, for a code and
+for every refresh: a grant below it is refused, and a refresh-token family
+below it revoked, so raising a client's minimum takes effect on its existing
+grants too.  `amr` stays RFC
 8176's, and `pyle_account_acr` names the account's strongest level, in the ID
 token and at `userinfo`.
 
@@ -340,7 +349,9 @@ is sent to sign in again at that level.
 ### 5.4 kleis
 
 pyle signs a **third-party block** attesting `user("christian")`, the
-`amr` and the `acr`, and appends it to a kleis biscuit.  A kleis grant can then say
+`amr` and the `acr` — only for a sign-in at `kleisMinAcr` or better, `mfa`
+unless configured, since existing grants trust the `user` fact as it is — and
+appends it to a kleis biscuit.  A kleis grant can then say
 
 ```
 check if user($u), ["christian"].contains($u) trusting ed25519/<pyle public key>;
@@ -354,8 +365,9 @@ token for a grant, and attenuate it — no owner typing a bearer name.
 
 The taxis plugin, the diff-reviewer agent CLI and similar tools use the
 **device authorization grant** (RFC 8628): the CLI shows a short code, the user
-approves it in a browser with a passkey — the approval page needs `phr` — and
-the CLI receives a biscuit stating the approving session's level.  This
+approves it in a browser with a passkey — the approval page needs `phr`, or
+the client's minimum if higher, and the poll checks it again — and the CLI
+receives a biscuit stating the approving session's level.  This
 replaces personal access tokens pasted into config files, and those tokens get
 an `amr` and an expiry like everything else.
 

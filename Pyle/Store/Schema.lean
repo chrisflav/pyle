@@ -276,9 +276,11 @@ def migration4 : Migration where
   registered before;
 * per WebAuthn credential, whether it has verified the user, at registration
   or in an assertion since, so that an account's strongest level can be told
-  from what it has registered.  Credentials registered before this migration
-  are taken to: the invitation that made every account's first credential
-  required user verification, and a later assertion cannot lower the flag;
+  from what it has registered.  Of the credentials registered before this
+  migration, only an account's first — the one its invitation created, which
+  had to verify the user, and which has the account's own creation time — is
+  taken to; any other is not, until an assertion with user verification
+  raises the flag, which nothing lowers;
 * per authorization code and refresh token, the `acr` its ID tokens state
   when the authorization request asked for one as an essential claim (OpenID
   Connect Core §5.5.1.1), `NULL` otherwise. -/
@@ -290,7 +292,9 @@ def migration5 : Migration where
        DEFAULT 'https://refeds.org/profile/mfa'
        CHECK (min_acr IN ('https://refeds.org/profile/sfa', 'https://refeds.org/profile/mfa',
          'phr', 'phrh'))",
-    "ALTER TABLE webauthn_credentials ADD COLUMN user_verified INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE webauthn_credentials ADD COLUMN user_verified INTEGER NOT NULL DEFAULT 0",
+    "UPDATE webauthn_credentials SET user_verified = 1 WHERE created =
+       (SELECT created FROM users u WHERE u.id = webauthn_credentials.user_id)",
     "ALTER TABLE codes ADD COLUMN acr TEXT",
     "ALTER TABLE refresh_tokens ADD COLUMN acr TEXT"
   ]

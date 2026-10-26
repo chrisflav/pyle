@@ -203,8 +203,12 @@ def eventOf (purpose : ChallengePurpose) : Audit.Event :=
 /-- `POST /signin/webauthn/finish` (`purpose = authenticate`) and
 `POST /signin/stepup/finish` (`purpose = stepUp`): check the assertion and any
 second factors with it, and sign in or step up, if together they reach the
-level the body asks for.  Second factors are not checked when they could not
-make up the difference: above `mfa`, only the assertion counts.
+level the body asks for.  Second factors with an assertion that is
+phishing-resistant on its own (`phr` or better) are ignored, neither checked
+nor counted: they could not raise its level, and a mistyped code must not fail
+a passkey.  With any other assertion they are checked — unless even with them
+the level asked for is out of reach (above `mfa`), in which case the attempt is
+refused before they are touched.
 
 The attempt counts against the client address from the start.  Once the
 assertion has said whose account it is, second factors that come with it
@@ -239,6 +243,8 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
       -- What the assertion reaches alone, and what second factors could
       -- raise it to.
       let alone := Policy.level [ca.factor]
+      let extras : Extras :=
+        if Acr.phr ≤ alone then { totp := none, recovery := none, password := none } else extras
       let best := if extras.count > 0 then Acr.max alone .mfa else alone
       unless best.satisfies want do
         Audit.log ctx r event .failure (userName := some ca.user.name)

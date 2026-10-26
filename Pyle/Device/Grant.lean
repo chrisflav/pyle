@@ -14,12 +14,14 @@ code while the user approves it in a browser.
   a digit — shown as `XXXX-XXXX`.  What the user types is read case-blind and
   with any separators dropped.  20⁸ codes and the limiter on the approval page
   keep guessing a live one out of reach.
-* **Approving** needs a session at `phr` or better: a CLI's token is as good
+* **Approving** needs a session at `phr` or better, or at the client's
+  minimum (`--min-acr`) if that is higher: a CLI's token is as good
   as the passkey that approved it, and an approval page is exactly what a
   phishing site would imitate.  Without one the browser is sent to sign in with
   `acr=phr`.  The page shows which client asks and for what before the user
   decides, and the decision is a form `POST`, under the `Origin` check.  The
-  tokens issued record the approving session's `amr`, and so its level.
+  tokens issued record the approving session's `amr`, and so its level, and
+  the poll checks that level against the client's minimum once more.
 * **Polling** answers `authorization_pending` until a decision, `slow_down` to
   a client polling faster than the interval, `access_denied` once denied,
   `expired_token` once expired; an approved code yields tokens once, with a
@@ -104,8 +106,14 @@ def authorization : Handler := fun ctx r => do
      ("expires_in", (ctx.config.deviceCodeSeconds : Json)),
      ("interval", (ctx.config.devicePollSeconds : Json))]
 
+/-- The level approving a device code for a client needs: `phr`, or the
+client's own minimum if that is higher. -/
+def approvalLevel (ctx : Ctx) (clientId : String) : IO Acr :=
+  return Acr.max .phr ((← ctx.store.clientSettings clientId).getD {}).minAcr
+
 /-- Answer a device-code token request (RFC 8628 §3.4, §3.5) from an
-authenticated client. -/
+authenticated client.  The approving session's level is checked again against
+what the client needs now, in case its minimum was raised in between. -/
 def poll (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × String)) :
     IO Reply := do
   let some deviceCode := lookupOnce form "device_code"
@@ -124,6 +132,9 @@ def poll (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × S
     let some user ← ctx.store.findUser userId
       | return oauthError "invalid_grant" "the account is gone"
     if user.disabled then return oauthError "invalid_grant" "the account is disabled"
+    let need ← approvalLevel ctx client.id
+    unless (Acr.ofAmr amr).satisfies need do
+      return oauthError "invalid_grant" s!"the approval was not at {need.identifier} or better"
     let family ← Crypto.randomBytes 32
     let refresh ← startRefresh ctx family client user scope amr authTime none
     tokenResponse ctx r client user scope amr authTime none (some refresh) "device_code"
@@ -174,6 +185,9 @@ def pageGet : Handler := fun ctx r => do
     return page "Connect a device" (s!"<p class=\"error\">{htmlEscape msg}</p>\n" ++ codeForm typed)
       .badRequest
   | .ok (code, d) =>
+    let need ← approvalLevel ctx d.clientId
+    unless s.level.satisfies need do
+      return signinRedirect (Req.pathAndQuery r) (acr := some need)
     let clientName := ((← ctx.store.findClient d.clientId).map (·.name)).getD d.clientId
     return page "Connect a device" <|
       s!"<p><strong>{htmlEscape clientName}</strong> asks to act for you with the scope " ++
@@ -198,7 +212,10 @@ def pagePost : Handler := fun ctx r => do
   | .error msg =>
     return page "Connect a device" (s!"<p class=\"error\">{htmlEscape msg}</p>\n" ++ codeForm "")
       .badRequest
-  | .ok (code, _) =>
+  | .ok (code, d) =>
+    let need ← approvalLevel ctx d.clientId
+    if approve && !s.level.satisfies need then
+      return signinRedirect s!"/device?{queryString [("user_code", code)]}" (acr := some need)
     let now ← ctx.clock
     let decision : Store.DeviceStatus :=
       if approve then .approved s.user s.amr s.authTime else .denied

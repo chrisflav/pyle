@@ -99,6 +99,10 @@ structure Config where
   devicePollSeconds : Nat := 5
   /-- How long a kleis attestation block is good for, in seconds (§5.4). -/
   attestationSeconds : Nat := 300
+  /-- The lowest level a sign-in must reach for pyle to attest it to kleis
+  (§5.4): `mfa` unless configured.  A kleis grant that trusts pyle's `user`
+  facts trusts them at this level. -/
+  kleisMinAcr : Acr := .mfa
   /-- The hosts forward authentication answers for, each with the datalog
   policy deciding who may reach it (§5.3).  A host not listed is refused. -/
   forwardAuthHosts : List (String × String) := []
@@ -126,8 +130,8 @@ def knownKeys : List String :=
    "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies",
    "allowPasswords", "attestationRoots", "aaguidAllowList",
    "accessTokenSeconds", "idTokenSeconds", "refreshTokenSeconds", "deviceCodeSeconds",
-   "devicePollSeconds", "attestationSeconds", "forwardAuthHosts", "forwardAuthCookieSeconds",
-   "forwardAuthSecret"]
+   "devicePollSeconds", "attestationSeconds", "kleisMinAcr", "forwardAuthHosts",
+   "forwardAuthCookieSeconds", "forwardAuthSecret"]
 
 /-- A required string field. -/
 private def reqStr (j : Json) (k : String) : Except String String :=
@@ -270,6 +274,8 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   let deviceCodeSeconds ← positive "deviceCodeSeconds" 600
   let devicePollSeconds ← positive "devicePollSeconds" 5
   let attestationSeconds ← positive "attestationSeconds" 300
+  let kleisMinAcr ← opt j "kleisMinAcr" Acr.mfa (fun v => (asStr v).bind Acr.ofName?)
+    "a level (sfa, mfa, phr or phrh)"
   let forwardAuthCookieSeconds ← positive "forwardAuthCookieSeconds" (8 * 3600)
   let hostEntries ← match j.getObjVal? "forwardAuthHosts" with
     | .error _ => pure []
@@ -301,7 +307,7 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
            sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies,
            allowPasswords, attestationRoots := attestationRoots.map resolve, aaguidAllowList,
            accessTokenSeconds, idTokenSeconds, refreshTokenSeconds, deviceCodeSeconds,
-           devicePollSeconds, attestationSeconds, forwardAuthHosts, forwardAuthMinAcr,
+           devicePollSeconds, attestationSeconds, kleisMinAcr, forwardAuthHosts, forwardAuthMinAcr,
            forwardAuthCookieSeconds, forwardAuthSecret }
 
 /-- Read and check a configuration file. -/

@@ -359,13 +359,22 @@ def migrationTests : IO Unit := IO.FS.withTempDir fun dir => do
       "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
         backup_eligible, backup_state, aaguid, name, created) \
         VALUES (x'02', 1, -7, x'03', 0, 0, 0, x'00', 'old key', 1)"
+    discard <| Store.exec c
+      "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
+        backup_eligible, backup_state, aaguid, name, created) \
+        VALUES (x'04', 1, -7, x'05', 0, 0, 0, x'00', 'added later', 7)"
   checkEq "the database is at version 4" (← s.version) 4
   s.migrate 2
   checkEq "and is brought to 5" (← s.version) 5
   checkEq "an older client has the mfa floor" ((← s.clientSettings "old").map (·.minAcr))
     (some .mfa)
-  checkEq "an older credential is taken to verify the user"
+  checkEq "the credential the invitation made is taken to verify the user"
     ((← s.findCredential (ByteArray.mk #[2])).map (·.userVerified)) (some true)
+  checkEq "one added later is not, until an assertion shows it does"
+    ((← s.findCredential (ByteArray.mk #[4])).map (·.userVerified)) (some false)
+  check "which raises the flag"
+    ((← s.recordCredentialUse (ByteArray.mk #[4]) 0 1 false true 9) &&
+      ((← s.findCredential (ByteArray.mk #[4])).map (·.userVerified)) == some true)
   let refused ← try
       discard <| s.run fun c => Store.exec c "UPDATE clients SET min_acr = 'gold'"
       pure false
@@ -389,8 +398,129 @@ def singleFactorLimitTests : IO Unit :=
     (Json.mkObj [("name", "sam"), ("password", "correct horse battery")]) (client := "192.0.2.99")
   checkEq "even the right one, for now" ok.status.toCode 429
 
+/-- Set a client's minimum level, keeping its other settings. -/
+def setMinAcr (ctx : Ctx) (client : String) (a : Acr) : IO Unit := do
+  let cs := (← ctx.store.clientSettings client).getD {}
+  discard <| ctx.store.setClientSettings client { cs with minAcr := a }
+
+/-- A kleis attestation needs `kleisMinAcr`. -/
+def kleisAssuranceTests : IO Unit := withCtx fun ctx _ => do
+  group "assurance: kleis attestations"
+  let alice ← ctx.store.addUser "alice" [] 1
+  let some agentSecret ← registerClient ctx.store "agent" "An agent" [appRedirect]
+      ["openid", "kleis"] false { minAcr := .sfa } 1
+    | check "an agent client" false
+  -- What is in the request does not matter: the level is checked first.
+  let attest (c : Ctx) (headers : List (String × String)) (path : String)
+      (cookie : Option String := none) :=
+    postForm c path [("request", "x")] headers cookie
+  let sfa ← sfaFor ctx alice
+  let r ← attest ctx sameOrigin "/kleis/attest/session" (some sfa)
+  checkEq "an sfa session gets no attestation" (r.status.toCode, jsonStr r "error")
+    (403, some "insufficient_acr")
+  let code ← obtainCode ctx sfa "agent" (scope := "openid kleis")
+  let access := (jsonStr (← exchange ctx code agentSecret (client := "agent")) "access_token"
+    ).getD ""
+  let r ← attest ctx [("Authorization", s!"Bearer {access}")] "/kleis/attest"
+  checkEq "nor does a token from one" (r.status.toCode, jsonStr r "error")
+    (403, some "insufficient_acr")
+  let lenient := { ctx with config := { ctx.config with kleisMinAcr := .sfa } }
+  let r ← attest lenient sameOrigin "/kleis/attest/session" (some sfa)
+  checkEq "unless kleisMinAcr allows sfa" (jsonStr r "error") (some "invalid_request")
+  let weak ← weakFor ctx alice
+  let r ← attest ctx sameOrigin "/kleis/attest/session" (some weak)
+  checkEq "an mfa session passes the default" (jsonStr r "error") (some "invalid_request")
+  let old : Pyle.Token.Identity := { (default : Pyle.Token.Identity) with user := "alice" }
+  check "a token from before levels counts as mfa" (Pyle.Token.tokenLevel old == .mfa)
+  let stated : Pyle.Token.Identity := { old with acr := some "https://refeds.org/profile/sfa" }
+  check "and a stated level as itself" (Pyle.Token.tokenLevel stated == .sfa)
+  let parse (extra : String) := (Json.parse ("{\"issuer\":\"https://a.example\",\
+    \"rpId\":\"a.example\",\"origins\":[\"https://a.example\"]" ++ extra ++ "}")).toOption
+    |>.map (Config.ofJson · "/etc/pyle")
+  match parse "", parse ",\"kleisMinAcr\":\"phr\"", parse ",\"kleisMinAcr\":\"gold\"" with
+  | some (.ok d), some (.ok c), some (.error _) =>
+    check "kleisMinAcr is mfa by default, and read as a level" (d.kleisMinAcr == .mfa &&
+      c.kleisMinAcr == .phr)
+  | _, _, _ => check "kleisMinAcr is mfa by default, and read as a level" false
+
+/-- The device grant answers to the client's minimum. -/
+def deviceMinimumTests : IO Unit := withCtx fun ctx clock => do
+  group "assurance: the device grant and the client's minimum"
+  let alice ← ctx.store.addUser "alice" [] 1
+  discard <| addClients ctx
+  setMinAcr ctx "cli" .phrh
+  let r ← deviceCodes ctx
+  let userCode := (jsonStr r "user_code").getD ""
+  let page := s!"/device?{queryString [("user_code", userCode)]}"
+  let (synced, _) ← do
+    let k ← SoftKey.new (backupEligible := true)
+    enrol ctx alice k
+    let some id := sessionCookieOf (← signInVia ctx k) | throw (.userError "no session")
+    pure (id, k)
+  checkEq "a phr session is sent to sign in for the client's phrh"
+    (param (location (← get ctx page synced)) "acr") (some "phrh")
+  let post ← postForm ctx "/device" [("user_code", userCode), ("decision", "approve")] sameOrigin
+    (cookie := some synced)
+  checkEq "and cannot approve" (param (location post) "acr") (some "phrh")
+  -- A minimum raised between approval and poll.
+  setMinAcr ctx "cli" .mfa
+  let r ← deviceCodes ctx
+  let deviceCode := (jsonStr r "device_code").getD ""
+  let userCode := (jsonStr r "user_code").getD ""
+  let ok ← postForm ctx "/device" [("user_code", userCode), ("decision", "approve")] sameOrigin
+    (cookie := some synced)
+  checkEq "a phr session approves for the phr floor" ok.status.toCode 200
+  setMinAcr ctx "cli" .phrh
+  clock.modify (· + ctx.config.devicePollSeconds + 1)
+  checkEq "a poll after the minimum was raised gets nothing"
+    (jsonStr (← pollDevice ctx deviceCode) "error") (some "invalid_grant")
+
+/-- The token endpoint answers to the client's minimum as it is now. -/
+def tokenMinimumTests : IO Unit := withCtx fun ctx _ => do
+  group "assurance: the token endpoint and the client's minimum"
+  let alice ← ctx.store.addUser "alice" [] 1
+  let (secret, _) ← addClients ctx
+  let weak ← weakFor ctx alice
+  let code ← obtainCode ctx weak
+  setMinAcr ctx "app" .phr
+  let t ← exchange ctx code secret
+  checkEq "a code whose sign-in is below the raised minimum is refused" (jsonStr t "error")
+    (some "invalid_grant")
+  setMinAcr ctx "app" .mfa
+  let t ← exchange ctx (← obtainCode ctx weak) secret
+  let rt := (jsonStr t "refresh_token").getD ""
+  check "at the minimum, tokens" (jsonStr t "access_token").isSome
+  setMinAcr ctx "app" .phr
+  let refresh (token : String) := postForm ctx "/token"
+    [("grant_type", "refresh_token"), ("refresh_token", token)] (basic "app" secret)
+  checkEq "a refresh below the raised minimum is refused" (jsonStr (← refresh rt) "error")
+    (some "invalid_grant")
+  setMinAcr ctx "app" .mfa
+  let fams ← ctx.store.run fun c =>
+    Store.queryOne c "SELECT COUNT(*) FROM revoked_families" #[] (Store.colNat · 0)
+  check "and its family is revoked" (fams.getD 0 ≥ 1)
+  checkEq "for good, even with the minimum lowered again" (jsonStr (← refresh rt) "error")
+    (some "invalid_grant")
+
+/-- Second factors with a passkey are ignored, not checked. -/
+def ignoredExtrasTests : IO Unit := withCtx fun ctx _ => do
+  group "assurance: second factors with a passkey"
+  let una ← ctx.store.addUser "una" [] 1
+  discard <| giveTotp ctx una
+  let k ← SoftKey.new
+  enrol ctx una k
+  let r ← signInVia ctx k (extra := [("totp", "000000"), ("recovery", "AAAAA-AAAAA")])
+  checkEq "a passkey with a wrong code still signs in" r.status.toCode 200
+  checkEq "and the code is not part of the sign-in"
+    ((replyJson r).getObjValAs? (List String) "amr").toOption (some ["hwk", "user"])
+  checkEq "nor counted against TOTP" ((← ctx.store.findTotp una.id).map (·.failures)) (some 0)
+
 /-- The assurance tests. -/
 def assuranceTests : IO Unit := do
+  kleisAssuranceTests
+  deviceMinimumTests
+  tokenMinimumTests
+  ignoredExtrasTests
   acrTests
   migrationTests
   singleFactorLimitTests

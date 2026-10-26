@@ -108,6 +108,14 @@ forward-auth host); a request can raise the level it needs, never lower it.
 When the session falls short, pyle sends the browser to sign in again at the
 level needed, without ending the session.
 
+Two caveats.  `phrh` rests on the authenticator's own backup-eligible flag:
+without `attestationRoots` and an `aaguidAllowList`, nothing proves that the
+key really is held in hardware, only that the authenticator says it will not
+be synced.  And turning `allowPasswords` off strands every account whose only
+way in is a password: it can no longer sign in at all, and needs a new
+invitation.  Check `pyle user list` (accounts with no authenticators) before
+switching passwords off.
+
 Adding or removing a way in needs a fresh authentication within the last five
 minutes, at the account's own best level or `mfa`, whichever is lower: an
 account that only has a password manages itself with the password, and one
@@ -129,7 +137,7 @@ base64url):
 | | body | answer |
 | --- | --- | --- |
 | `/signin/webauthn/begin` | `{}` (passkey) or `{"name"}` (security key) | WebAuthn request options |
-| `/signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?, "acr"?}` | `{"redirect", "amr", "acr"}` and the session cookie |
+| `/signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?, "acr"?}` (second factors are ignored with a passkey that verified the user) | `{"redirect", "amr", "acr"}` and the session cookie |
 | `/signin/stepup/begin`, `/signin/stepup/finish` | as above, for the current session | as above |
 | `/signin/codes` | `{"name"}` and `"password"` alone or two of `"password"`, `"totp"`, `"recovery"`; `"return"`?, `"acr"`? | as above |
 | `/invite/<token>/begin`, `/invite/<token>/finish` | `{"kind"?}` (`"passkey"` or `"security-key"`); `{"credential", "name"?}` | creation options; `201 {"name", "acr"}` |
@@ -234,7 +242,9 @@ account that only has a password from one that chose to use it.
   `acr_values` is not read.
 
 Otherwise the ID token's `acr` is the session's own level, which may be more
-than was asked.  Discovery lists the four identifiers in
+than was asked.  `/token` checks the client's minimum again, as it is at the
+time: a code or refresh token whose sign-in is below it gets `invalid_grant`,
+and a refresh token's whole family is revoked.  Discovery lists the four identifiers in
 `acr_values_supported`.
 
 A request that needs a signed-in user sends the browser to
@@ -285,8 +295,9 @@ block of checks); the identity is read from the authority block only.
 authenticate as at `/token`) answers `device_code`, `user_code` (`XXXX-XXXX`),
 `verification_uri` (`<issuer>/device`), `verification_uri_complete`,
 `expires_in` and `interval`.  The user approves or denies at `/device`, which
-needs a session at `phr` or better: signed in with a passkey or a security key
-that verifies the user.  The tokens state the approving session's `amr` and
+needs a session at `phr` or better — signed in with a passkey or a security key
+that verifies the user — or at the client's `--min-acr` if that is higher, and
+the poll checks the approving session's level against it once more.  The tokens state the approving session's `amr` and
 level.  The client polls
 `/token` with the device-code grant and gets `authorization_pending`,
 `slow_down` (which adds five seconds to the interval), `access_denied`,
@@ -302,7 +313,11 @@ granted the scope `kleis`, which a client must be registered for
 `request`, a kleis biscuit's third-party block request in base64url, and
 answers `{"block": <third-party block contents, base64url>, "public_key":
 "ed25519/<hex>", "expires": <unix time>}`.  The block states `user`, `amr`,
-`acr` and `group` facts and expires after `attestationSeconds` (five minutes).  Append
+`acr` and `group` facts and expires after `attestationSeconds` (five minutes).
+pyle attests only a sign-in at `kleisMinAcr` or better (`mfa` by default; a
+token from before levels counts as `mfa`), and answers `403 insufficient_acr`
+otherwise, so a grant that trusts pyle's `user` is never met by a password
+alone.  Append
 it to the kleis token, and a kleis grant can name the user:
 
 ```
@@ -379,7 +394,8 @@ out ends it.
 
 Optional, with their defaults: `accessTokenSeconds` (3600), `idTokenSeconds`
 (600), `refreshTokenSeconds` (thirty days), `deviceCodeSeconds` (600),
-`devicePollSeconds` (5), `attestationSeconds` (300), `forwardAuthHosts` (none),
+`devicePollSeconds` (5), `attestationSeconds` (300), `kleisMinAcr` (`mfa`),
+`forwardAuthHosts` (none),
 `forwardAuthCookieSeconds` (eight hours) and `forwardAuthSecret` (none; at
 least 16 characters, and required when `forwardAuthHosts` is set).
 

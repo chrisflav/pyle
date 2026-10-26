@@ -29,6 +29,12 @@ Two routes answer, because they authenticate differently:
 * `POST /kleis/attest/session` from a signed-in browser, under the `Origin`
   check; the attested `amr` is the session's.
 
+Either attests only a sign-in at `kleisMinAcr` or better (`mfa` unless
+configured), and answers `403 insufficient_acr` otherwise: a kleis grant that
+trusts pyle's `user` fact must not be met by a password alone.  A token issued
+before pyle stated levels has no `acr` and counts as `mfa`, which every
+session then reached.
+
 Either takes a form with `request`, the request in base64url, and answers
 `{"block": …, "public_key": "ed25519/…", "expires": …}`, the block being the
 serialised third-party block contents in base64url.
@@ -66,6 +72,16 @@ def attestReply (ctx : Ctx) (r : Req) (user : Store.User) (amr : List String) : 
         (LeanBiscuit.Proto.Schema.encodeThirdPartyBlockContents contents))),
      ("public_key", Json.str key.print), ("expires", (expires : Json))]
 
+/-- `403`, for a sign-in below `kleisMinAcr`. -/
+def levelTooLow (need : Acr) : Reply :=
+  noStore <| Reply.error .forbidden "insufficient_acr"
+    s!"a kleis attestation needs a sign-in at {need.identifier} or better"
+
+/-- The level a token states, read as `mfa` for a token from before pyle
+stated levels: every session then was at least that. -/
+def tokenLevel (identity : Identity) : Acr :=
+  (identity.acr.bind Acr.ofIdentifier?).getD .mfa
+
 /-- `POST /kleis/attest`, with a pyle access token. -/
 def attestBearer : Handler := fun ctx r => do
   match ← bearerUser ctx r with
@@ -75,6 +91,8 @@ def attestBearer : Handler := fun ctx r => do
       return (noStore (Reply.error .forbidden "insufficient_scope"
         "the access token was not granted the kleis scope")).withHeader "WWW-Authenticate"
         "Bearer realm=\"pyle\", error=\"insufficient_scope\", scope=\"kleis\""
+    unless (tokenLevel identity).satisfies ctx.config.kleisMinAcr do
+      return levelTooLow ctx.config.kleisMinAcr
     attestReply ctx r u identity.amr
 
 /-- `POST /kleis/attest/session`, from a signed-in browser. -/
@@ -83,6 +101,7 @@ def attestSession : Handler := fun ctx r => do
     | return Reply.error .unauthorized "login_required" "sign in first"
   let some u ← ctx.store.findUser s.user
     | return Reply.error .unauthorized "login_required" "sign in first"
+  unless s.level.satisfies ctx.config.kleisMinAcr do return levelTooLow ctx.config.kleisMinAcr
   attestReply ctx r u s.amr
 
 end Token

@@ -146,10 +146,9 @@ structure Credential where
   lastUsed : Option Nat
   /-- Whether it has verified the user (a PIN or a fingerprint), at
   registration or in any assertion since: what makes it a passkey rather than
-  a security key that is only touched.  Credentials registered before
-  migration 5 are assumed to, which is what the invitation that made every
-  account's first one required. -/
-  userVerified : Bool := true
+  a security key that is only touched.  Of the credentials registered before
+  migration 5, only the one an invitation created is assumed to. -/
+  userVerified : Bool := false
 
 /-- The columns of `webauthn_credentials`, in the order `readCredential` reads
 them. -/

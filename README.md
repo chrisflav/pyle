@@ -79,7 +79,7 @@ them; have the reverse proxy add the headers if that matters.
 Accounts are created by invitation: `pyle invite <name>` prints
 `<issuer>/invite/<token>` (valid for seven days unless `--ttl` says otherwise;
 only the token's hash is stored).  Whoever opens it creates the account's
-first passkey and is signed in with it.  From `/account` they can then add
+first passkey, is told the account is ready, and signs in with it from there.  From `/account` they can then add
 more passkeys and security keys, an authenticator app (TOTP), recovery codes,
 and — if `allowPasswords` is set — a password, and see and end their sessions.
 The account page nags until two authenticators are registered, and the last

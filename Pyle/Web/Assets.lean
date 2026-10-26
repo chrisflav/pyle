@@ -337,7 +337,7 @@ function setupInvite(body) {
       if (!res.ok) throw new Error(describe(res));
       document.getElementById('invite-form').hidden = true;
       document.getElementById('invite-done').hidden = false;
-      say('');
+      say('Your passkey is registered.');
       document.getElementById('continue-signin').focus();
     } catch (e) { failed(e); }
   });

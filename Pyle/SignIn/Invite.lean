@@ -18,8 +18,8 @@ invitation is consumed in the same transaction (`Store.redeemInvitation`), so
 an invitation creates at most one account and a registration that fails
 leaves it usable.  The credential must be discoverable and verify the user —
 a passkey — since it is the account's only way in until a second is added;
-the page then signs in with it, so that the session comes from an assertion
-like every other (`Policy`).
+the page then sends the person on to `/signin` to sign in with it, so that
+the session comes from an assertion like every other (`Policy`).
 
 The account's WebAuthn user handle has to be in the creation options, before
 the account exists.  It is derived from the registration challenge under a

@@ -141,8 +141,13 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
   check "the script posts to endpoints" (posts.length ≥ 14)
   for p in posts do
     check s!"POST {p} is a route" (routed .post p)
-  for p in ["/invite/x/begin", "/invite/x/finish"] do
+  -- Named in the script by variables or ternaries, which `quotedAfter` cannot see.
+  for p in ["/invite/x/begin", "/invite/x/finish", "/signin/webauthn/begin",
+      "/signin/webauthn/finish", "/signin/stepup/begin", "/signin/stepup/finish",
+      "/signin/codes"] do
     check s!"POST {p} is a route" (routed .post p)
+    check s!"and the script names {p}"
+      (p.startsWith "/invite/" || containsStr script s!"'{p}'")
   check "the script uses both invitation endpoints"
     (containsStr script "base + '/begin'" && containsStr script "base + '/finish'")
   for p in (quotedAfter script "location.assign('").eraseDups do
@@ -193,12 +198,15 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
     (containsStr page.bodyText "<div id=\"invite-done\" hidden>")
   check "which leads on to sign-in"
     (containsStr page.bodyText "id=\"continue-signin\"")
+  let inviteScript :=
+    ((Web.script.splitOn "function setupInvite").getD 1 "").splitOn "document.addEventListener"
   check "the script shows the confirmation instead of signing in at once"
     (containsStr Web.script "getElementById('invite-done').hidden = false" &&
-      !containsStr Web.script "getAssertion('/signin/webauthn/begin', {});\n      await finish(\
-        '/signin/webauthn/finish', { credential: assertion, return: '/account' })")
+      !containsStr (inviteScript.headD "") "getAssertion(" &&
+      !containsStr (inviteScript.headD "") "finish(")
   let signin ← getPage ctx "/signin?return=%2Faccount"
   checkEq "the sign-in it leads to answers 200" signin.status.toCode 200
+  check "and returns to the account" (containsStr signin.bodyText "data-return=\"/account\"")
   checkEq "a malformed token is 404" (← getPage ctx "/invite/xyz").status.toCode 404
   checkEq "an unknown token is 404"
     (← getPage ctx s!"/invite/{b64u (← Crypto.randomBytes 32)}").status.toCode 404

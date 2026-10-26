@@ -51,6 +51,7 @@ cat > "$PYLE_CONFIG" <<EOF
   "rootKeyFile": "data/root.key",
   "trustedProxies": ["127.0.0.1"],
   "devicePollSeconds": 1,
+  "allowPasswords": true,
   "forwardAuthSecret": "$FA_SECRET",
   "forwardAuthHosts": {
     "$FA_HOST": "deny if path(\$p), \$p.starts_with(\"/admin\");\nallow if group(\"admin\");",
@@ -96,9 +97,19 @@ SECRET="$(tail -1 "$WORK/client.log")"
 check $? "the secret is printed and only its hash kept"
 "$PYLE" client add tv --public --name TV --redirect "http://127.0.0.1/cb" > "$WORK/tv.log" 2>&1
 check $? "pyle client add tv --public" "$(cat "$WORK/tv.log")"
+INVITE2="$("$PYLE" invite pat --ttl 1h 2>"$WORK/invite2.err")"
+check $? "pyle invite pat" "$(cat "$WORK/invite2.err")"
+"$PYLE" client add lowkey --name Low --redirect "$REDIRECT" --min-acr sfa > "$WORK/low.log" 2>&1
+check $? "pyle client add lowkey --min-acr sfa" "$(cat "$WORK/low.log")"
+SFA_SECRET="$(tail -1 "$WORK/low.log")"
+OUT="$("$PYLE" client add odd --redirect "$REDIRECT" --min-acr gold 2>&1)"
+[ $? -ne 0 ] && grep -q "is not a level" <<< "$OUT"
+check $? "an unknown --min-acr is refused" "$OUT"
 CLIENTS="$("$PYLE" client list 2>&1)"
-grep -q "^app	confidential	ES256" <<< "$CLIENTS"
-check $? "pyle client list" "$CLIENTS"
+grep -q "^app	confidential	ES256	min-acr: mfa" <<< "$CLIENTS"
+check $? "pyle client list, with the mfa floor by default" "$CLIENTS"
+grep -q "^lowkey	confidential	ES256	min-acr: sfa" <<< "$CLIENTS"
+check $? "and the minimum given" "$CLIENTS"
 
 # ---------------------------------------------------------------- the server
 "$PYLE" serve > "$WORK/pyle.log" 2>&1 &
@@ -137,7 +148,8 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $ISSUER" \
 python3 -I "$ROOT/scripts/e2e.py" --port "$PORT" --issuer "$ISSUER" --invite "$INVITE" \
   --user alice --client app --secret="$SECRET" --redirect "$REDIRECT" --post-logout "$BYE" \
   --public-client tv --fa-host "$FA_HOST" --fa-other "$FA_OTHER" \
-  --fa-secret="$FA_SECRET" --counts "$WORK/counts"
+  --fa-secret="$FA_SECRET" --invite2 "$INVITE2" --user2 pat --sfa-client lowkey \
+  --sfa-secret="$SFA_SECRET" --counts "$WORK/counts"
 if [ -f "$WORK/counts" ]; then
   read -r P F < "$WORK/counts"
   PASS=$((PASS+P)); FAIL=$((FAIL+F))

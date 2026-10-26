@@ -8,7 +8,8 @@ operations the invitation page needs: looking an invitation up without using
 it (to greet the person by the name they are invited as), and redeeming it.
 
 **Redeeming is one transaction.**  An invitation is consumed when its first
-credential is stored (DESIGN §1): the account and its credential are created
+factor is stored (DESIGN §1) — a credential, or a password where passwords are
+allowed: the account and its first factor are created
 in the same `BEGIN IMMEDIATE` transaction that deletes the invitation, after
 checking that the invitation is still live, the name still free and the
 credential id not registered to anyone.  Two browsers racing with the same
@@ -89,13 +90,21 @@ def Store.findInvitation (s : Store) (tokenHash : SecretHash) (now : Nat) :
       WHERE token_hash = ?" #[tokenHash] readInvitation
   return row.filter (now < ·.expires)
 
-/-- Redeem an invitation by storing its first credential: in one transaction,
-check that the invitation is live, its name free and the credential id
+/-- An invited account's first way in: a WebAuthn credential, made for the
+account once its id is known, or the PHC string of a password's hash. -/
+inductive FirstFactor where
+  /-- A passkey or a security key. -/
+  | credential (cred : UserId → Credential)
+  /-- A password, where the deployment allows them. -/
+  | password (phc : String)
+
+/-- Redeem an invitation by storing its first factor: in one transaction,
+check that the invitation is live, its name free and, for a credential, its id
 unused, then delete the invitation, create the account with the given
-WebAuthn user handle, and store the credential `cred` makes for it.  The new
+WebAuthn user handle, and store the credential or the password.  The new
 account, or why nothing was done. -/
 def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteArray)
-    (cred : UserId → Credential) (now : Nat) : IO (Except String User) :=
+    (first : FirstFactor) (now : Nat) : IO (Except String User) :=
   s.atomically fun c => do
     let some inv ← queryOne c
         "SELECT user_name, groups, created_by, created, expires FROM invitations \
@@ -106,25 +115,32 @@ def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteAr
     then return .error "the name is taken"
     if (← queryOne c "SELECT 1 FROM users WHERE handle = ?" #[handle] (colInt · 0)).isSome then
       return .error "the user handle is taken"
-    let probe := cred ⟨0⟩
-    if (← queryOne c "SELECT 1 FROM webauthn_credentials WHERE id = ?" #[probe.id]
-        (colInt · 0)).isSome then
-      return .error "the credential is already registered"
+    if let .credential cred := first then
+      let probe := cred ⟨0⟩
+      if (← queryOne c "SELECT 1 FROM webauthn_credentials WHERE id = ?" #[probe.id]
+          (colInt · 0)).isSome then
+        return .error "the credential is already registered"
     discard <| exec c "DELETE FROM invitations WHERE token_hash = ?" #[tokenHash]
     let some u ← queryOne c
         s!"INSERT INTO users (handle, name, groups, created) VALUES (?, ?, ?, ?) \
           RETURNING {userColumns}"
         #[handle, inv.userName, encodeList inv.groups, now] readUser
       | throw (.userError "store: the new user was not returned")
-    let k := cred u.id
-    discard <| exec c
-      "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
-        backup_eligible, backup_state, aaguid, transports, name, created) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      #[k.id, u.id, k.algorithm, k.publicKey, k.signCount,
-        Value.int (if k.backupEligible then 1 else 0),
-        Value.int (if k.backupState then 1 else 0), k.aaguid,
-        encodeList k.transports, k.name, k.created]
+    match first with
+    | .credential cred =>
+      let k := cred u.id
+      discard <| exec c
+        "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
+          backup_eligible, backup_state, aaguid, transports, name, created, user_verified) \
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        #[k.id, u.id, k.algorithm, k.publicKey, k.signCount,
+          Value.int (if k.backupEligible then 1 else 0),
+          Value.int (if k.backupState then 1 else 0), k.aaguid,
+          encodeList k.transports, k.name, k.created,
+          Value.int (if k.userVerified then 1 else 0)]
+    | .password phc =>
+      discard <| exec c "INSERT INTO passwords (user_id, phc, created) VALUES (?, ?, ?)"
+        #[u.id, phc, now]
     return .ok u
 
 end Store

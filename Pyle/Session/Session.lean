@@ -1,5 +1,6 @@
 import Pyle.Http.Router
 import LeanBiscuit.Util.Base64
+import Pyle.Session.Acr
 
 /-!
 # Sessions
@@ -15,8 +16,9 @@ A session is a row on the server and an opaque random identifier in a cookie
 * the identifier is rotated whenever the session's authentication changes
   (`rotate`, and `Policy.stepUp`), so an identifier planted in a browser
   before sign-in is worthless after it;
-* it records the user, the `amr` values, `auth_time` and the authenticators
-  used, and a user can list theirs and end any of them.
+* it records the user, the `amr` values — from which its assurance level is
+  read back (`level`) — `auth_time` and the authenticators used, and a user can
+  list theirs and end any of them.
 
 The cookie is looked up by its hash, not compared: finding a row by the
 SHA-256 of a 256-bit random value leaks nothing a timing attacker could build
@@ -25,7 +27,7 @@ nothing about any identifier.
 
 **Creating a session** is not here.  It happens in exactly one function,
 `Policy.establish`, and recording a fresh authentication on a session in
-exactly one other, `Policy.stepUp`; both take a `StrongAuthentication`, whose
+exactly one other, `Policy.stepUp`; both take a `Policy.Authentication`, whose
 constructor is private to `Pyle.Session.Policy` (§9.3), and the SQL that
 inserts or re-authenticates a session row is private to that file too.  This
 module reads, rotates and ends sessions, none of which can raise what a
@@ -84,6 +86,11 @@ def ofRow (r : Store.SessionRow) : Session :=
   { idHash := r.idHash, user := r.user, amr := r.amr, factors := r.factors,
     authTime := r.authTime, created := r.created, lastSeen := r.lastSeen,
     clientAddress := r.clientAddress, userAgent := r.userAgent }
+
+/-- The level the session reached (DESIGN §1), read back from its `amr`
+(`Acr.ofAmr`), which is exactly the level of the authentication that wrote it
+(`Policy.Authentication.level_eq_ofAmr`). -/
+def level (s : Session) : Acr := Acr.ofAmr s.amr
 
 /-- How long the cookie should live: until the absolute timeout. -/
 def cookieMaxAge (ctx : Ctx) (s : Session) (now : Nat) : Nat :=

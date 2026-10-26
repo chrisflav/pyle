@@ -13,6 +13,7 @@ import PyleTests.Token
 import PyleTests.Device
 import PyleTests.ForwardAuth
 import PyleTests.EndToEnd
+import PyleTests.Assurance
 import PyleTests.QrCode
 
 /-!
@@ -41,5 +42,6 @@ def main : IO UInt32 := do
   deviceGrantTests
   forwardAuthTests
   endToEndTests
+  assuranceTests
   qrCodeTests
   report

@@ -133,9 +133,9 @@ def credentialTests : IO Unit := withCtx fun ctx _ => do
   checkEq "the algorithm round-trips" (c.map (·.algorithm)) (some (-7))
   checkEq "transports round-trip" (c.map (·.transports)) (some ["usb"])
   checkEq "listed for the user" ((← s.listCredentials alice.id).size) 2
-  check "a use against the stored counter applies" (← s.recordCredentialUse id1 5 6 false 200)
+  check "a use against the stored counter applies" (← s.recordCredentialUse id1 5 6 false false 200)
   check "a second use against the same counter does not"
-    (!(← s.recordCredentialUse id1 5 7 false 201))
+    (!(← s.recordCredentialUse id1 5 7 false false 201))
   checkEq "the counter moved once" ((← s.findCredential id1).map (·.signCount)) (some 6)
   checkEq "last used is recorded" ((← s.findCredential id1).bind (·.lastUsed)) (some 200)
   check "removing the second-to-last authenticator is refused"

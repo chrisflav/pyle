@@ -54,7 +54,8 @@ def userinfo : Handler := fun ctx r => do
   | .error reply => return reply
   | .ok (u, identity) =>
     return noStore <| Reply.json <| Json.mkObj <|
-      [("sub", Json.str (subjectOf u))] ++ scopedClaims u identity.scopes
+      [("sub", Json.str (subjectOf u))] ++ accountClaims (← Policy.accountLevel ctx u.id) ++
+        scopedClaims u identity.scopes
 
 end Oidc
 end Pyle

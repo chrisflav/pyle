@@ -25,23 +25,34 @@ def familyOfCode (codeHash : Store.SecretHash) : ByteArray :=
   LeanBiscuit.Sha256.hash ("pyle refresh family v1".toUTF8 ++ codeHash.bytes)
 
 /-- Issue an access token, and an ID token if `openid` is in `scope`, for a
-user at a client, and answer with them and the refresh token `refresh`. -/
+user at a client, and answer with them and the refresh token `refresh`.
+
+The level of the sign-in is read back from its `amr` (`Acr.ofAmr`); the access
+token states it as `acr`, and the ID token too, unless the authorization asked
+for an essential `acr` claim, whose answer is `acrClaim`.  Both state the
+account's own strongest level, read afresh, as `account_acr` and
+`pyle_account_acr`. -/
 def tokenResponse (ctx : Ctx) (r : Req) (client : Store.Client) (user : Store.User)
     (scope : String) (amr : List String) (authTime : Nat) (nonce : Option String)
-    (refresh : Option String) (grant : String) : IO Reply := do
+    (refresh : Option String) (grant : String) (acrClaim : Option String := none) :
+    IO Reply := do
   let now ← ctx.clock
   let expires := now + ctx.config.accessTokenSeconds
+  let level := Acr.ofAmr amr
+  let account ← Policy.accountLevel ctx user.id
   let access ← Token.issue ctx.store ctx.rootKey
-    { user := user.name, amr, authTime, groups := user.groups, client := client.id,
+    { user := user.name, amr, acr := level.identifier, accountAcr := account.map (·.identifier),
+      authTime, groups := user.groups, client := client.id,
       audience := [client.id, Token.pyleAudience], scopes := words scope } now expires
   let idToken ← if (words scope).contains "openid" then
       let settings := (← ctx.store.clientSettings client.id).getD {}
       let claims := idTokenClaims ctx.config.issuer client.id user (words scope) amr
-        (some authTime) nonce now (now + ctx.config.idTokenSeconds)
+        (acrClaim.getD level.identifier) account (some authTime) nonce now
+        (now + ctx.config.idTokenSeconds)
       some <$> signIdToken ctx.store ctx.rootKey settings claims now
     else pure none
   Audit.log ctx r .tokenIssued .success (userName := some user.name)
-    (detail := s!"{grant} for {client.id}")
+    (detail := s!"{grant} for {client.id}, acr {level.identifier}")
   return noStore <| Reply.json <| Json.mkObj <|
     [("access_token", Json.str access), ("token_type", "Bearer"),
      ("expires_in", (ctx.config.accessTokenSeconds : Json)), ("scope", Json.str scope)] ++
@@ -58,13 +69,13 @@ rotated.  Unless the scope includes `offline_access`, it is tied to `session`,
 the pyle session the grant came from, and is revoked when that session ends —
 by sign-out, from the account page, by being replaced, or by expiring. -/
 def startRefresh (ctx : Ctx) (family : ByteArray) (client : Store.Client) (user : Store.User)
-    (scope : String) (amr : List String) (authTime : Nat) (session : Option Store.SecretHash) :
-    IO String := do
+    (scope : String) (amr : List String) (authTime : Nat) (session : Option Store.SecretHash)
+    (acr : Option String := none) : IO String := do
   let now ← ctx.clock
   let token ← randomToken
   let expires := now + ctx.config.refreshTokenSeconds
   ctx.store.startRefreshFamily (tokenHash token)
-    { family, clientId := client.id, user := user.id, scope, amr, authTime, expires } now
+    { family, clientId := client.id, user := user.id, scope, amr, authTime, expires, acr } now
   let tie := if (words scope).contains offlineAccess then none else session
   ctx.store.addRefreshFamily family expires tie now
   return token

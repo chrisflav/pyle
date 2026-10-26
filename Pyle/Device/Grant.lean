@@ -14,11 +14,12 @@ code while the user approves it in a browser.
   a digit — shown as `XXXX-XXXX`.  What the user types is read case-blind and
   with any separators dropped.  20⁸ codes and the limiter on the approval page
   keep guessing a live one out of reach.
-* **Approving** needs a session whose `acr` is `phr`: a CLI's token is as good
+* **Approving** needs a session at `phr` or better: a CLI's token is as good
   as the passkey that approved it, and an approval page is exactly what a
   phishing site would imitate.  Without one the browser is sent to sign in with
   `acr=phr`.  The page shows which client asks and for what before the user
-  decides, and the decision is a form `POST`, under the `Origin` check.
+  decides, and the decision is a form `POST`, under the `Origin` check.  The
+  tokens issued record the approving session's `amr`, and so its level.
 * **Polling** answers `authorization_pending` until a decision, `slow_down` to
   a client polling faster than the interval, `access_denied` once denied,
   `expired_token` once expired; an approved code yields tokens once, with a
@@ -138,11 +139,12 @@ def codeForm (prefill : String) : String :=
 /-- Send the browser to sign in with a phishing-resistant authenticator, and
 back to the device page with what it was given. -/
 def needSignin (r : Req) : Reply :=
-  signinRedirect (Req.pathAndQuery r) (phr := true)
+  signinRedirect (Req.pathAndQuery r) (acr := some .phr)
 
-/-- The session of a request, if it is phishing-resistant. -/
+/-- The session of a request, if it is phishing-resistant: at `phr` or
+better. -/
 def strongSession (ctx : Ctx) (r : Req) : IO (Option Session) := do
-  return (← Session.current ctx r).filter (Policy.acr ·.amr == "phr")
+  return (← Session.current ctx r).filter (·.level.satisfies .phr)
 
 /-- Look a typed user code up, through the rate limiter for the signed-in
 user and the client's address: a wrong code counts as a failure. -/
@@ -184,7 +186,7 @@ def pageGet : Handler := fun ctx r => do
 
 /-- `POST /device`: record the user's decision on a user code. -/
 def pagePost : Handler := fun ctx r => do
-  let some s ← strongSession ctx r | return signinRedirect "/device" (phr := true)
+  let some s ← strongSession ctx r | return signinRedirect "/device" (acr := some .phr)
   let malformed := page "Connect a device" "<p>The form is malformed.</p>" .badRequest
   let .ok form := r.form | return malformed
   let some typed := lookupOnce form "user_code" | return malformed

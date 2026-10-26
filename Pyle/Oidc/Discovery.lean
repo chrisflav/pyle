@@ -33,7 +33,8 @@ def scopesSupported : List String :=
 
 /-- The claims ID tokens and `/userinfo` carry. -/
 def claimsSupported : List String :=
-  ["iss", "sub", "aud", "exp", "iat", "auth_time", "nonce", "amr", "acr", "name", "groups"]
+  ["iss", "sub", "aud", "exp", "iat", "auth_time", "nonce", "amr", "acr", accountAcrClaim, "name",
+   "groups"]
 
 /-- The discovery document. -/
 def discoveryDocument (issuer : String) : Json :=
@@ -57,10 +58,10 @@ def discoveryDocument (issuer : String) : Json :=
       strs ["client_secret_basic", "client_secret_post", "none"]),
     ("code_challenge_methods_supported", strs ["S256"]),
     ("claims_supported", strs claimsSupported),
-    ("acr_values_supported", strs ["phr", "mfa"]),
+    ("acr_values_supported", strs (Acr.all.map (·.identifier))),
     ("prompt_values_supported", strs ["none", "login"]),
     ("authorization_response_iss_parameter_supported", Json.bool true),
-    ("claims_parameter_supported", Json.bool false),
+    ("claims_parameter_supported", Json.bool true),
     ("request_parameter_supported", Json.bool false),
     ("request_uri_parameter_supported", Json.bool false)]
 

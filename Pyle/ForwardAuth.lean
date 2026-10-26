@@ -15,15 +15,26 @@ only from a peer listed in `trustedProxies`; anyone else is refused.
 **Who may reach what** is datalog.  Each protected host is listed in the
 configuration's `forwardAuthHosts` with a policy, evaluated by `lean-biscuit`'s
 authorizer over the facts `user($u)`, `group($g)` (one per group), `host($h)`,
-`path($p)` and `method($m)`:
+`path($p)`, `method($m)`, and how the session signed in: `acr($a)`, its level
+as an identifier (`"phrh"`, `"phr"`, `"https://refeds.org/profile/mfa"`,
+`"https://refeds.org/profile/sfa"`), `amr($m)` (one per RFC 8176 value) and
+`account_acr($a)`, the strongest level the account could reach, if any:
 
 ```json
 "forwardAuthHosts": {
-  "grafana.example.org": "allow if group(\"ops\"); allow if user(\"alice\");"
+  "grafana.example.org": "allow if group(\"ops\"); allow if user(\"alice\");",
+  "vault.example.org": {"policy": "allow if group(\"ops\");", "minAcr": "phr"}
 }
 ```
 
 No matching `allow` is a refusal, and a host not listed is refused outright.
+
+**The level.**  A session must reach the host's `minAcr` before the policy
+is asked at all — `mfa` for a host given as a plain policy, which is the form
+earlier versions read.  A session below it is sent through the grant to sign
+in again at that level, as one without a cookie is, and a non-`GET` request
+is answered `401`.  `acr` facts are exact, so a policy that wants "at least"
+a level says so with `minAcr` rather than with `acr`.
 
 **The cookie.**  pyle's session cookie is a `__Host-` cookie on pyle's own
 host, which no other host ever sees, so a protected host gets a cookie of its
@@ -101,14 +112,33 @@ def hostName (authority : String) : String :=
 def policyFor (ctx : Ctx) (host : String) : Option String :=
   (ctx.config.forwardAuthHosts.find? (·.1.toLower == host)).map (·.2)
 
+/-- The lowest level a session must reach for a host: its `minAcr`, or the
+floor, `mfa`. -/
+def minAcrFor (ctx : Ctx) (host : String) : Acr :=
+  ((ctx.config.forwardAuthMinAcr.find? (·.1.toLower == host)).map (·.2)).getD .mfa
+
+/-- How a session signed in, for a policy: its `amr`, its level, and the
+account's strongest level. -/
+structure SignInFacts where
+  /-- The RFC 8176 values. -/
+  amr : List String := []
+  /-- The level of the sign-in. -/
+  acr : Option Acr := none
+  /-- The account's strongest level, if it has one. -/
+  accountAcr : Option Acr := none
+
 /-- Whether a policy allows a user to make a request.  The facts are stated by
 the authorizer, with no token, and the policy's own checks and policies decide;
 anything but a matching `allow` is a refusal. -/
-def allows (policy user : String) (groups : List String) (host path method : String) : Bool :=
+def allows (policy user : String) (groups : List String) (host path method : String)
+    (signIn : SignInFacts := {}) : Bool :=
   let fact (name value : String) : Builder.Fact := ⟨⟨name, [.str value]⟩⟩
   let request : AuthorizerBuilder :=
     { facts := [fact "user" user] ++ groups.map (fact "group") ++
-        [fact "host" host, fact "path" path, fact "method" method] }
+        [fact "host" host, fact "path" path, fact "method" method] ++
+        signIn.amr.map (fact "amr") ++
+        (signIn.acr.map fun a => [fact "acr" a.identifier]).getD [] ++
+        (signIn.accountAcr.map fun a => [fact "account_acr" a.identifier]).getD [] }
   match request.code policy with
   | .error _ => false
   | .ok b => (Authorizer.authorizeToken b default).toOption.isSome
@@ -307,13 +337,21 @@ def check : Handler := fun ctx r => do
         "WWW-Authenticate" "Cookie"
   let some user ← ctx.store.findUser s.user
     | return Reply.error .unauthorized "login_required" "sign in first"
-  unless allows policy user.name user.groups host path method do
+  let level := Acr.ofAmr s.amr
+  unless level.satisfies (minAcrFor ctx host) do
+    if method == "GET" || method == "HEAD" then
+      return ← toGrant ctx scheme authority (path ++ query)
+    return (Reply.error .unauthorized "login_required"
+      "sign in again with a stronger authenticator").withHeader "WWW-Authenticate" "Cookie"
+  let facts : SignInFacts :=
+    { amr := s.amr, acr := some level, accountAcr := ← Policy.accountLevel ctx user.id }
+  unless allows policy user.name user.groups host path method facts do
     return Reply.error .forbidden "forbidden" "the policy for this host does not allow you"
   return { status := .ok, headers :=
     [("Remote-User", user.name), ("Remote-Groups", ",".intercalate user.groups)] }
 
 /-- `GET /forward-auth/grant?rd=<url>&state=<hash>`: on pyle's own host, with
-the session, issue a one-time code for a protected host, bound to the session,
+the session — after sign-in, at the host's level, if need be — issue a one-time code for a protected host, bound to the session,
 the host, the path and the state, and send the browser there to redeem it.  The
 path must be one a redirect cannot turn into another host
 (`safeRedirectPath`). -/
@@ -334,7 +372,12 @@ def grant : Handler := fun ctx r => do
   let some policy := policyFor ctx host | return refuse "The address is not one pyle protects."
   let some s ← Session.current ctx r | return signinRedirect (Req.pathAndQuery r)
   let some user ← ctx.store.findUser s.user | return signinRedirect (Req.pathAndQuery r)
-  unless allows policy user.name user.groups host path "GET" do
+  let need := minAcrFor ctx host
+  unless s.level.satisfies need do
+    return signinRedirect (Req.pathAndQuery r) none (some need)
+  let facts : SignInFacts :=
+    { amr := s.amr, acr := some s.level, accountAcr := ← Policy.accountLevel ctx user.id }
+  unless allows policy user.name user.groups host path "GET" facts do
     return refuse s!"Your account may not use {host}."
   let code ← randomToken
   let now ← ctx.clock

@@ -94,8 +94,9 @@ def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String
   | .issue a =>
     let some user ← liveUser ctx a.user | return oauthError "invalid_grant" "the account is gone"
     let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime session
+      a.acr
     tokenResponse ctx r client user a.scope a.amr a.authTime a.nonce (some refresh)
-      "authorization_code"
+      "authorization_code" a.acr
 
 /-- The refresh-token grant. -/
 def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
@@ -122,7 +123,7 @@ def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
         unless asked.all granted.contains do
           return oauthError "invalid_scope" "the scope exceeds the original grant"
         pure (" ".intercalate asked)
-    tokenResponse ctx r client user scope g.amr g.authTime none (some new) "refresh_token"
+    tokenResponse ctx r client user scope g.amr g.authTime none (some new) "refresh_token" g.acr
 
 /-- `POST /token`. -/
 def token : Handler := fun ctx r => do

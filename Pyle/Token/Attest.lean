@@ -13,9 +13,9 @@ check if user($u), ["alice"].contains($u) trusting ed25519/<pyle's biscuit root 
 
 The holder of a kleis biscuit asks it for a third-party block request, sends
 that request here, and appends the block pyle returns.  The block states
-`user`, the `amr` of the sign-in and the user's `group`s, and checks that it is
-used within `attestationSeconds`; it is signed by pyle's biscuit root key
-through OpenSSL, and covers the request's previous signature, so it is good in
+`user`, the `amr` and `acr` of the sign-in and the user's `group`s, and checks
+that it is used within `attestationSeconds`; it is signed by pyle's biscuit
+root key through OpenSSL, and covers the request's previous signature, so it is good in
 that one token only.
 
 Two routes answer, because they authenticate differently:
@@ -59,6 +59,7 @@ def attestReply (ctx : Ctx) (r : Req) (user : Store.User) (amr : List String) : 
   let now ← ctx.clock
   let expires := now + ctx.config.attestationSeconds
   let (contents, key) ← attest ctx.store ctx.rootKey request user.name amr user.groups now expires
+    (Acr.ofAmr amr).identifier
   Audit.log ctx r .tokenIssued .success (userName := some user.name) (detail := "kleis attestation")
   return noStore <| Reply.json <| Json.mkObj
     [("block", Json.str (LeanBiscuit.Base64.encode

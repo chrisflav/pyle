@@ -15,7 +15,14 @@ What an OpenID Connect client learns about the user (OpenID Connect Core
 * `iat`, `exp` — issued now, good for `idTokenSeconds`;
 * `auth_time` — when the user authenticated, which may be long before;
 * `nonce` — the one the authorization request carried, if any;
-* `amr` (RFC 8176) and `acr` (`phr` or `mfa`, `Policy.acr`) — how;
+* `amr` (RFC 8176) and `acr` — how: `acr` is the level of the sign-in
+  (`Acr`, read back from the `amr`), or, when the authorization request asked
+  for `acr` as an essential claim, the first of its values the level meets
+  (`AcrRequest.claim`);
+* `pyle_account_acr` — the strongest level the account could sign in at,
+  given what it has registered (`Acr.Capabilities.level`), so that a service
+  can tell an account that only has a password from one that chose to use it;
+  absent for an account that has nothing that may sign in alone;
 * `name` and `groups` — the account's name when the scope includes `profile`,
   its groups when it includes `groups`.
 
@@ -29,6 +36,14 @@ namespace Oidc
 
 open Lean (Json)
 
+/-- The claim naming the account's strongest level. -/
+def accountAcrClaim : String := "pyle_account_acr"
+
+/-- The `pyle_account_acr` claim for an account's strongest level, if it has
+one.  Shared by ID tokens and `/userinfo`. -/
+def accountClaims (account : Option Acr) : List (String × Json) :=
+  (account.map fun a => [(accountAcrClaim, Json.str a.identifier)]).getD []
+
 /-- The claims about the user that a scope releases: `name` for `profile`,
 `groups` for `groups`.  Shared by ID tokens and `/userinfo`. -/
 def scopedClaims (u : Store.User) (scopes : List String) : List (String × Json) :=
@@ -38,14 +53,15 @@ def scopedClaims (u : Store.User) (scopes : List String) : List (String × Json)
 
 /-- The claims of an ID token for a grant of `scopes`. -/
 def idTokenClaims (issuer clientId : String) (u : Store.User) (scopes amr : List String)
-    (authTime : Option Nat) (nonce : Option String) (now expires : Nat) : Json :=
+    (acr : String) (account : Option Acr) (authTime : Option Nat) (nonce : Option String)
+    (now expires : Nat) : Json :=
   Json.mkObj <|
     [("iss", Json.str issuer), ("sub", Json.str (subjectOf u)), ("aud", Json.str clientId),
      ("exp", (expires : Json)), ("iat", (now : Json))] ++
     (authTime.map fun t => [("auth_time", (t : Json))]).getD [] ++
     (nonce.map fun n => [("nonce", Json.str n)]).getD [] ++
-    [("amr", Json.arr (amr.map Json.str).toArray), ("acr", Json.str (Policy.acr amr))] ++
-    scopedClaims u scopes
+    [("amr", Json.arr (amr.map Json.str).toArray), ("acr", Json.str acr)] ++
+    accountClaims account ++ scopedClaims u scopes
 
 /-- The key use a client's ID tokens are signed with. -/
 def idTokenUse (settings : Store.ClientSettings) : Keys.Use :=

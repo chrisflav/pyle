@@ -14,6 +14,8 @@ and carries two checks of its own:
 ```
 user("alice");
 amr("hwk"); amr("user");
+acr("phrh");
+account_acr("phrh");
 auth_time(2026-10-25T10:00:00Z);
 group("admin");
 client("taxis");
@@ -46,6 +48,13 @@ structure Identity where
   user : String
   /-- The authentication methods of the sign-in (RFC 8176). -/
   amr : List String
+  /-- The assurance level of the sign-in, as its identifier: `phrh`, `phr`,
+  `https://refeds.org/profile/mfa` or `https://refeds.org/profile/sfa`.  `none`
+  for a token issued before pyle stated levels. -/
+  acr : Option String := none
+  /-- The strongest level the account could sign in at, when the token was
+  issued, if it had one. -/
+  accountAcr : Option String := none
   /-- The user's groups. -/
   groups : List String
   /-- The OAuth client the token was issued to. -/
@@ -101,6 +110,8 @@ def verify (roots : List PublicKey) (service : String) (now : Nat) (token : Stri
   let some user := (stringFacts biscuit.symbols authority "user").head?
     | throw "the token names no user"
   return { user, amr := stringFacts biscuit.symbols authority "amr",
+           acr := (stringFacts biscuit.symbols authority "acr").head?,
+           accountAcr := (stringFacts biscuit.symbols authority "account_acr").head?,
            groups := stringFacts biscuit.symbols authority "group",
            client := (stringFacts biscuit.symbols authority "client").head?,
            authTime := dateFact biscuit.symbols authority "auth_time",

@@ -323,7 +323,8 @@ function setupAccount() {
   });
 }
 
-// The invitation page: register the first passkey, then sign in with it.
+// The invitation page: register the first passkey, say that it worked, and
+// leave signing in with it to the sign-in page, as a step of its own.
 function setupInvite(body) {
   const base = '/invite/' + encodeURIComponent(body.dataset.token);
   on('create', 'click', async function () {
@@ -334,10 +335,14 @@ function setupInvite(body) {
       const res = await post(base + '/finish',
         { credential: credential, name: value('passkey-name') });
       if (!res.ok) throw new Error(describe(res));
-      say('Your passkey is registered. Now sign in with it.');
-      const assertion = await getAssertion('/signin/webauthn/begin', {});
-      await finish('/signin/webauthn/finish', { credential: assertion, return: '/account' });
+      document.getElementById('invite-form').hidden = true;
+      document.getElementById('invite-done').hidden = false;
+      say('');
+      document.getElementById('continue-signin').focus();
     } catch (e) { failed(e); }
+  });
+  on('continue-signin', 'click', function () {
+    window.location.assign('/signin?return=%2Faccount');
   });
 }
 

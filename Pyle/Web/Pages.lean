@@ -202,11 +202,21 @@ def invite : Handler := fun ctx r => do
         .notFound
   let token := (r.param "token").getD ""
   return htmlReply <| page "invite" "Welcome" [("token", token)] <|
-    s!"<p>You are invited to an account named <strong>{escape inv.userName}</strong>. \
+    s!"<div id=\"invite-form\">\n\
+      <p>You are invited to an account named <strong>{escape inv.userName}</strong>. \
       Create a passkey for it on this device or on a security key.</p>\n" ++
     "<label for=\"passkey-name\">A name for the passkey</label>\n\
      <input id=\"passkey-name\" autocomplete=\"off\" placeholder=\"my laptop\">\n\
-     <button type=\"button\" id=\"create\">Create a passkey</button>"
+     <button type=\"button\" id=\"create\">Create a passkey</button>\n\
+     </div>\n" ++
+    -- Shown once the passkey is stored.  Signing in is a second ceremony, so it
+    -- waits for the person to ask for it rather than following unannounced.
+    s!"<div id=\"invite-done\" hidden>\n\
+      <p class=\"notice\">Your account <strong>{escape inv.userName}</strong> is set up, \
+      and your passkey is registered.</p>\n\
+      <p>Sign in with it to continue to your account.</p>\n\
+      <button type=\"button\" id=\"continue-signin\">Continue to sign in</button>\n\
+      </div>"
 
 /-! ## The rest -/
 

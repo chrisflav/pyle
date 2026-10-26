@@ -138,7 +138,7 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
     check s!"data-{d} is written by a page" (containsStr all s!"data-{d}=\"")
   let posts := (quotedAfter script "post('" ++ quotedAfter script "act('" ++
     quotedAfter script "getAssertion('").eraseDups
-  check "the script posts to endpoints" (posts.length ≥ 15)
+  check "the script posts to endpoints" (posts.length ≥ 14)
   for p in posts do
     check s!"POST {p} is a route" (routed .post p)
   for p in ["/invite/x/begin", "/invite/x/finish"] do
@@ -189,6 +189,16 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   check "greeting the account by name" (containsStr page.bodyText "<strong>newbie</strong>")
   check "and carrying the token for the script"
     (containsStr page.bodyText s!"data-token=\"{token}\"")
+  check "with the confirmation hidden until the passkey is stored"
+    (containsStr page.bodyText "<div id=\"invite-done\" hidden>")
+  check "which leads on to sign-in"
+    (containsStr page.bodyText "id=\"continue-signin\"")
+  check "the script shows the confirmation instead of signing in at once"
+    (containsStr Web.script "getElementById('invite-done').hidden = false" &&
+      !containsStr Web.script "getAssertion('/signin/webauthn/begin', {});\n      await finish(\
+        '/signin/webauthn/finish', { credential: assertion, return: '/account' })")
+  let signin ← getPage ctx "/signin?return=%2Faccount"
+  checkEq "the sign-in it leads to answers 200" signin.status.toCode 200
   checkEq "a malformed token is 404" (← getPage ctx "/invite/xyz").status.toCode 404
   checkEq "an unknown token is 404"
     (← getPage ctx s!"/invite/{b64u (← Crypto.randomBytes 32)}").status.toCode 404

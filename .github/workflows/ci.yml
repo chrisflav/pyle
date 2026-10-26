@@ -18,8 +18,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Headers only: the library itself is the static one the Lean toolchain ships.
-      - name: Install OpenSSL headers
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # qrencode is for the tests, which compare our QR codes with its symbols.
+      - name: Install OpenSSL headers and qrencode
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev qrencode
 
       - uses: leanprover/lean-action@24581d74d674803a25a81b10b059c5c0cdd344c6 # v1.6.2
         with:

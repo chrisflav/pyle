@@ -59,6 +59,7 @@ import Pyle.Encoding.Base64Url
 import Pyle.Encoding.Cbor
 import Pyle.Encoding.Der
 import Pyle.Encoding.Json
+import Pyle.Encoding.QrCode
 import Pyle.WebAuthn.Assertion
 import Pyle.WebAuthn.Attestation
 import Pyle.WebAuthn.AuthenticatorData

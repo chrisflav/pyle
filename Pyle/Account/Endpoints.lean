@@ -1,4 +1,5 @@
 import Pyle.SignIn.Common
+import Pyle.Encoding.QrCode
 
 /-!
 # Managing an account
@@ -17,7 +18,7 @@ stopped from.
 | `POST /account/authenticators/register/finish` | `{"credential", "name"?}` | `201 {"id"}` |
 | `POST /account/authenticators/rename` | `{"id", "name"}` | `204` |
 | `POST /account/authenticators/remove` | `{"id"}` | `204`, or `409` |
-| `POST /account/totp/begin` | `{}` | `{"secret", "uri", "pending"}` |
+| `POST /account/totp/begin` | `{}` | `{"secret", "uri", "qr", "pending"}` |
 | `POST /account/totp/confirm` | `{"pending", "code"}` | `204` |
 | `POST /account/totp/remove` | `{}` | `204`, or `409` |
 | `POST /account/recovery-codes` | `{}` | `{"codes"}` |
@@ -153,13 +154,23 @@ def totpIssuer (ctx : Ctx) : String := ctx.config.rpId
 def base32Text (b : ByteArray) : String :=
   String.ofList ((Factor.base32Encode b).toList.filter (· != '='))
 
-/-- `POST /account/totp/begin`: a new secret, not yet stored. -/
+/-- The QR code of an `otpauth://` URI, as a `data:` URL of its SVG, or the
+empty string for a URI too long for any symbol, which no user name allowed
+makes. -/
+def totpQr (uri : String) : String :=
+  match Encoding.QrCode.encodeText uri with
+  | some m => Encoding.QrCode.toDataUrl m
+  | none => ""
+
+/-- `POST /account/totp/begin`: a new secret, not yet stored, with its URI
+both as text and as a QR code to scan. -/
 def totpBegin : Handler := fun ctx r => withStepUp ctx r fun s _ => do
   let u ← userOf ctx s
   let secret ← Factor.Totp.generateSecret
   let pending ← Secrets.sealPending ctx.rootKey u.id secret (← ctx.clock)
-  return .json (Json.mkObj [("secret", base32Text secret),
-    ("uri", Factor.Totp.uri (totpIssuer ctx) u.name secret), ("pending", b64 pending)])
+  let uri := Factor.Totp.uri (totpIssuer ctx) u.name secret
+  return .json (Json.mkObj [("secret", base32Text secret), ("uri", uri), ("qr", totpQr uri),
+    ("pending", b64 pending)])
 
 /-- `POST /account/totp/confirm`: store the secret once a code from it
 verifies.  Counted against the rate limiter, since it checks a code. -/

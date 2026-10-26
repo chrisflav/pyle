@@ -154,9 +154,10 @@ def accountContent (ctx : Ctx) (s : Session) (u : User) : IO String := do
       "<p>No authenticator app is set up.</p>\n\
        <button type=\"button\" id=\"totp-begin\">Set up an authenticator app</button>\n\
        <div id=\"totp-setup\" hidden>\n\
-       <p>Add this secret to your app, or open the link on the device that has it:</p>\n\
-       <p><code id=\"totp-secret\"></code></p>\n\
-       <p><a id=\"totp-uri\" href=\"/account\"></a></p>\n\
+       <p>Scan this with your authenticator app, or enter the key by hand.</p>\n\
+       <img id=\"totp-qr\" class=\"qr\" alt=\"QR code for your authenticator app\" hidden>\n\
+       <p><a id=\"totp-uri\" href=\"/account\">On your phone? Open in your authenticator app</a></p>\n\
+       <p>The key: <code id=\"totp-secret\"></code></p>\n\
        <label for=\"totp-code\">The code your app shows</label>\n\
        <input id=\"totp-code\" inputmode=\"numeric\" autocomplete=\"one-time-code\">\n\
        <button type=\"button\" id=\"totp-confirm\">Confirm</button>\n</div>"

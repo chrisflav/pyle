@@ -157,7 +157,9 @@ of it is written to be total and given round-trip properties (§9).
 ## 3. Second factors that are not WebAuthn
 
 **TOTP.**  The secret is 20 random bytes, shown once as an `otpauth://` URI and
-QR code, and stored encrypted (§6.3).  A code is accepted for the current time
+QR code, and stored encrypted (§6.3).  The QR code is encoded and rendered as
+SVG in Lean (`Encoding/QrCode`, ISO/IEC 18004 in byte mode at level M) with no
+library, and reaches the page as a `data:` URL, which `img-src` allows.  A code is accepted for the current time
 step and one step either side.  The step of the last accepted code is stored,
 and a code for that step or an earlier one is refused: a code is good at most
 once, which RFC 6238 recommends and most implementations forget.
@@ -513,7 +515,7 @@ until someone proves it.
 
 ```
 Pyle/
-  Encoding/    Base64Url, Cbor, Cose, Json
+  Encoding/    Base64Url, Cbor, Cose, Json, QrCode
   WebAuthn/    AuthenticatorData, ClientData, Assertion, Registration, Attestation
   Factor/      Totp, RecoveryCode, Password
   Session/     Session, Policy (StrongAuthentication), StepUp

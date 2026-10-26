@@ -150,6 +150,13 @@ def attestTests : IO Unit := withCtx fun ctx clock => do
   let some withBlock := (Biscuit.ofBytes withBlock.toBytes kleisPublic).toOption
     | check "the attested token verifies" false
   check "with the attestation the grant allows" (authorize withBlock)
+  let attested (policy : String) : Bool :=
+    match AuthorizerBuilder.code {} s!"time({Pyle.Token.date now});\n{policy}" with
+    | .ok b => (Authorizer.authorizeToken b withBlock).toOption.isSome
+    | .error _ => false
+  check "the attestation states the level"
+    (attested s!"allow if acr(\"phrh\") trusting {pyleKey.print};")
+  check "and no other" (!attested s!"allow if acr(\"phr\") trusting {pyleKey.print};")
   let late (t : Token.Biscuit) : Bool :=
     match AuthorizerBuilder.code {} s!"time({Pyle.Token.date (now + 3600)});\nallow if true;" with
     | .ok b => (Authorizer.authorizeToken b t).toOption.isSome

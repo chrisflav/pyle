@@ -55,7 +55,8 @@ def qrUnitTests : IO Unit := do
   | some m =>
     let svg := toSvg m
     check "the SVG is one path" ((svg.splitOn "<path").length == 2)
-    check "with a quiet zone in its view box" ((svg.splitOn "viewBox=\"0 0 29 29\"").length == 2)
+    check "with a quiet zone in its view box"
+      ((svg.splitOn s!"viewBox=\"0 0 {m.size + 8} {m.size + 8}\"").length == 2)
     check "and crisp edges" ((svg.splitOn "shape-rendering=\"crispEdges\"").length == 2)
     check "the data URL" ((toDataUrl m).startsWith "data:image/svg+xml;base64,PHN2Zy")
   | none => check "a short URI encodes" false

@@ -6,20 +6,28 @@ import Pyle.SignIn.Common
 Accounts are created by an administrator or by invitation, never by sign-up
 (DESIGN, non-goals).  `pyle invite <name>` stores an invitation under the
 SHA-256 of a random token and prints `<issuer>/invite/<token>`; whoever opens
-that link registers the account's first passkey there.
+that link registers the account's first way in there.
 
 | | body | answer |
 | --- | --- | --- |
-| `POST /invite/<token>/begin` | `{}` | creation options |
-| `POST /invite/<token>/finish` | `{"credential", "name"?}` | `201 {"name"}` |
+| `POST /invite/<token>/begin` | `{"kind"?}` | creation options |
+| `POST /invite/<token>/finish` | `{"credential", "name"?}` | `201 {"name", "acr"}` |
+| `POST /invite/<token>/password` | `{"password"}` | `201 {"name", "acr"}` |
 
-The account does not exist until its first credential is stored, and the
+The first way in may be a passkey, the default `kind`, asked for as a
+discoverable credential that verifies the user; a security key touched
+without a PIN (`"kind": "security-key"`: not discoverable, user verification
+only preferred); or, where the deployment allows passwords, a password.  The
+latter two sign in alone only at `sfa` (DESIGN §1); the answer's `acr` is the
+strongest level the new account can reach (`Acr.Capabilities.level`), which
+the page shows, and the account page keeps asking for a passkey.
+
+The account does not exist until its first factor is stored, and the
 invitation is consumed in the same transaction (`Store.redeemInvitation`), so
 an invitation creates at most one account and a registration that fails
-leaves it usable.  The credential must be discoverable and verify the user —
-a passkey — since it is the account's only way in until a second is added;
-the page then sends the person on to `/signin` to sign in with it, so that
-the session comes from an assertion like every other (`Policy`).
+leaves it usable.  The page then sends the person on to `/signin` to sign in,
+so that the session comes from a checked factor like every other
+(`Policy`).
 
 The account's WebAuthn user handle has to be in the creation options, before
 the account exists.  It is derived from the registration challenge under a
@@ -81,8 +89,14 @@ def noInvitation : Reply :=
   Reply.error .notFound "not_found" "this invitation does not exist or has expired"
 
 /-- `POST /invite/<token>/begin`: creation options for the invited account's
-first passkey.  Counted against the rate limiter, since it tests a token. -/
-def beginInvitation : Handler := fun ctx r =>
+first credential — a passkey, or with `"kind": "security-key"` a security key
+that need not be discoverable or verify the user.  Counted against the rate
+limiter, since it tests a token. -/
+def beginInvitation : Handler := fun ctx r => do
+  let j ← match jsonBody r with
+    | .ok j => pure j
+    | .error rep => return rep
+  let securityKey := strField j "kind" == some "security-key"
   limited ctx r .invitationUsed none fun lim attempt => do
     let some (_, inv) ← invitationOf ctx r | return noInvitation
     lim.succeed attempt
@@ -90,10 +104,20 @@ def beginInvitation : Handler := fun ctx r =>
       | .ok ch => pure ch
       | .error rep => return rep
     let handle := Secrets.invitationHandle ctx.rootKey ch
-    return .json (creationOptions ctx ch handle inv.userName [] "required" "required")
+    let (residentKey, uv) :=
+      if securityKey then ("discouraged", "preferred") else ("required", "required")
+    return .json (creationOptions ctx ch handle inv.userName [] residentKey uv)
 
-/-- `POST /invite/<token>/finish`: register the passkey, creating the account
-and consuming the invitation. -/
+/-- The `201` of a redeemed invitation: the account's name and the strongest
+level it can reach. -/
+def invitationRedeemed (ctx : Ctx) (u : User) : IO Reply := do
+  let level ← Policy.accountLevel ctx u.id
+  return .json (Json.mkObj [("name", u.name),
+    ("acr", match level with | some a => Json.str a.identifier | none => Json.null)]) .created
+
+/-- `POST /invite/<token>/finish`: register the credential, creating the
+account and consuming the invitation.  User verification is not required:
+whether the credential gave it is recorded, and decides the account's level. -/
 def finishInvitation : Handler := fun ctx r => do
   let j ← match jsonBody r with
     | .ok j => pure j
@@ -107,19 +131,19 @@ def finishInvitation : Handler := fun ctx r => do
     let some h := tokenHashOf r | return noInvitation
     let refuse (why : String) : IO Reply := do
       Audit.log ctx r .invitationUsed .failure (detail := why)
-      return Reply.error .badRequest "registration_failed" "the passkey could not be registered"
+      return Reply.error .badRequest "registration_failed" "the authenticator could not be registered"
     let some (challenge, ch) ← consumeRegistrationChallenge ctx reg
       | refuse "unknown or expired challenge"
     -- A challenge issued for an existing account's registration is not one
     -- for an invitation.
     if ch.user.isSome then return ← refuse "challenge issued to an account"
-    match ← verifyNewCredential ctx challenge reg (requireUserVerification := true) with
+    match ← verifyNewCredential ctx challenge reg (requireUserVerification := false) with
     | .error why => refuse why
     | .ok c =>
       let now ← ctx.clock
       let handle := Secrets.invitationHandle ctx.rootKey challenge
       match ← ctx.store.redeemInvitation h handle
-          (fun u => credentialRow c u name reg.transports now) now with
+          (.credential fun u => credentialRow c u name reg.transports now) now with
       | .error why =>
         Audit.log ctx r .invitationUsed .failure (detail := why)
         return noInvitation
@@ -128,7 +152,34 @@ def finishInvitation : Handler := fun ctx r => do
         Audit.log ctx r .invitationUsed .success (userName := some u.name)
         Audit.log ctx r .register .success (userName := some u.name)
           (factor := some ("webauthn:" ++ b64 c.id))
-        return .json (Json.mkObj [("name", u.name)]) .created
+        invitationRedeemed ctx u
+
+/-- `POST /invite/<token>/password`: create the account with a password as its
+first way in, where the deployment allows passwords, consuming the
+invitation.  The account gets a random WebAuthn user handle, for the passkey
+it may add later.  Counted against the rate limiter like the other
+invitation endpoints. -/
+def finishInvitationPassword : Handler := fun ctx r => do
+  if !ctx.config.allowPasswords then
+    return Reply.error .forbidden "passwords_disabled" "this deployment does not use passwords"
+  let j ← match jsonBody r with
+    | .ok j => pure j
+    | .error rep => return rep
+  let some pw := strField j "password" | return badRequest "'password' is missing"
+  if let some rep := passwordProblem pw then return rep
+  limited ctx r .invitationUsed none fun lim attempt => do
+    let some (h, _) ← invitationOf ctx r | return noInvitation
+    let phc ← Factor.Password.hash pw
+    let now ← ctx.clock
+    match ← ctx.store.redeemInvitation h (← Crypto.randomBytes 32) (.password phc) now with
+    | .error why =>
+      Audit.log ctx r .invitationUsed .failure (detail := why)
+      return noInvitation
+    | .ok u =>
+      lim.succeed attempt
+      Audit.log ctx r .invitationUsed .success (userName := some u.name)
+      Audit.log ctx r .register .success (userName := some u.name) (factor := some "password")
+      invitationRedeemed ctx u
 
 end SignIn
 end Pyle

@@ -31,6 +31,7 @@ def routes : List Route := [
   .mk' .get "/invite/:token" Web.invite,
   .mk' .post "/invite/:token/begin" beginInvitation,
   .mk' .post "/invite/:token/finish" finishInvitation,
+  .mk' .post "/invite/:token/password" finishInvitationPassword,
   .mk' .get "/account" Web.account,
   .mk' .post "/account/authenticators/register/begin" Account.registerBegin,
   .mk' .post "/account/authenticators/register/finish" Account.registerFinish,

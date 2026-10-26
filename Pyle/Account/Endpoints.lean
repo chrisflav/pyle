@@ -6,9 +6,11 @@ import Pyle.Encoding.QrCode
 
 What a signed-in user can do to their own account (DESIGN §1, §3, §4), as
 JSON over `fetch`.  Every change that adds or removes a way in, or renames
-one, needs a step-up within the last five minutes (`requireStepUp`), and
-answers `403 step_up_required` otherwise, which the account page meets by
-running a step-up and trying again.  Ending a session needs only the session:
+one, needs a step-up within the last five minutes (`requireStepUp`) at the
+level `SignIn.changeLevel` gives — the account's own best level or `mfa`,
+whichever is lower — and answers `403 step_up_required` otherwise, naming that
+level in `acr`, which the account page meets by running a step-up and trying
+again.  Ending a session needs only the session:
 taking access away is never what an attacker with a stolen cookie wants to be
 stopped from.
 
@@ -23,7 +25,7 @@ stopped from.
 | `POST /account/totp/remove` | `{}` | `204`, or `409` |
 | `POST /account/recovery-codes` | `{}` | `{"codes"}` |
 | `POST /account/password` | `{"password"}` | `204` |
-| `POST /account/password/remove` | `{}` | `204` |
+| `POST /account/password/remove` | `{}` | `204`, or `409` |
 | `POST /account/sessions/end` | `{"handle"}` | `204` |
 
 **At least two.**  Removing a credential or the TOTP secret is refused with
@@ -42,7 +44,8 @@ used, so it cannot then be used to sign in.
 in the answer once; the database keeps only their HMACs.
 
 **Passwords**, when the deployment allows them, are at least twelve
-characters.  The breached-password check DESIGN §3 mentions needs a list pyle
+characters (`SignIn.passwordProblem`).  The password of an account with no
+WebAuthn credential cannot be removed: it is that account's only way in.  The breached-password check DESIGN §3 mentions needs a list pyle
 does not ship; it is left to a later round.
 -/
 
@@ -217,12 +220,6 @@ def recoveryCodes : Handler := fun ctx r => withStepUp ctx r fun s _ => do
     (factor := some "recovery") (detail := "recovery codes replaced")
   return .json (Json.mkObj [("codes", toJson codes)])
 
-/-- The shortest password accepted, in characters. -/
-def minPasswordLength : Nat := 12
-
-/-- The longest, so that hashing one costs a bounded amount. -/
-def maxPasswordLength : Nat := 1024
-
 /-- `403`, when the deployment does not allow passwords. -/
 def passwordsOff : Reply :=
   Reply.error .forbidden "passwords_disabled" "this deployment does not use passwords"
@@ -231,19 +228,25 @@ def passwordsOff : Reply :=
 def setPassword : Handler := fun ctx r => withStepUp ctx r fun s j => do
   if !ctx.config.allowPasswords then return passwordsOff
   let some pw := strField j "password" | return badRequest "'password' is missing"
-  if pw.length < minPasswordLength then
-    return Reply.error .badRequest "password_too_short"
-      s!"a password has at least {minPasswordLength} characters"
-  if pw.length > maxPasswordLength then
-    return Reply.error .badRequest "password_too_long"
-      s!"a password has at most {maxPasswordLength} characters"
+  if let some rep := passwordProblem pw then return rep
   ctx.store.setPassword s.user (← Factor.Password.hash pw) (← ctx.clock)
   Audit.log ctx r .register .success (userName := ← userName ctx s.user)
     (factor := some "password")
   return .noContent
 
-/-- `POST /account/password/remove`. -/
+/-- `409`, for removing the password of an account that has no WebAuthn
+credential: it would be left with no way to sign in on its own. -/
+def lastWayIn : Reply :=
+  Reply.error .conflict "last_way_in"
+    "add a passkey or a security key before removing the password"
+
+/-- `POST /account/password/remove`.  Refused while the account has no WebAuthn
+credential, since the password is then its only factor that may stand alone. -/
 def removePassword : Handler := fun ctx r => withStepUp ctx r fun s _ => do
+  if (← ctx.store.listCredentials s.user).isEmpty && (← ctx.store.findPassword s.user).isSome then
+    Audit.log ctx r .removeAuthenticator .refused (userName := ← userName ctx s.user)
+      (factor := some "password") (detail := "the account's only way in")
+    return lastWayIn
   if ← ctx.store.removePassword s.user then
     Audit.log ctx r .removeAuthenticator .success (userName := ← userName ctx s.user)
       (factor := some "password")

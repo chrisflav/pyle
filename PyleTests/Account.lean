@@ -161,6 +161,8 @@ def totpTests : IO Unit := withCtx fun ctx clock => do
   check "and its QR code, as a data URL of SVG"
     (jstr body "qr" == Account.totpQr (jstr body "uri") &&
       (jstr body "qr").startsWith "data:image/svg+xml;base64,")
+  checkEq "and the reply, carrying the secret, is not cached" (b.header "cache-control")
+    (some "no-store")
   check "nothing is stored yet" ((← ctx.store.findTotp u.id).isNone)
   let pending := jstr body "pending"
   let now ← clock.get

@@ -285,6 +285,8 @@ function setupAccount() {
       if (data.qr) {
         qr.src = data.qr;
         qr.hidden = false;
+      } else {
+        qr.hidden = true;
       }
       document.getElementById('totp-uri').setAttribute('href', data.uri);
       document.getElementById('totp-secret').textContent = data.secret;

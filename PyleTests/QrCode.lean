@@ -130,7 +130,12 @@ def qrencodeTests : IO Unit := do
       pure (r.exitCode == 0)
     catch _ => pure false
   if !present then
-    say "  note: qrencode is not installed, so the comparison is skipped"
+    -- CI installs qrencode, so its absence there means the comparison was
+    -- lost, not merely unavailable.
+    if (← IO.getEnv "CI").isSome then
+      check "qrencode is installed in CI" false "the comparison needs /usr/bin/qrencode"
+    else
+      say "  note: qrencode is not installed, so the comparison is skipped"
     return
   let file ← IO.FS.createTempFile >>= fun (h, p) => do h.flush; pure p
   let mut same := 0

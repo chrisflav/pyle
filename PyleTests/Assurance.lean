@@ -340,9 +340,60 @@ def forwardAuthAssuranceTests : IO Unit := withCtx fun ctx0 _ => do
       ("{\"b.example\":7}", "a number")] do
     check s!"{what} is refused" (match parse bad with | some (.error _) => true | _ => false)
 
+/-- Migration 5 brings an older database forward. -/
+def migrationTests : IO Unit := IO.FS.withTempDir fun dir => do
+  group "assurance: migration 5"
+  let s ← Store.Store.openFile (dir / "old.db")
+  s.run fun c => do
+    discard <| Store.currentVersion c
+    for m in Store.migrations.take 4 do
+      for st in m.statements do discard <| Store.exec c st
+      discard <| Store.exec c
+        "INSERT INTO schema_version (version, description, applied) VALUES (?, ?, ?)"
+        #[m.version, m.description, (1 : Nat)]
+    discard <| Store.exec c "INSERT INTO users (handle, name, created) VALUES (x'01', 'old', 1)"
+    discard <| Store.exec c
+      "INSERT INTO clients (id, name, redirect_uris, scopes, created) \
+        VALUES ('old', 'Old', '[]', '[]', 1)"
+    discard <| Store.exec c
+      "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
+        backup_eligible, backup_state, aaguid, name, created) \
+        VALUES (x'02', 1, -7, x'03', 0, 0, 0, x'00', 'old key', 1)"
+  checkEq "the database is at version 4" (← s.version) 4
+  s.migrate 2
+  checkEq "and is brought to 5" (← s.version) 5
+  checkEq "an older client has the mfa floor" ((← s.clientSettings "old").map (·.minAcr))
+    (some .mfa)
+  checkEq "an older credential is taken to verify the user"
+    ((← s.findCredential (ByteArray.mk #[2])).map (·.userVerified)) (some true)
+  let refused ← try
+      discard <| s.run fun c => Store.exec c "UPDATE clients SET min_acr = 'gold'"
+      pure false
+    catch _ => pure true
+  check "a minimum that is not a level is refused by the schema" refused
+
+/-- Single-factor sign-in is limited per account like the rest. -/
+def singleFactorLimitTests : IO Unit :=
+    withSignInCtx (fun c => { c with allowPasswords := true }) fun ctx _ => do
+  group "assurance: single-factor sign-in is rate limited"
+  let sam ← ctx.store.addUser "sam" [] 1
+  ctx.store.setPassword sam.id (← Factor.Password.hash "correct horse battery") 1
+  let codes ← (List.range 6).mapM fun i => do
+    let r ← postJson ctx "/signin/codes"
+      (Json.mkObj [("name", "sam"), ("password", "wrong password")])
+      (client := s!"192.0.2.{40 + i}")
+    return r.status.toCode
+  checkEq "a password alone is limited per account across addresses" codes
+    [401, 401, 401, 401, 429, 429]
+  let ok ← postJson ctx "/signin/codes"
+    (Json.mkObj [("name", "sam"), ("password", "correct horse battery")]) (client := "192.0.2.99")
+  checkEq "even the right one, for now" ok.status.toCode 429
+
 /-- The assurance tests. -/
 def assuranceTests : IO Unit := do
   acrTests
+  migrationTests
+  singleFactorLimitTests
   oidcAssuranceTests
   accountChangeTests
   deviceAssuranceTests

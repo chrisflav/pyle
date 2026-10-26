@@ -81,26 +81,65 @@ comes from an agent acting for Christian, on this one pull request".
 
 | Kind | Role | Notes |
 | --- | --- | --- |
-| Passkey (discoverable WebAuthn credential, user verification) | primary, alone sufficient | Phishing-resistant: bound to the origin by the browser. |
-| Security key (WebAuthn, possibly non-discoverable) | primary with UV, or second factor | Same ceremony, different flags. |
+| Passkey (discoverable WebAuthn credential, user verification) | primary, alone `phr` | Phishing-resistant: bound to the origin by the browser. |
+| Security key (WebAuthn, possibly non-discoverable) | primary: `phr` with UV, `sfa` without; or second factor | Same ceremony, different flags. |
 | TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports. |
-| Recovery codes | last resort | Ten single-use codes, stored hashed, shown once. |
-| Password | optional first factor, never alone | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
+| Recovery codes | last resort, second factor only | Ten single-use codes, stored hashed, shown once. |
+| Password | optional: alone `sfa`, or a first factor | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
 
 A sign-in yields an **authentication method reference** (`amr`, RFC 8176):
-`hwk`/`swk` with `user` for WebAuthn, `otp` for TOTP, `pwd` for a password.  It
-is carried into every token (§5), so a service can demand a phishing-resistant
-sign-in for something sensitive without trusting a boolean that only means
-"some second factor happened".
+`hwk`/`swk` with `user` for WebAuthn, `otp` for TOTP, `pwd` for a password,
+the private `rec` for a recovery code, and `mfa` for two kinds.  OpenID
+Connect EAP ACR Values 1.0 §3 adds `pop`, proof of possession of a key stored
+who knows where; pyle always knows which of `hwk` and `swk` it is, and never
+says `pop`.  The `amr` is carried into every token (§5), so a service can
+demand a phishing-resistant sign-in for something sensitive without trusting
+a boolean that only means "some second factor happened".
 
-**Assurance policy.**  A session is *strong* if it was established by a WebAuthn
-assertion with user verification, or by any two distinct factors.  Only strong
-sessions get tokens.  A password alone produces no session at all — it is only
-a step.
+**Assurance levels.**  A sign-in reaches a level, its `acr`, and the session
+records it; pyle does not refuse a single factor, and each service decides
+what it needs.  The levels are published identifiers, lowest first:
+
+| level | identifier | reached by |
+| --- | --- | --- |
+| `sfa` | `https://refeds.org/profile/sfa` (REFEDS Single Factor Authentication Profile 1.0) | one factor that may stand alone: a password (only with `allowPasswords`), or a WebAuthn assertion without user verification |
+| `mfa` | `https://refeds.org/profile/mfa` (REFEDS MFA Profile) | two factors of distinct kinds |
+| `phr` | `phr` (OpenID Connect EAP ACR Values 1.0 §2, "phishing-resistant") | a WebAuthn assertion with user verification |
+| `phrh` | `phrh` (the same, "phishing-resistant hardware-protected") | the same from a credential that is not backup-eligible (the BE flag clear), whose key never leaves the authenticator |
+
+Each level satisfies the ones below it, and the order is total.  A TOTP code
+or a recovery code alone reaches no level and makes no session: either is only
+ever a second factor.  A password meets REFEDS SFA's twelve characters
+(§4.1.1), and every factor is rate limited (§4.1.3, our §7).
+
+The default floor is `mfa`: a service that asks for nothing and has no
+configured minimum gets only `mfa` or better, and opts down to `sfa` by being
+registered for it (§5).  A request can raise the level it needs, never lower
+it: whoever controls the browser controls the request.
+
+Two definitions are a matter of reading.  `phr` asks that a party under the
+relying party's control learn nothing that would let it authenticate as the
+user elsewhere; WebAuthn's origin binding gives exactly that, and nothing else
+pyle has does.  `phrh` asks that the information needed to authenticate be
+held in a hardware-protected device; a credential that is not backup-eligible
+is one the authenticator promises never to export, which is as close as
+WebAuthn comes without attestation (§2.2, where an AAGUID allow-list makes it
+closer).
+
+**Account safety.**  What an account has registered bounds the level it can
+reach: `phrh` or `phr` with a credential that has verified the user
+(device-bound for `phrh`), `mfa` with two kinds of factor, `sfa` with only a
+password or a touch-only key.  pyle states it to services as
+`pyle_account_acr` and `account_acr` (§5), shows it on the account page in
+plain words, and asks for a passkey until there is one.  An invitation may
+create the account with a single factor (a touch-only key, or a password where
+allowed), so the first sign-in can happen on a device without a platform
+authenticator.
 
 **At least two.**  A user cannot remove their second-to-last authenticator, and
 is nagged until they have registered two.  Losing a single key should never be
-an administrator's problem.
+an administrator's problem.  The password of an account with no WebAuthn
+credential cannot be removed either: it is that account's only way in.
 
 ## 2. WebAuthn ceremonies
 
@@ -183,13 +222,29 @@ A session is a row on the server and an opaque random identifier in a cookie:
 - the identifier is rotated on every change of authentication state, so a
   session fixed before sign-in is worthless after it;
 - idle timeout (default 8 h) and absolute timeout (default 30 days);
-- records `amr`, `auth_time` and the authenticators used.
+- records `amr`, `auth_time` and the authenticators used; its level is read
+  back from the `amr`, and is exactly the level of the authentication that
+  wrote it (§9.1).
 
 **Step-up.**  A relying service may send `max_age` or ask for an `acr`; if the
-session's `auth_time` is too old, or its factors too weak, pyle asks for a
-fresh WebAuthn assertion without ending the session.  Removing an
-authenticator, adding one and minting long-lived tokens always require a
-step-up within the last five minutes.
+session's `auth_time` is too old, or its level too low, pyle sends the browser
+to sign in again at the level needed, without ending the session.  The sign-in
+page offers only what reaches that level and the endpoints refuse what falls
+short, so the round trip cannot loop.  A step-up replaces the session's level
+with the new authentication's, as it replaces `auth_time`: it says how the user
+signed in just now.
+
+**Account changes.**  Removing an authenticator, adding one, renaming one,
+and setting up TOTP, recovery codes or a password require a step-up within the
+last five minutes, at the account's own best level or `mfa`, whichever is
+lower.  An account that can only sign in with one factor can still manage
+itself with that factor — otherwise a password-only account could never add
+the passkey the account page asks for.  An account that has a passkey or two
+kinds of factor needs `mfa`, which a passkey meets: the protection such an
+account had before levels existed, and REFEDS MFA §3.2's factor independence,
+since one stolen factor cannot then add another.  Requiring `phr` of accounts
+that have a passkey would close the relayed-codes hole below, at the cost of
+the recovery path; that is still §12's question.
 
 A step-up need not be WebAuthn: two factors through the code form (a
 password and a TOTP code, or a recovery code and another factor) are accepted
@@ -221,6 +276,24 @@ pyle is an OpenID Provider for the authorization-code flow, and only that:
 ID tokens are JWTs, since that is what every OIDC client library expects.  Which
 algorithm they are signed with is an open question (§12).
 
+**Levels.**  Each client has a minimum level (`pyle client add --min-acr`,
+`mfa` unless set), and a request may ask for more with `acr_values` — a list
+in order of preference, of which pyle reads the four identifiers, the bare
+`mfa` of earlier versions, and REFEDS MFA 2.0's
+`https://refeds.org/profile/mfa/phr` as `phr` — or with the `claims`
+parameter's `id_token.acr` (OpenID Connect Core §5.5).  Any listed level will
+do, so the session must reach the weakest listed and the client's minimum;
+unknown values are ignored, as `acr_values` is voluntary.  A session below that
+is sent to sign in again at the level needed; under `prompt=none` the client
+gets `interaction_required` (and `login_required` without a fresh enough
+session).  The ID token's `acr` is the session's level, except when `claims`
+marks `acr` essential: then it is the first requested value the session meets,
+as Core §5.5.1.1 requires and as REFEDS MFA §4.2.2.1 asks of an OP that
+performed more than was requested, and a request none of whose values pyle
+knows is refused with `unmet_authentication_requirements`.  `amr` stays RFC
+8176's, and `pyle_account_acr` names the account's strongest level, in the ID
+token and at `userinfo`.
+
 ### 5.2 Biscuits for our own services
 
 orchestra, taxis and diff-reviewer are ours, and they can do better than a JWT.
@@ -229,6 +302,8 @@ For them the access token is a **biscuit** whose authority block says:
 ```
 user("christian");
 amr("hwk"); amr("user");
+acr("phrh");
+account_acr("phrh");
 auth_time(2026-10-25T10:00:00Z);
 check if time($t), $t < 2026-10-25T11:00:00Z;
 check if audience($a), ["taxis", "orchestra"].contains($a);
@@ -257,12 +332,15 @@ For services that have no sign-in of their own, pyle answers Caddy's
 `200` with `Remote-User` and `Remote-Groups` headers when the session cookie is
 good and the user may reach that host, otherwise a redirect to sign in.  Which
 users may reach which host is a datalog rule, like everything else that
-decides access.
+decides access, over the user, the request and how the session signed in
+(`acr`, `amr`, `account_acr`).  Each host has a minimum level, `mfa` unless
+configured, which a session must reach before the rule is asked; one below it
+is sent to sign in again at that level.
 
 ### 5.4 kleis
 
-pyle signs a **third-party block** attesting `user("christian")` and the
-`amr`, and appends it to a kleis biscuit.  A kleis grant can then say
+pyle signs a **third-party block** attesting `user("christian")`, the
+`amr` and the `acr`, and appends it to a kleis biscuit.  A kleis grant can then say
 
 ```
 check if user($u), ["christian"].contains($u) trusting ed25519/<pyle public key>;
@@ -276,7 +354,8 @@ token for a grant, and attenuate it — no owner typing a bearer name.
 
 The taxis plugin, the diff-reviewer agent CLI and similar tools use the
 **device authorization grant** (RFC 8628): the CLI shows a short code, the user
-approves it in a browser with a passkey, and the CLI receives a biscuit.  This
+approves it in a browser with a passkey — the approval page needs `phr` — and
+the CLI receives a biscuit stating the approving session's level.  This
 replaces personal access tokens pasted into config files, and those tokens get
 an `amr` and an expiry like everything else.
 
@@ -359,12 +438,12 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 | Table | Contents |
 | --- | --- |
 | `users` | id, handle (random 32 bytes, the WebAuthn user handle), name, groups |
-| `webauthn_credentials` | credential id, user, COSE public key, sign count, flags, AAGUID, transports, name, created/last used |
+| `webauthn_credentials` | credential id, user, COSE public key, sign count, flags (and whether it has verified the user), AAGUID, transports, name, created/last used |
 | `totp` | user, encrypted secret, last accepted step |
 | `recovery_codes` | user, HMAC, spent-at |
 | `sessions` | id hash, user, amr, auth_time, created, last seen, client hints |
 | `challenges` | challenge, purpose, user, expiry — deleted on first use |
-| `clients` | OIDC clients: id, secret hash, redirect URIs, allowed scopes |
+| `clients` | OIDC clients: id, secret hash, redirect URIs, allowed scopes, minimum level |
 | `codes`, `refresh_tokens` | hashes only, with the binding fields of §5.1 |
 | `keys` | encrypted signing keys, state (next/current/previous) |
 | `audit` | §7 |
@@ -384,12 +463,12 @@ As in kleis, the point of Lean is that some of these become theorems.
 2. **Single use.**  The challenge, code and refresh-token stores are state
    machines; a value that has been consumed is never accepted again.
    Invariant over every sequence of operations.
-3. **No session without the policy.**  `Policy.establish` takes a
-   `StrongAuthentication`, whose constructor is private to
-   `Pyle.Session.Policy`, as is the constructor of the per-factor evidence it
-   is built from and the SQL that writes a session row — a type-level
-   guarantee in the style of kleis's `AuthorizedRequest`, not a theorem to
-   maintain.
+3. **No session without the policy.**  `Policy.establish` takes an
+   `Authentication`, whose constructor is private to `Pyle.Session.Policy`, as
+   is the constructor of the per-factor evidence it is built from and the SQL
+   that writes a session row — a type-level guarantee in the style of kleis's
+   `AuthorizedRequest`, not a theorem to maintain.  Its level is computed from
+   its factors, never supplied.
 4. **Authorization codes.**  A token is issued for a code only if the code was
    issued to that client, for that redirect URI, with a challenge the verifier
    hashes to, and has not expired or been used.
@@ -483,9 +562,37 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
      exchange consumed the code and before it began the family finds no
      family and revokes nothing; the replay itself is still refused.  This
      predates the proofs, and nothing above claims otherwise.
-3. **No session without the policy**: structural, as above; `password_alone`,
-   `totp_alone`, `recovery_alone` and the `ofFactors_*` theorems in
-   `Session/Policy.lean` say what the policy rules out.
+3. **No session without the policy**: structural, as above.  The theorems
+   of `Session/Policy.lean` say what each level needs and what the policy
+   rules out:
+   * the level a session records is the level its factors justify:
+     `Authentication.level_eq_ofAmr` — the session keeps the `amr`, and
+     `Acr.ofAmr` reads back exactly `Authentication.level`, the level computed
+     from the factors (`level`).  It holds because an authentication uses
+     each kind of factor at most once;
+   * a TOTP code alone and a recovery code alone are no authentication
+     (`totp_alone`, `recovery_alone`), nor are two factors of one kind
+     (`ofFactors_same_kind`) or of two users (`ofFactors_two_users`);
+   * a password alone and a security key without user verification alone
+     sign in at `sfa` (`password_alone`, `key_alone`), and `sfa` comes from
+     nothing else (`level_sfa`: exactly one factor, a password or WebAuthn
+     without user verification);
+   * `mfa` or better needs a phishing-resistant factor or two kinds of factor
+     (`level_mfa`), and two kinds reach at least `mfa` (`mfa_le_level`);
+   * `phr` needs WebAuthn with user verification (`level_phr`), and `phrh` the
+     same from a credential that is not backup-eligible (`level_phrh`);
+   * in `Session/Acr.lean`, the order of the levels is a total order
+     (`Acr.le_refl`, `le_trans`, `le_antisymm`, `le_total`), `satisfies` is
+     monotone in both arguments (`Acr.satisfies_mono`), a request added to a
+     floor never lowers it (`Acr.satisfies_max`), and a change to an account
+     never needs more than `mfa` and needs exactly `mfa` of an account that
+     can reach it (`Capabilities.changeLevel_le_mfa`, `changeLevel_eq_mfa`).
+
+   Not proved: that the endpoints ask for the right level.  `Authorize`,
+   `ForwardAuth` and the device page compare the session's level with what
+   they need through `Acr.satisfies`, and the theorems say what that
+   comparison means; that each compares with the right minimum is checked by
+   the tests.
 4. **Authorization codes**: `codeDecision_issue` — tokens are issued for a
    code only if the store handed back its row, it was issued to this client,
    for this `redirect_uri`, the verifier is well formed and its `S256`
@@ -519,7 +626,7 @@ Pyle/
   Encoding/    Base64Url, Cbor, Cose, Json, QrCode
   WebAuthn/    AuthenticatorData, ClientData, Assertion, Registration, Attestation
   Factor/      Totp, RecoveryCode, Password
-  Session/     Session, Policy (StrongAuthentication), StepUp
+  Session/     Session, Acr (the levels), Policy (Authentication), StepUp
   Oidc/        Authorize, Token, Discovery, Jwks, Jwt, DeviceGrant
   Token/       Biscuit issuing, third-party attestation for kleis
   ForwardAuth.lean
@@ -582,6 +689,15 @@ deployment.
 - **Synced passkeys.**  Passkeys synced by Apple, Google or a password manager
   are as strong as that account.  Whether to require device-bound credentials
   (backup-eligible flag clear) for administrators is a policy knob to decide.
+  A service can already ask for it, as `phrh`; what is open is whether pyle
+  should enforce it per group.
+- **The `acr` answered to `acr_values`.**  REFEDS MFA 2.0 §4.2.2.1 asks an OP
+  that performed phishing-resistant MFA for a request of plain MFA to assert
+  only `https://refeds.org/profile/mfa`.  pyle does so when the request is an
+  essential `claims` request, which REFEDS §4.4 tells conforming relying
+  parties to send, and otherwise states the session's own level, which tells a
+  service more.  If REFEDS relying parties that use `acr_values` turn up, the
+  voluntary request may have to be answered the same way.
 - **Replacing the root key, and ending every session.**  The root key never
   changes, and there is no way to end every session at once.  So the
   database together with the root key — a leaked backup, a stolen disk — is

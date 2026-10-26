@@ -201,8 +201,8 @@ def signInRequired : Reply :=
 `need` or better; the level is in the answer's `acr`, as a short name, for the
 page to ask for. -/
 def stepUpRequired (need : Acr) : Reply :=
-  .json (Json.mkObj [("error", "step_up_required"), ("error_description", "confirm it is you first"),
-    ("acr", need.shortName)]) .forbidden
+  .json (Json.mkObj [("error", "step_up_required"),
+    ("error_description", "confirm it is you first"), ("acr", need.shortName)]) .forbidden
 
 /-- The body as JSON, or the `400` to answer.  An empty body is `{}`. -/
 def jsonBody (r : Req) : Except Reply Json :=

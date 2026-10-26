@@ -131,7 +131,8 @@ def finishInvitation : Handler := fun ctx r => do
     let some h := tokenHashOf r | return noInvitation
     let refuse (why : String) : IO Reply := do
       Audit.log ctx r .invitationUsed .failure (detail := why)
-      return Reply.error .badRequest "registration_failed" "the authenticator could not be registered"
+      return Reply.error .badRequest "registration_failed"
+        "the authenticator could not be registered"
     let some (challenge, ch) ← consumeRegistrationChallenge ctx reg
       | refuse "unknown or expired challenge"
     -- A challenge issued for an existing account's registration is not one

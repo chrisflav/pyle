@@ -423,18 +423,27 @@ theorem mem_amr {fs : List Factor} {s : String} :
   · rename_i ht
     simp [List.mem_eraseDups, List.mem_flatMap, ht]
 
-theorem user_mem_amr {f : Factor} : "user" ∈ f.amr ↔ f.kind = .webauthn ∧ f.userVerified = true := by
+/-- A factor gives `user` exactly when it is WebAuthn that verified the user. -/
+theorem user_mem_amr {f : Factor} :
+    "user" ∈ f.amr ↔ f.kind = .webauthn ∧ f.userVerified = true := by
   obtain ⟨u, k, uv, be, l⟩ := f
   cases k <;> cases uv <;> cases be <;> simp [Factor.amr]
 
-theorem hwk_mem_amr {f : Factor} : "hwk" ∈ f.amr ↔ f.kind = .webauthn ∧ f.backupEligible = false := by
+/-- A factor gives `hwk` exactly when it is WebAuthn from a device-bound
+credential. -/
+theorem hwk_mem_amr {f : Factor} :
+    "hwk" ∈ f.amr ↔ f.kind = .webauthn ∧ f.backupEligible = false := by
   obtain ⟨u, k, uv, be, l⟩ := f
   cases k <;> cases uv <;> cases be <;> simp [Factor.amr]
 
-theorem swk_mem_amr {f : Factor} : "swk" ∈ f.amr ↔ f.kind = .webauthn ∧ f.backupEligible = true := by
+/-- A factor gives `swk` exactly when it is WebAuthn from a credential that
+may be synced. -/
+theorem swk_mem_amr {f : Factor} :
+    "swk" ∈ f.amr ↔ f.kind = .webauthn ∧ f.backupEligible = true := by
   obtain ⟨u, k, uv, be, l⟩ := f
   cases k <;> cases uv <;> cases be <;> simp [Factor.amr]
 
+/-- No single factor gives `mfa`. -/
 theorem mfa_not_mem_amr {f : Factor} : "mfa" ∉ f.amr := by
   obtain ⟨u, k, uv, be, l⟩ := f
   cases k <;> cases uv <;> cases be <;> simp [Factor.amr]

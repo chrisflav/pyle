@@ -118,17 +118,23 @@ def ofAmr (amr : List String) : Acr :=
 
 /-! ## The order -/
 
+/-- The order is the order of the ranks. -/
 theorem le_iff {a b : Acr} : a ≤ b ↔ a.rank ≤ b.rank := Iff.rfl
 
+/-- Every level is at least itself. -/
 theorem le_refl (a : Acr) : a ≤ a := Nat.le_refl _
 
+/-- The order is transitive. -/
 theorem le_trans {a b c : Acr} (h₁ : a ≤ b) (h₂ : b ≤ c) : a ≤ c := Nat.le_trans h₁ h₂
 
+/-- **The order is total**: of two levels, one is at least the other. -/
 theorem le_total (a b : Acr) : a ≤ b ∨ b ≤ a := Nat.le_total _ _
 
+/-- Two levels of one rank are one level. -/
 theorem rank_injective {a b : Acr} (h : a.rank = b.rank) : a = b := by
   cases a <;> cases b <;> first | rfl | (simp [rank] at h)
 
+/-- The order is antisymmetric. -/
 theorem le_antisymm {a b : Acr} (h₁ : a ≤ b) (h₂ : b ≤ a) : a = b :=
   rank_injective (Nat.le_antisymm h₁ h₂)
 
@@ -138,11 +144,13 @@ theorem sfa_le (a : Acr) : Acr.sfa ≤ a := Nat.zero_le _
 /-- `phrh` is the greatest level. -/
 theorem le_phrh (a : Acr) : a ≤ Acr.phrh := by cases a <;> decide
 
+/-- The stronger of two levels is at least the first. -/
 theorem le_max_left (a b : Acr) : a ≤ max a b := by
   unfold max; split
   · assumption
   · exact le_refl a
 
+/-- The stronger of two levels is at least the second. -/
 theorem le_max_right (a b : Acr) : b ≤ max a b := by
   unfold max; split
   · exact le_refl b
@@ -150,6 +158,7 @@ theorem le_max_right (a b : Acr) : b ≤ max a b := by
     · contradiction
     · exact h
 
+/-- The weaker of two levels is at most the first. -/
 theorem min_le_left (a b : Acr) : min a b ≤ a := by
   unfold min; split
   · exact le_refl a
@@ -157,6 +166,7 @@ theorem min_le_left (a b : Acr) : min a b ≤ a := by
     · contradiction
     · exact h
 
+/-- The weaker of two levels is at most the second. -/
 theorem min_le_right (a b : Acr) : min a b ≤ b := by
   unfold min; split
   · assumption
@@ -164,6 +174,7 @@ theorem min_le_right (a b : Acr) : min a b ≤ b := by
 
 /-! ## Satisfying a demand -/
 
+/-- `satisfies` is the order. -/
 theorem satisfies_iff {h w : Acr} : satisfies h w = true ↔ w ≤ h := by
   simp [satisfies]
 

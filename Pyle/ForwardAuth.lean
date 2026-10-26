@@ -351,10 +351,10 @@ def check : Handler := fun ctx r => do
     [("Remote-User", user.name), ("Remote-Groups", ",".intercalate user.groups)] }
 
 /-- `GET /forward-auth/grant?rd=<url>&state=<hash>`: on pyle's own host, with
-the session — after sign-in, at the host's level, if need be — issue a one-time code for a protected host, bound to the session,
-the host, the path and the state, and send the browser there to redeem it.  The
-path must be one a redirect cannot turn into another host
-(`safeRedirectPath`). -/
+the session — after sign-in, at the host's level, if need be — issue a
+one-time code for a protected host, bound to the session, the host, the path
+and the state, and send the browser there to redeem it.  The path must be one
+a redirect cannot turn into another host (`safeRedirectPath`). -/
 def grant : Handler := fun ctx r => do
   let refuse (msg : String) (status : Std.Http.Status := .forbidden) :=
     page "Access refused" s!"<p>{htmlEscape msg}</p>" status

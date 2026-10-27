@@ -14,29 +14,40 @@ stopped from.
 
 | | body | answer |
 | --- | --- | --- |
-| `POST /account/authenticators/register/begin` | `{}` | creation options |
-| `POST /account/authenticators/register/finish` | `{"credential", "name"?}` | `201 {"id"}` |
+| `POST /account/authenticators/register/begin` | `{"kind"?}` | creation options |
+| `POST /account/authenticators/register/finish` | `{"credential", "name"?, "kind"?}` | `201 {"id"}` |
 | `POST /account/authenticators/rename` | `{"id", "name"}` | `204` |
 | `POST /account/authenticators/remove` | `{"id"}` | `204`, or `409` |
-| `POST /account/totp/begin` | `{}` | `{"secret", "uri", "qr", "pending"}` |
-| `POST /account/totp/confirm` | `{"pending", "code"}` | `204` |
-| `POST /account/totp/remove` | `{}` | `204`, or `409` |
+| `POST /account/totp/begin` | `{"name"?}` | `{"secret", "uri", "qr", "pending", "name"}` |
+| `POST /account/totp/confirm` | `{"pending", "code", "name"?}` | `201 {"id", "name"}` |
+| `POST /account/totp/rename` | `{"id", "name"}` | `204` |
+| `POST /account/totp/remove` | `{"id"}` | `204`, or `409` |
 | `POST /account/recovery-codes` | `{}` | `{"codes"}` |
 | `POST /account/password` | `{"password"}` | `204` |
 | `POST /account/password/remove` | `{}` | `204` |
 | `POST /account/sessions/end` | `{"handle"}` | `204` |
 
-**At least two.**  Removing a credential or the TOTP secret is refused with
-`409` when it would leave fewer than two authenticators (§1); the store makes
-the count and the delete one transaction.
+**Kinds.**  `kind` is `passkey` (a discoverable credential that verifies the
+user: `residentKey` and `userVerification` required, and a registration that
+did not verify the user is refused) or `security-key` (`residentKey`
+discouraged, `userVerification` preferred); without it, both are preferred.
+It also picks the default name, "Passkey 2" or "Security key 3".
 
-**TOTP enrolment** takes two requests and remembers nothing in between: the
-new secret goes to the browser, shown as base32 and as an `otpauth://` URI,
-and also sealed for this user with the time it was issued
-(`Secrets.sealPending`).  The browser hands the sealed value back with the
-first code from the app; only a code that verifies against it stores the
-secret, and it must come within ten minutes.  The code's step is recorded as
-used, so it cannot then be used to sign in.
+**At least two.**  Removing a credential or an authenticator app is refused
+with `409` when it would leave fewer than two authenticators (§1), every app
+counting as one; the store makes the count and the delete one transaction.
+
+**Authenticator apps.**  An account may have several, each with its own
+secret and name, renamed and removed by the id `confirm` answers with.
+Enrolment takes two requests and remembers nothing in between: the new
+secret goes to the browser, shown as base32 and as an `otpauth://` URI, and
+also sealed for this user with the time it was issued and the name the app
+is to have (`Secrets.sealPending`).  The browser hands the sealed value back
+with the first code from the app; only a code that verifies against it
+stores the secret, as a new app beside any others, and it must come within
+ten minutes.  The code's step is recorded as that app's last, so it cannot
+then be used to sign in.  The account page does the first request itself, in
+`GET /account/add/app` (`Pyle.Web.Pages`).
 
 **Recovery codes** are generated ten at a time, replace the old ones, and are
 in the answer once; the database keeps only their HMACs.
@@ -71,15 +82,51 @@ def userOf (ctx : Ctx) (s : Session) : IO User := do
 def idOf (j : Json) : Except Reply ByteArray :=
   (bytesField j "id").mapError badRequest
 
-/-- `POST /account/authenticators/register/begin`. -/
-def registerBegin : Handler := fun ctx r => withStepUp ctx r fun s _ => do
+/-- What the user asked to add: a passkey, which is discoverable and verifies
+the user, a security key, which need be neither, or either. -/
+inductive Kind where
+  /-- A passkey: `residentKey` and `userVerification` required. -/
+  | passkey
+  /-- A security key: `residentKey` discouraged, `userVerification`
+  preferred, so that a key with a PIN verifies and one without is touched. -/
+  | securityKey
+  /-- Whatever the authenticator offers: both preferred. -/
+  | any
+  deriving DecidableEq, Repr
+
+/-- The kind a body asks for, as `"kind"`: `passkey`, `security-key`, or
+anything else for either. -/
+def kindOf (j : Json) : Kind :=
+  match strField j "kind" with
+  | some "passkey" => .passkey
+  | some "security-key" => .securityKey
+  | _ => .any
+
+/-- The `residentKey` and `userVerification` of the creation options for a
+kind. -/
+def Kind.selection : Kind → String × String
+  | .passkey => ("required", "required")
+  | .securityKey => ("discouraged", "preferred")
+  | .any => ("preferred", "preferred")
+
+/-- The name of the `n`-th authenticator of a kind, when it is given none. -/
+def Kind.defaultName (k : Kind) (n : Nat) : String :=
+  match k with
+  | .passkey => s!"Passkey {n}"
+  | .securityKey => s!"Security key {n}"
+  | .any => s!"authenticator {n}"
+
+/-- `POST /account/authenticators/register/begin`: creation options for the
+kind the body asks for (`kindOf`). -/
+def registerBegin : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let u ← userOf ctx s
   let creds ← ctx.store.listCredentials u.id
   let ch ← match ← newChallenge ctx r .register (some u.id) with
     | .ok ch => pure ch
     | .error rep => return rep
+  let (residentKey, userVerification) := (kindOf j).selection
   return .json (creationOptions ctx ch u.handle u.name
-    (creds.toList.map fun c => descriptor c.id c.transports) "preferred" "preferred")
+    (creds.toList.map fun c => descriptor c.id c.transports) residentKey userVerification)
 
 /-- `POST /account/authenticators/register/finish`. -/
 def registerFinish : Handler := fun ctx r => withStepUp ctx r fun s j => do
@@ -94,14 +141,16 @@ def registerFinish : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let some (challenge, ch) ← consumeRegistrationChallenge ctx reg
     | refuse "unknown or expired challenge"
   if ch.user != some u.id then return ← refuse "challenge issued to someone else"
-  match ← verifyNewCredential ctx challenge reg (requireUserVerification := false) with
+  let kind := kindOf j
+  match ← verifyNewCredential ctx challenge reg
+      (requireUserVerification := kind == .passkey) with
   | .error why => refuse why
   | .ok c =>
     if (← ctx.store.findCredential c.id).isSome then
       Audit.log ctx r .register .failure (userName := some u.name) (detail := "already registered")
       return Reply.error .conflict "already_registered" "this authenticator is already registered"
     let n := (← ctx.store.listCredentials u.id).size
-    let name := credentialName (strField j "name") s!"authenticator {n + 1}"
+    let name := credentialName (strField j "name") (kind.defaultName (n + 1))
     ctx.store.addCredential (credentialRow c u.id name reg.transports (← ctx.clock))
     Audit.log ctx r .register .success (userName := some u.name)
       (factor := some ("webauthn:" ++ b64 c.id))
@@ -162,18 +211,55 @@ def totpQr (uri : String) : String :=
   | some m => Encoding.QrCode.toDataUrl m
   | none => ""
 
-/-- `POST /account/totp/begin`: a new secret, not yet stored, with its URI
-both as text and as a QR code to scan. -/
-def totpBegin : Handler := fun ctx r => withStepUp ctx r fun s _ => do
-  let u ← userOf ctx s
-  let secret ← Factor.Totp.generateSecret
-  let pending ← Secrets.sealPending ctx.rootKey u.id secret (← ctx.clock)
-  let uri := Factor.Totp.uri (totpIssuer ctx) u.name secret
-  return .json (Json.mkObj [("secret", base32Text secret), ("uri", uri), ("qr", totpQr uri),
-    ("pending", b64 pending)])
+/-- The name a new authenticator app gets when it is given none, for an
+account that has `n` already: "Authenticator app", then "Authenticator app 2"
+and so on. -/
+def defaultAppName (n : Nat) : String :=
+  if n == 0 then "Authenticator app" else s!"Authenticator app {n + 1}"
 
-/-- `POST /account/totp/confirm`: store the secret once a code from it
-verifies.  Counted against the rate limiter, since it checks a code. -/
+/-- A new TOTP secret for `u`, not yet stored: its base32, its `otpauth://`
+URI, the URI's QR code, and the secret sealed for the browser to hand back
+(`Secrets.sealPending`) with the name the app is to have. -/
+structure NewApp where
+  /-- The secret in base32. -/
+  secret : String
+  /-- The `otpauth://` URI. -/
+  uri : String
+  /-- Its QR code as a `data:` URL, or empty. -/
+  qr : String
+  /-- The sealed pending secret, in base64url. -/
+  pending : String
+  /-- The name it is to have. -/
+  name : String
+
+/-- Make a new TOTP secret for `u`, to be named `name` (`NewApp`). -/
+def newApp (ctx : Ctx) (u : User) (name : String) : IO NewApp := do
+  let secret ← Factor.Totp.generateSecret
+  let pending ← Secrets.sealPending ctx.rootKey u.id secret (← ctx.clock) name
+  let uri := Factor.Totp.uri (totpIssuer ctx) u.name secret
+  return { secret := base32Text secret, uri, qr := totpQr uri, pending := b64 pending, name }
+
+/-- The name for a new app: as typed, else the default for an account with
+`n` apps. -/
+def appName (s : Option String) (n : Nat) : String :=
+  credentialName s (defaultAppName n)
+
+/-- `POST /account/totp/begin`: a new secret, not yet stored, with its URI
+both as text and as a QR code to scan, for an app to be named `name`. -/
+def totpBegin : Handler := fun ctx r => withStepUp ctx r fun s j => do
+  let u ← userOf ctx s
+  let n := (← ctx.store.listTotpApps u.id).size
+  let a ← newApp ctx u (appName (strField j "name") n)
+  return .json (Json.mkObj [("secret", a.secret), ("uri", a.uri), ("qr", a.qr),
+    ("pending", a.pending), ("name", a.name)])
+
+/-- The audit log's name for an authenticator app. -/
+def appFactor (id : Int) : Option String := some s!"totp:{id}"
+
+/-- `POST /account/totp/confirm`: store the secret as a new app once a code
+from it verifies.  The app is named by `name` in the body if there is one,
+else by the name given to `begin`.  Counted against the rate limiter, since it
+checks a code. -/
 def totpConfirm : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let u ← userOf ctx s
   let pending ← match bytesField j "pending" with
@@ -182,30 +268,63 @@ def totpConfirm : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let some code := strField j "code" | return badRequest "'code' is missing"
   limited ctx r .register (some u.name) fun lim attempt => do
     let now ← ctx.clock
-    let some (secret, issued) := Secrets.openPending ctx.rootKey u.id pending
+    let some p := Secrets.openPending ctx.rootKey u.id pending
       | return badRequest "'pending' is not a secret issued to this account"
-    if issued + enrolmentSeconds < now then
+    if p.issued + enrolmentSeconds < now then
       return Reply.error .badRequest "expired" "start the set-up again"
-    let some step := Factor.Totp.verify secret now (Policy.normaliseCode code) none
+    let some step := Factor.Totp.verify p.secret now (Policy.normaliseCode code) none
       | Audit.log ctx r .register .failure (userName := some u.name) (factor := some "totp")
           (detail := "wrong first code")
         return Reply.error .badRequest "invalid_code" "the code does not match; try the next one"
     lim.succeed attempt
-    ctx.store.setTotp u.id (← Secrets.sealTotp ctx.rootKey u.id secret) now
-    discard <| ctx.store.acceptTotpStep u.id step now
-    Audit.log ctx r .register .success (userName := some u.name) (factor := some "totp")
-    return .noContent
+    let n := (← ctx.store.listTotpApps u.id).size
+    let name := appName ((strField j "name").filter (!·.trimAscii.isEmpty) <|>
+      (if p.name.isEmpty then none else some p.name)) n
+    let app ← ctx.store.addTotpApp u.id name (some step) now
+      (Secrets.sealTotpApp ctx.rootKey u.id · p.secret)
+    Audit.log ctx r .register .success (userName := some u.name) (factor := appFactor app.id)
+      (detail := s!"authenticator app '{name}' added")
+    return .json (Json.mkObj [("id", toJson app.id), ("name", name)]) .created
 
-/-- `POST /account/totp/remove`. -/
-def totpRemove : Handler := fun ctx r => withStepUp ctx r fun s _ => do
-  let name ← userName ctx s.user
-  if (← ctx.store.findTotp s.user).isNone then
-    return Reply.error .notFound "not_found" "there is no TOTP secret"
-  if ← ctx.store.removeTotp s.user then
-    Audit.log ctx r .removeAuthenticator .success (userName := name) (factor := some "totp")
+/-- An authenticator app's id from a body: a number, or a string of digits. -/
+def appIdOf (j : Json) : Except Reply Int :=
+  match j.getObjVal? "id" with
+  | .ok (.num n) => if n.exponent == 0 then .ok n.mantissa else .error (badRequest "'id' is not an app")
+  | .ok (.str t) => match t.toInt? with
+    | some i => .ok i
+    | none => .error (badRequest "'id' is not an app")
+  | _ => .error (badRequest "'id' is missing")
+
+/-- `404`, for an app that is not the user's. -/
+def noSuchApp : Reply := Reply.error .notFound "not_found" "no such authenticator app"
+
+/-- `POST /account/totp/rename`: rename one of the user's apps. -/
+def totpRename : Handler := fun ctx r => withStepUp ctx r fun s j => do
+  let id ← match appIdOf j with
+    | .ok id => pure id
+    | .error rep => return rep
+  let some name := strField j "name" | return badRequest "'name' is missing"
+  let name := credentialName (some name) ""
+  if name.isEmpty then return badRequest "the name is empty"
+  if ← ctx.store.renameTotpApp s.user id name then
+    Audit.log ctx r .userChanged .success (userName := ← userName ctx s.user)
+      (factor := appFactor id) (detail := s!"authenticator app renamed to '{name}'")
     return .noContent
-  Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := some "totp")
-    (detail := "would leave fewer than two authenticators")
+  return noSuchApp
+
+/-- `POST /account/totp/remove`: remove one of the user's apps, by id. -/
+def totpRemove : Handler := fun ctx r => withStepUp ctx r fun s j => do
+  let id ← match appIdOf j with
+    | .ok id => pure id
+    | .error rep => return rep
+  let name ← userName ctx s.user
+  let some app ← ctx.store.findTotpApp s.user id | return noSuchApp
+  if ← ctx.store.removeTotpApp s.user id then
+    Audit.log ctx r .removeAuthenticator .success (userName := name) (factor := appFactor id)
+      (detail := s!"authenticator app '{app.name}' removed")
+    return .noContent
+  Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := appFactor id)
+    (detail := s!"authenticator app '{app.name}': would leave fewer than two authenticators")
   return lastTwo
 
 /-- `POST /account/recovery-codes`: ten new codes, replacing the old ones. -/

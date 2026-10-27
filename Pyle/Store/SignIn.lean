@@ -33,6 +33,10 @@ def Store.setPassword (s : Store) (user : UserId) (phc : String) (now : Nat) : I
 def Store.findPassword (s : Store) (user : UserId) : IO (Option String) := s.run fun c =>
   queryOne c "SELECT phc FROM passwords WHERE user_id = ?" #[user] (colText · 0)
 
+/-- When a user's password was set, if they have one. -/
+def Store.passwordSetAt (s : Store) (user : UserId) : IO (Option Nat) := s.run fun c =>
+  queryOne c "SELECT created FROM passwords WHERE user_id = ?" #[user] (colNat · 0)
+
 /-- Remove a user's password.  Whether there was one. -/
 def Store.removePassword (s : Store) (user : UserId) : IO Bool := s.run fun c => do
   return (← exec c "DELETE FROM passwords WHERE user_id = ?" #[user]) > 0

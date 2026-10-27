@@ -1,6 +1,7 @@
 import Pyle.Crypto.Aead
 import Pyle.Crypto.Hkdf
 import Pyle.Store.Users
+import Pyle.Factor.Totp
 
 /-!
 # Keys derived from the root key
@@ -12,16 +13,23 @@ weakness in one use says nothing about another:
 
 | `info` | used for |
 | --- | --- |
-| `pyle totp v1` | sealing TOTP secrets, with the user id as associated data |
+| `pyle totp v1` | sealing TOTP secrets, with the user and the app as associated data |
 | `pyle recovery-code v1` | the HMAC under which recovery codes are stored |
 | `pyle invitation-handle v1` | the WebAuthn user handle of an invited account |
 | `pyle decoy-credential v1` | the padding credential ids of a named sign-in |
 
-The associated data of a sealed TOTP secret is the user's row id in decimal,
-so a sealed secret copied into another user's row no longer opens.  A secret
-in the middle of being enrolled, handed to the browser and back, is sealed
-with `pending ` in front of the id and the time it was issued inside, so it
-can neither be stored as another user's nor kept for later.
+The associated data of a sealed TOTP secret names its row: `totp `, the
+user's row id and the app's row id, in decimal (`appAd`).  A sealed secret
+copied into another user's row, or into another of the same user's apps, no
+longer opens.  The one secret an account had before it could have several
+was sealed with the user's row id alone (`userAd`); migration 6 made it the
+app whose id is the user's, and `openTotpApp` accepts that associated data
+for that row and no other.
+
+A secret in the middle of being enrolled, handed to the browser and back, is
+sealed with `pending ` in front of the user id and, inside, the time it was
+issued and the name the app is to have, so it can neither be stored as
+another user's nor kept for later.
 -/
 
 namespace Pyle
@@ -47,19 +55,30 @@ def invitationHandleKey (rootKey : ByteArray) : ByteArray :=
 /-- The key decoy credential ids are made under. -/
 def decoyKey (rootKey : ByteArray) : ByteArray := derive rootKey "pyle decoy-credential v1"
 
-/-- The associated data of a user's sealed TOTP secret: the row id in
-decimal. -/
+/-- The associated data a user's single TOTP secret was sealed with before
+migration 6: the user's row id in decimal. -/
 def userAd (user : Store.UserId) : ByteArray := (toString user.val).toUTF8
 
-/-- Seal a TOTP secret for storage in a user's row. -/
-def sealTotp (rootKey : ByteArray) (user : Store.UserId) (secret : ByteArray) :
-    IO ByteArray :=
-  Crypto.«seal» (totpKey rootKey) (userAd user) secret
+/-- The associated data of an authenticator app's sealed secret: `totp `,
+the user's row id and the app's, in decimal. -/
+def appAd (user : Store.UserId) (app : Int) : ByteArray :=
+  s!"totp {user.val} {app}".toUTF8
 
-/-- Open a user's stored TOTP secret. -/
-def openTotp (rootKey : ByteArray) (user : Store.UserId) (sealedSecret : ByteArray) :
-    Except String ByteArray :=
-  Crypto.«open» (totpKey rootKey) (userAd user) sealedSecret
+/-- Seal a TOTP secret for the row of app `app` of `user`. -/
+def sealTotpApp (rootKey : ByteArray) (user : Store.UserId) (app : Int) (secret : ByteArray) :
+    IO ByteArray :=
+  Crypto.«seal» (totpKey rootKey) (appAd user app) secret
+
+/-- Open the sealed secret of app `app` of `user`.  It opens with the
+associated data of its own row, or — for the row migration 6 made of the
+account's one secret, whose id is the user's — with the user id alone. -/
+def openTotpApp (rootKey : ByteArray) (user : Store.UserId) (app : Int)
+    (sealedSecret : ByteArray) : Except String ByteArray :=
+  match Crypto.«open» (totpKey rootKey) (appAd user app) sealedSecret with
+  | .ok secret => .ok secret
+  | .error e =>
+    if app == user.val then Crypto.«open» (totpKey rootKey) (userAd user) sealedSecret
+    else .error e
 
 /-- The associated data of a secret being enrolled. -/
 def pendingAd (user : Store.UserId) : ByteArray := ("pending " ++ toString user.val).toUTF8
@@ -71,19 +90,31 @@ def be64 (n : Nat) : ByteArray :=
 /-- A big-endian number back. -/
 def ofBe64 (b : ByteArray) : Nat := b.foldl (fun acc x => acc * 256 + x.toNat) 0
 
-/-- Seal a TOTP secret being enrolled, with the time it was issued, for the
-browser to hand back with its first code. -/
-def sealPending (rootKey : ByteArray) (user : Store.UserId) (secret : ByteArray) (now : Nat) :
-    IO ByteArray :=
-  Crypto.«seal» (totpKey rootKey) (pendingAd user) (be64 now ++ secret)
+/-- A secret being enrolled, as `openPending` gives it back. -/
+structure Pending where
+  /-- The new secret. -/
+  secret : ByteArray
+  /-- When it was issued. -/
+  issued : Nat
+  /-- The name the app was to have when it was issued; empty if none. -/
+  name : String
 
-/-- Open a secret being enrolled: the secret and when it was issued, if it
-was sealed for this user by `sealPending`. -/
+/-- Seal a TOTP secret being enrolled, with the time it was issued and the
+name the app is to have, for the browser to hand back with its first code.
+The plaintext is the time in eight bytes, the secret, then the name. -/
+def sealPending (rootKey : ByteArray) (user : Store.UserId) (secret : ByteArray) (now : Nat)
+    (name : String := "") : IO ByteArray :=
+  Crypto.«seal» (totpKey rootKey) (pendingAd user) (be64 now ++ secret ++ name.toUTF8)
+
+/-- Open a secret being enrolled, if it was sealed for this user by
+`sealPending`. -/
 def openPending (rootKey : ByteArray) (user : Store.UserId) (sealedSecret : ByteArray) :
-    Option (ByteArray × Nat) := do
+    Option Pending := do
   let plain ← (Crypto.«open» (totpKey rootKey) (pendingAd user) sealedSecret).toOption
-  guard (plain.size > 8)
-  return (plain.extract 8 plain.size, ofBe64 (plain.extract 0 8))
+  let n := Factor.Totp.secretLength
+  guard (plain.size ≥ 8 + n)
+  let name ← String.fromUTF8? (plain.extract (8 + n) plain.size)
+  return { secret := plain.extract 8 (8 + n), issued := ofBe64 (plain.extract 0 8), name }
 
 /-- The user handle of an account created through an invitation: the HMAC of
 the registration challenge.  The account does not exist while the browser

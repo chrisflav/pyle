@@ -4,13 +4,13 @@ import Pyle.Crypto.Ffi
 /-!
 # Users and their authenticators
 
-The accounts, and what each one signs in with: WebAuthn credentials, a TOTP
-secret and recovery codes (DESIGN.md §1, §3).
+The accounts, and what each one signs in with: WebAuthn credentials,
+authenticator apps (TOTP) and recovery codes (DESIGN.md §1, §3).
 
 The store keeps what the ceremonies need and checks nothing about it: whether
 an assertion is good is `Pyle.WebAuthn`'s question, and this module only
 remembers the answer.  The one exception is the consume-once operations — a
-recovery code is spent, and a TOTP step is used, by a single conditional
+recovery code is spent, and an app's TOTP step is used, by a single conditional
 `UPDATE`, so two requests racing with the same code cannot both succeed.
 -/
 
@@ -218,12 +218,13 @@ def Store.renameCredential (s : Store) (user : UserId) (id : ByteArray) (name : 
   return (← exec c "UPDATE webauthn_credentials SET name = ? WHERE id = ? AND user_id = ?"
     #[name, id, user]) > 0
 
-/-- How many authenticators a user has: WebAuthn credentials, plus one for a
-TOTP secret.  The two-authenticator rule of §1 counts these. -/
+/-- How many authenticators a user has: WebAuthn credentials, plus one for
+each authenticator app.  The two-authenticator rule of §1 counts these. -/
 def countAuthenticators (c : SQLite) (user : UserId) : IO Nat := do
   let creds ← queryOne c "SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?"
     #[user] (colNat · 0)
-  let totp ← queryOne c "SELECT COUNT(*) FROM totp WHERE user_id = ?" #[user] (colNat · 0)
+  let totp ← queryOne c "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?" #[user]
+    (colNat · 0)
   return creds.getD 0 + totp.getD 0
 
 /-- How many authenticators a user has (see `countAuthenticators`). -/
@@ -248,71 +249,127 @@ def Store.removeCredential (s : Store) (user : UserId) (id : ByteArray) (keep : 
   removeAuthenticatorKeeping c user keep <|
     exec c "DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?" #[id, user]
 
-/-! ## TOTP -/
+/-! ## TOTP
 
-/-- A user's TOTP secret, sealed, with its replay and lockout state. -/
-structure TotpRecord where
+An account may have several authenticator apps, each with its own secret
+(migration 6).  Each app keeps the step of the last code it accepted, so the
+replay rule of §3 holds per app; the failure count and the lock of §7 are the
+account's, shared by all its apps. -/
+
+/-- One of a user's authenticator apps: its sealed secret and its replay
+state. -/
+structure TotpApp where
+  /-- The row id, never reused. -/
+  id : Int
   /-- Whose it is. -/
   user : UserId
-  /-- The secret, sealed under the root key (§6.3).  The store never sees it
-  in the clear. -/
+  /-- A name the user gave it. -/
+  name : String
+  /-- The secret, sealed under the root key for this row (§6.3,
+  `Secrets.sealTotpApp`).  The store never sees it in the clear. -/
   sealedSecret : ByteArray
-  /-- The time step of the last code accepted (§3). -/
+  /-- The time step of the last code this app accepted (§3). -/
   lastStep : Option Nat
+  /-- When it was added. -/
+  created : Nat
+  /-- When a code from it last signed in, if one has and that is known. -/
+  lastUsed : Option Nat
+
+/-- The columns of `totp_apps`, in the order `readTotpApp` reads them. -/
+def totpAppColumns : String := "id, user_id, name, secret, last_step, created, last_used"
+
+/-- Read a `totp_apps` row selected with `totpAppColumns`. -/
+def readTotpApp (st : SQLite.Stmt) : IO TotpApp := do
+  return { id := ← colInt st 0, user := ⟨← colInt st 1⟩, name := ← colText st 2,
+           sealedSecret := ← colBlob st 3, lastStep := ← colOpt colNat st 4,
+           created := ← colNat st 5, lastUsed := ← colOpt colNat st 6 }
+
+/-- An account's TOTP lock (§7): consecutive failed codes, whichever app they
+were meant for, and until when TOTP is locked. -/
+structure TotpLock where
   /-- Consecutive failed codes. -/
-  failures : Nat
-  /-- Until when TOTP is locked for this account (§7). -/
-  lockedUntil : Nat
+  failures : Nat := 0
+  /-- Until when TOTP is locked for this account. -/
+  lockedUntil : Nat := 0
+  deriving Repr, BEq, Inhabited
 
-/-- Store (or replace) a user's sealed TOTP secret. -/
-def Store.setTotp (s : Store) (user : UserId) (sealedSecret : ByteArray) (now : Nat) :
-    IO Unit := s.run fun c => do
-  discard <| exec c
-    "INSERT INTO totp (user_id, secret, created) VALUES (?, ?, ?) \
-      ON CONFLICT (user_id) DO UPDATE SET secret = excluded.secret, last_step = NULL, \
-      failures = 0, locked_until = 0, created = excluded.created"
-    #[user, sealedSecret, now]
+/-- Add an authenticator app.  The secret is sealed by `sealFor`, which is given
+the new row's id, so that the sealed secret can be bound to its row; the row
+and its secret are written in one transaction.  `lastStep` is the step of the
+code that confirmed it, which is then used up. -/
+def Store.addTotpApp (s : Store) (user : UserId) (name : String) (lastStep : Option Nat)
+    (now : Nat) (sealFor : Int → IO ByteArray) : IO TotpApp := s.atomically fun c => do
+  let some id ← queryOne c
+      "INSERT INTO totp_apps (user_id, name, secret, last_step, created) \
+        VALUES (?, ?, X'', ?, ?) RETURNING id"
+      #[user, name, Value.opt lastStep, now] (colInt · 0)
+    | throw (.userError "store: the new authenticator app was not returned")
+  let sealedSecret ← sealFor id
+  discard <| exec c "UPDATE totp_apps SET secret = ? WHERE id = ?" #[sealedSecret, id]
+  return { id, user, name, sealedSecret, lastStep, created := now, lastUsed := none }
 
-/-- A user's TOTP record. -/
-def Store.findTotp (s : Store) (user : UserId) : IO (Option TotpRecord) := s.run fun c =>
-  queryOne c "SELECT user_id, secret, last_step, failures, locked_until FROM totp \
-      WHERE user_id = ?" #[user] fun st => do
-    return { user := ⟨← colInt st 0⟩, sealedSecret := ← colBlob st 1,
-             lastStep := ← colOpt colNat st 2, failures := ← colNat st 3,
-             lockedUntil := ← colNat st 4 }
+/-- A user's authenticator apps, oldest first. -/
+def Store.listTotpApps (s : Store) (user : UserId) : IO (Array TotpApp) := s.run fun c =>
+  query c s!"SELECT {totpAppColumns} FROM totp_apps WHERE user_id = ? ORDER BY id" #[user]
+    readTotpApp
 
-/-- Remove a user's TOTP secret, under the same rule as `removeCredential`:
-not if it would leave fewer than `keep` authenticators.  Whether it was
-removed. -/
-def Store.removeTotp (s : Store) (user : UserId) (keep : Nat := 2) : IO Bool :=
+/-- One of a user's authenticator apps, by id. -/
+def Store.findTotpApp (s : Store) (user : UserId) (id : Int) : IO (Option TotpApp) :=
+  s.run fun c => queryOne c
+    s!"SELECT {totpAppColumns} FROM totp_apps WHERE id = ? AND user_id = ?" #[id, user]
+    readTotpApp
+
+/-- Rename one of a user's authenticator apps.  Whether it was theirs. -/
+def Store.renameTotpApp (s : Store) (user : UserId) (id : Int) (name : String) : IO Bool :=
+  s.run fun c => return (← exec c "UPDATE totp_apps SET name = ? WHERE id = ? AND user_id = ?"
+    #[name, id, user]) > 0
+
+/-- Remove one of a user's authenticator apps, under the same rule as
+`removeCredential`: not if it would leave fewer than `keep` authenticators.
+Whether it was removed. -/
+def Store.removeTotpApp (s : Store) (user : UserId) (id : Int) (keep : Nat := 2) : IO Bool :=
   s.atomically fun c =>
     removeAuthenticatorKeeping c user keep <|
-      exec c "DELETE FROM totp WHERE user_id = ?" #[user]
+      exec c "DELETE FROM totp_apps WHERE id = ? AND user_id = ?" #[id, user]
 
-/-- Record an accepted code for time step `step`.  Applies only if `step` is
-strictly later than the last accepted one and TOTP is not locked, in one
-conditional `UPDATE`; that is the replay rule of §3 enforced where two
-concurrent requests cannot both pass it.  Whether it applied. -/
-def Store.acceptTotpStep (s : Store) (user : UserId) (step now : Nat) : IO Bool :=
-  s.run fun c => do
+/-- An account's TOTP lock; an account that has never failed has none
+recorded, which is no failures and no lock. -/
+def Store.totpLock (s : Store) (user : UserId) : IO TotpLock := s.run fun c => do
+  let l ← queryOne c "SELECT failures, locked_until FROM totp_lock WHERE user_id = ?" #[user]
+    fun st => return ({ failures := ← colNat st 0, lockedUntil := ← colNat st 1 } : TotpLock)
+  return l.getD {}
+
+/-- Record a code accepted by app `app` for time step `step`.  Applies only if
+the app is the user's, `step` is strictly later than the last step that app
+accepted, and the account's TOTP is not locked, in one conditional `UPDATE`;
+that is the replay rule of §3, per app, enforced where two concurrent requests
+cannot both pass it.  An accepted code clears the account's failures.  Whether
+it applied. -/
+def Store.acceptTotpStep (s : Store) (user : UserId) (app : Int) (step now : Nat) : IO Bool :=
+  s.atomically fun c => do
     let n ← exec c
-      "UPDATE totp SET last_step = ?, failures = 0 \
-        WHERE user_id = ? AND (last_step IS NULL OR last_step < ?) AND locked_until <= ?"
-      #[step, user, step, now]
+      "UPDATE totp_apps SET last_step = ?, last_used = ? \
+        WHERE id = ? AND user_id = ? AND (last_step IS NULL OR last_step < ?) \
+        AND NOT EXISTS (SELECT 1 FROM totp_lock WHERE user_id = ? AND locked_until > ?)"
+      #[step, now, app, user, step, user, now]
+    if n > 0 then
+      discard <| exec c "UPDATE totp_lock SET failures = 0 WHERE user_id = ?" #[user]
     return n > 0
 
-/-- Record a failed code.  After `maxFailures` consecutive failures TOTP is
+/-- Record a failed code for an account, once for the attempt however many
+apps it was checked against.  After `maxFailures` consecutive failures TOTP is
 locked for `lockSeconds` and the count starts again (§7: five, fifteen
 minutes).  Returns the time it is locked until, if it now is. -/
 def Store.recordTotpFailure (s : Store) (user : UserId) (now : Nat)
     (maxFailures : Nat := 5) (lockSeconds : Nat := 900) : IO (Option Nat) :=
   s.atomically fun c => do
     let some failures ← queryOne c
-        "UPDATE totp SET failures = failures + 1 WHERE user_id = ? RETURNING failures"
+        "INSERT INTO totp_lock (user_id, failures) VALUES (?, 1) \
+          ON CONFLICT (user_id) DO UPDATE SET failures = failures + 1 RETURNING failures"
         #[user] (colNat · 0)
       | return none
     if failures ≥ maxFailures then
-      discard <| exec c "UPDATE totp SET failures = 0, locked_until = ? WHERE user_id = ?"
+      discard <| exec c "UPDATE totp_lock SET failures = 0, locked_until = ? WHERE user_id = ?"
         #[now + lockSeconds, user]
       return some (now + lockSeconds)
     return none
@@ -341,6 +398,12 @@ def Store.unspentRecoveryCodes (s : Store) (user : UserId) : IO Nat := s.run fun
   return (← queryOne c
     "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND spent_at IS NULL"
     #[user] (colNat · 0)).getD 0
+
+/-- How many recovery codes a user has, spent or not: the ten of the last
+set made, or none. -/
+def Store.recoveryCodeCount (s : Store) (user : UserId) : IO Nat := s.run fun c => do
+  return (← queryOne c "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?" #[user]
+    (colNat · 0)).getD 0
 
 end Store
 end Pyle

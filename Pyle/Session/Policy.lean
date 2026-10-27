@@ -9,20 +9,19 @@ import Pyle.Factor.Password
 /-!
 # The assurance policy
 
-DESIGN §1: a sign-in reaches an assurance level (`Acr`), computed from the
-factors it used, and the session records it; each relying service decides
-what it needs.  The levels, lowest first:
+DESIGN §1: a session exists only for a *strong* authentication — a WebAuthn
+assertion with user verification, or two factors of distinct kinds — and it
+records the assurance level (`Acr`) that authentication reached, computed
+from its factors.  The levels, lowest first:
 
-* `sfa` — one factor alone: a password (only where `allowPasswords` is on), or
-  a WebAuthn assertion without user verification (a security key touched,
-  with no PIN or fingerprint);
 * `mfa` — two factors of distinct kinds;
 * `phr` — a WebAuthn assertion with user verification;
 * `phrh` — the same from a credential that is not backup-eligible, so its key
   is held by the authenticator and never synced.
 
-A TOTP code alone and a recovery code alone reach no level at all: they are
-only ever a second factor.
+One factor alone that is not phishing-resistant — a password, a security key
+without user verification, a TOTP code, a recovery code — produces no session
+at all: it is only a step.
 
 The policy is enforced by a type rather than by a check each handler must
 remember (§9.3, in the style of kleis's `AuthorizedRequest`):
@@ -48,9 +47,10 @@ A session row keeps the `amr` of the authentication, and the session's level
 is read back from it (`Session.level`, `Acr.ofAmr`).  `level_eq_ofAmr` proves
 that this gives exactly the level the factors reach, so the level recorded is
 the level justified.  The theorems at the end say what the policy rules out
-and what each level needs: TOTP alone and a recovery code alone give no
-authentication (`totp_alone`, `recovery_alone`); `sfa` comes only from a
-password or a security key without user verification, alone (`level_sfa`);
+and what each level needs: one factor that is not phishing-resistant, or two
+of the same kind, or two users', is no authentication (`password_alone`,
+`key_alone`, `totp_alone`, `recovery_alone`, `ofFactors_*`); every
+authentication is phishing-resistant or has two kinds of factor (`strong`);
 `phr` needs WebAuthn with user verification (`level_phr`), and `phrh` the
 same from a device-bound credential (`level_phrh`).
 
@@ -95,14 +95,6 @@ inductive FactorKind where
   | password
   deriving DecidableEq, Repr
 
-/-- Whether a factor of this kind may be used alone, at `sfa`: a WebAuthn
-assertion or a password, but never a TOTP code or a recovery code. -/
-def FactorKind.alone : FactorKind → Bool
-  | .webauthn => true
-  | .password => true
-  | .totp => false
-  | .recovery => false
-
 /-- Evidence that one factor was checked for one user.  Only the checks in
 this file make these. -/
 structure Factor where private mk ::
@@ -138,20 +130,25 @@ def TwoKinds (fs : List Factor) : Prop := ∃ f ∈ fs, ∃ g ∈ fs, f.kind ≠
 instance (fs : List Factor) : Decidable (TwoKinds fs) := by
   unfold TwoKinds; infer_instance
 
+/-- The policy of DESIGN §1, over the factors of one sign-in: one WebAuthn
+assertion with user verification, or two factors of distinct kinds. -/
+def Satisfies (fs : List Factor) : Prop := (∃ f ∈ fs, f.PhishingResistant) ∨ TwoKinds fs
+
+instance (fs : List Factor) : Decidable (Satisfies fs) := by
+  unfold Satisfies; infer_instance
+
 /-- The level factors reach (DESIGN §1): `phrh` with a phishing-resistant
 factor from a device-bound credential, `phr` with any phishing-resistant
-factor, `mfa` with two kinds of factor, and `sfa` otherwise. -/
+factor, and `mfa` otherwise — which, for factors the policy admits, means two
+kinds of factor. -/
 def level (fs : List Factor) : Acr :=
   if ∃ f ∈ fs, f.HardwareBound then .phrh
   else if ∃ f ∈ fs, f.PhishingResistant then .phr
-  else if TwoKinds fs then .mfa
-  else .sfa
+  else .mfa
 
-/-- The factors the policy admits as one authentication: at least one, each
-kind at most once, and, if they reach only `sfa`, a kind that may stand
-alone. -/
-def Admissible (fs : List Factor) : Prop :=
-  fs ≠ [] ∧ (fs.map (·.kind)).Nodup ∧ (level fs = .sfa → ∀ f ∈ fs, f.kind.alone = true)
+/-- The factors the policy admits as one authentication: they satisfy the
+policy, and use each kind of factor at most once. -/
+def Admissible (fs : List Factor) : Prop := Satisfies fs ∧ (fs.map (·.kind)).Nodup
 
 instance (fs : List Factor) : Decidable (Admissible fs) := by
   unfold Admissible; infer_instance
@@ -220,73 +217,39 @@ theorem ofFactors_factors {fs : List Factor} {a : Authentication}
     · cases h; rfl
     · cases h
 
-/-- One factor alone reaches `sfa` unless it is phishing-resistant. -/
-theorem level_single {f : Factor} (h : ¬ f.PhishingResistant) : level [f] = .sfa := by
-  have h1 : ¬ ∃ g ∈ [f], g.HardwareBound := by
-    rintro ⟨g, hg, hk, hv, -⟩
-    simp only [List.mem_singleton] at hg
-    exact h (hg ▸ ⟨hk, hv⟩)
-  have h2 : ¬ ∃ g ∈ [f], g.PhishingResistant := by
-    rintro ⟨g, hg, hp⟩
-    simp only [List.mem_singleton] at hg
-    exact h (hg ▸ hp)
-  have h3 : ¬ TwoKinds [f] := by
-    rintro ⟨g, hg, g', hg', hne⟩
-    simp only [List.mem_singleton] at hg hg'
-    exact hne (by rw [hg, hg'])
-  simp only [level, if_neg h1, if_neg h2, if_neg h3]
-
-/-- One factor of a kind that may not stand alone is no authentication. -/
-theorem ofFactors_single_not_alone {f : Factor} (h : f.kind.alone = false) :
+/-- One factor that is not a WebAuthn assertion with user verification is no
+authentication. -/
+theorem ofFactors_single {f : Factor} (h : ¬ f.PhishingResistant) :
     Authentication.ofFactors [f] = none := by
-  have hp : ¬ f.PhishingResistant := fun ⟨hk, _⟩ => by rw [hk] at h; cases h
   simp only [Authentication.ofFactors]
   rw [dif_neg]
-  rintro ⟨⟨-, -, hs⟩, -⟩
-  have := hs (level_single hp) f (by simp)
-  rw [h] at this
-  cases this
+  rintro ⟨⟨hs, -⟩, -⟩
+  rcases hs with ⟨g, hg, hp⟩ | ⟨g, hg, g', hg', hne⟩
+  · simp only [List.mem_singleton] at hg
+    exact h (hg ▸ hp)
+  · simp only [List.mem_singleton] at hg hg'
+    exact hne (by rw [hg, hg'])
+
+/-- **A password alone never yields a session.** -/
+theorem password_alone {f : Factor} (h : f.kind = .password) :
+    Authentication.ofFactors [f] = none :=
+  ofFactors_single fun hp => by simp [Factor.PhishingResistant, h] at hp
+
+/-- **A security key without user verification alone never yields a
+session.** -/
+theorem key_alone {f : Factor} (hv : f.userVerified = false) :
+    Authentication.ofFactors [f] = none :=
+  ofFactors_single fun hp => by simp [Factor.PhishingResistant, hv] at hp
 
 /-- **A TOTP code alone never yields a session.** -/
 theorem totp_alone {f : Factor} (h : f.kind = .totp) :
     Authentication.ofFactors [f] = none :=
-  ofFactors_single_not_alone (by rw [h]; rfl)
+  ofFactors_single fun hp => by simp [Factor.PhishingResistant, h] at hp
 
 /-- **A recovery code alone never yields a session.** -/
 theorem recovery_alone {f : Factor} (h : f.kind = .recovery) :
     Authentication.ofFactors [f] = none :=
-  ofFactors_single_not_alone (by rw [h]; rfl)
-
-/-- One factor of a kind that may stand alone is an authentication, at the
-level it reaches. -/
-theorem ofFactors_single_alone {f : Factor} (h : f.kind.alone = true) :
-    ∃ a, Authentication.ofFactors [f] = some a ∧ a.factors = [f] := by
-  simp only [Authentication.ofFactors]
-  rw [dif_pos]
-  · exact ⟨_, rfl, rfl⟩
-  · refine ⟨⟨by simp, by simp, fun _ g hg => ?_⟩, fun g hg => ?_⟩
-    · simp only [List.mem_singleton] at hg
-      rw [hg]; exact h
-    · simp only [List.mem_singleton] at hg
-      rw [hg]
-
-/-- **A password alone signs in at `sfa`** (where passwords are allowed at
-all: `checkPassword` makes no factor otherwise). -/
-theorem password_alone {f : Factor} (h : f.kind = .password) :
-    ∃ a, Authentication.ofFactors [f] = some a ∧ a.level = .sfa := by
-  obtain ⟨a, ha, hf⟩ := ofFactors_single_alone (f := f) (by rw [h]; rfl)
-  refine ⟨a, ha, ?_⟩
-  simp only [Authentication.level, hf]
-  exact level_single fun ⟨hk, _⟩ => by rw [h] at hk; cases hk
-
-/-- **A security key touched without user verification signs in at
-`sfa`.** -/
-theorem key_alone {f : Factor} (hk : f.kind = .webauthn) (hv : f.userVerified = false) :
-    ∃ a, Authentication.ofFactors [f] = some a ∧ a.level = .sfa := by
-  obtain ⟨a, ha, hf⟩ := ofFactors_single_alone (f := f) (by rw [hk]; rfl)
-  refine ⟨a, ha, ?_⟩
-  simp only [Authentication.level, hf]
-  exact level_single fun ⟨_, hv'⟩ => by rw [hv] at hv'; cases hv'
+  ofFactors_single fun hp => by simp [Factor.PhishingResistant, h] at hp
 
 /-- Two factors of the same kind are no authentication: two passwords, or the
 same security key twice, are one factor. -/
@@ -294,7 +257,7 @@ theorem ofFactors_same_kind {f g : Factor} (hk : f.kind = g.kind) :
     Authentication.ofFactors [f, g] = none := by
   simp only [Authentication.ofFactors]
   rw [dif_neg]
-  rintro ⟨⟨-, hn, -⟩, -⟩
+  rintro ⟨⟨-, hn⟩, -⟩
   simp [hk] at hn
 
 /-- Factors of two different users are no authentication, whatever they
@@ -306,48 +269,11 @@ theorem ofFactors_two_users {f g : Factor} (h : f.user ≠ g.user) :
   intro ⟨_, hu⟩
   exact h (hu g (by simp)).symm
 
-/-- Factors of distinct kinds reach at least `mfa`. -/
-theorem mfa_le_level {fs : List Factor} (h : TwoKinds fs) : Acr.mfa ≤ level fs := by
-  unfold level
-  by_cases h1 : ∃ f ∈ fs, f.HardwareBound
-  · rw [if_pos h1]; decide
-  · rw [if_neg h1]
-    by_cases h2 : ∃ f ∈ fs, f.PhishingResistant
-    · rw [if_pos h2]; decide
-    · rw [if_neg h2, if_pos h]; exact Acr.le_refl _
-
-/-- **`sfa` comes only from one factor that may stand alone**: a password, or
-a WebAuthn assertion without user verification. -/
-theorem level_sfa (a : Authentication) (h : a.level = .sfa) :
-    ∃ f, a.factors = [f] ∧
-      (f.kind = .password ∨ (f.kind = .webauthn ∧ f.userVerified = false)) := by
-  have h' : level a.factors = .sfa := h
-  obtain ⟨hne, hn, halone⟩ := a.admissible
-  have hp : ¬ ∃ f ∈ a.factors, f.PhishingResistant := by
-    intro hp
-    unfold level at h'
-    by_cases h1 : ∃ f ∈ a.factors, f.HardwareBound
-    · rw [if_pos h1] at h'; cases h'
-    · rw [if_neg h1, if_pos hp] at h'; cases h'
-  have ht : ¬ TwoKinds a.factors := fun ht => by
-    have := mfa_le_level ht
-    rw [h'] at this
-    exact absurd this (by decide)
-  have hall := halone h'
-  clear halone h h'
-  generalize a.factors = fs at hne hn hall hp ht ⊢
-  rcases fs with _ | ⟨f, _ | ⟨g, rest⟩⟩
-  · exact absurd rfl hne
-  · refine ⟨f, rfl, ?_⟩
-    have hf := hall f (by simp)
-    have hpf : ¬ f.PhishingResistant := fun hpf => hp ⟨f, by simp, hpf⟩
-    revert hf hpf
-    obtain ⟨u, k, uv, be, l⟩ := f
-    cases k <;> cases uv <;> simp [FactorKind.alone, Factor.PhishingResistant]
-  · exfalso
-    apply ht
-    refine ⟨f, by simp, g, by simp, fun hk => ?_⟩
-    simp [hk] at hn
+/-- **Every authentication is strong**: it has a phishing-resistant factor
+or two factors of distinct kinds. -/
+theorem strong (a : Authentication) :
+    (∃ f ∈ a.factors, f.PhishingResistant) ∨ TwoKinds a.factors :=
+  a.admissible.1
 
 /-- **`phr` needs WebAuthn with user verification.** -/
 theorem level_phr (a : Authentication) (h : Acr.phr ≤ a.level) :
@@ -362,7 +288,7 @@ theorem level_phr (a : Authentication) (h : Acr.phr ≤ a.level) :
     · rename_i hp
       obtain ⟨f, hf, hk, hv⟩ := hp
       exact fun _ => ⟨f, hf, hk, hv⟩
-    · split <;> intro h <;> exact absurd h (by decide)
+    · intro h; exact absurd h (by decide)
 
 /-- **`phrh` needs WebAuthn with user verification from a device-bound
 credential** (one that is not backup-eligible). -/
@@ -373,27 +299,19 @@ theorem level_phrh (a : Authentication) (h : a.level = .phrh) :
   split
   · rename_i hh
     exact fun _ => hh
-  · split
-    · nofun
-    · split <;> nofun
+  · split <;> nofun
 
-/-- **`mfa` or better needs a phishing-resistant factor or two kinds of
-factor.** -/
-theorem level_mfa (a : Authentication) (h : Acr.mfa ≤ a.level) :
-    (∃ f ∈ a.factors, f.PhishingResistant) ∨ TwoKinds a.factors := by
-  revert h
-  simp only [Authentication.level, level]
-  split
-  · rename_i hh
-    obtain ⟨f, hf, hk, hv, -⟩ := hh
-    exact fun _ => .inl ⟨f, hf, hk, hv⟩
-  · split
-    · rename_i hp
-      exact fun _ => .inl hp
-    · split
-      · rename_i ht
-        exact fun _ => .inr ht
-      · intro h; cases h
+/-- An authentication at `mfa` has two kinds of factor: its level is `mfa`
+only when no factor is phishing-resistant. -/
+theorem level_mfa (a : Authentication) (h : a.level = .mfa) : TwoKinds a.factors := by
+  rcases strong a with ⟨f, hf, hp⟩ | ht
+  · exfalso
+    revert h
+    simp only [Authentication.level, level]
+    split
+    · nofun
+    · rw [if_pos ⟨f, hf, hp⟩]; nofun
+  · exact ht
 
 /-! ## The level read back from the `amr` -/
 
@@ -473,13 +391,6 @@ theorem level_eq_ofAmr {fs : List Factor} (hn : (fs.map (·.kind)).Nodup) :
       · exact h
       · exact absurd h (by decide)
     · exact .inl
-  have hm : "mfa" ∈ amr fs ↔ TwoKinds fs := by
-    simp only [mem_amr]
-    constructor
-    · rintro (⟨f, -, hf⟩ | ⟨-, h⟩)
-      · exact absurd hf mfa_not_mem_amr
-      · exact h
-    · exact fun h => .inr ⟨by trivial, h⟩
   have e1 : ("user" ∈ amr fs ∧ "hwk" ∈ amr fs) ↔ ∃ f ∈ fs, f.HardwareBound := by
     rw [hu, hh]
     constructor
@@ -508,23 +419,20 @@ theorem level_eq_ofAmr {fs : List Factor} (hn : (fs.map (·.kind)).Nodup) :
     by_cases h2 : ∃ f ∈ fs, f.PhishingResistant
     · rw [if_pos ((e2 h1).mpr h2), if_pos h2]
     · rw [if_neg (fun h => h2 ((e2 h1).mp h)), if_neg h2]
-      by_cases h3 : TwoKinds fs
-      · rw [if_pos (hm.mpr h3), if_pos h3]
-      · rw [if_neg (fun h => h3 (hm.mp h)), if_neg h3]
 
 /-- **The level a session records is the level its authentication reached**:
 a session keeps the `amr` (`establish`, `stepUp`), and `Session.level` reads
 the level back from it. -/
 theorem Authentication.level_eq_ofAmr (a : Authentication) : Acr.ofAmr a.amr = a.level :=
-  Policy.level_eq_ofAmr a.admissible.2.1
+  Policy.level_eq_ofAmr a.admissible.2
 /-! ## The checks
 
 Each check does everything that makes its factor good once: there is no way
 to obtain a `Factor` without the store recording that it was used. -/
 
 /-- The WebAuthn relying party of a configuration.  User verification is not
-required by the ceremony itself: an assertion without it is a factor that
-reaches only `sfa` alone, and the policy decides. -/
+required by the ceremony itself: an assertion without it is a factor, just not
+one that suffices alone, and the policy decides. -/
 def relyingParty (c : Config) (requireUserVerification : Bool := false) :
     WebAuthn.RelyingParty :=
   { id := c.rpId, origins := c.origins, requireUserVerification }

@@ -17,8 +17,8 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
 * `pyle client add <id> --redirect <uri>… [--public] [--scope <s>]… [--name <n>]
   [--rs256] [--post-logout <uri>]… [--min-acr <level>]` registers an OpenID
   Connect client and prints its secret, once.  `--min-acr` is the lowest level
-  a session must reach to sign in to it: `sfa`, `mfa` (the default), `phr` or
-  `phrh`, or the identifier of one.
+  a session must reach to sign in to it: `mfa` (the default), `phr` or `phrh`,
+  or the identifier of one.
 * `pyle client list` and `pyle client remove <id>`.
 * `pyle keys rotate [es256|rs256|biscuit]` promotes the waiting next key of
   each named use (all three by default) and announces a fresh one.
@@ -39,7 +39,7 @@ def usage : String :=
   "                                    print a link that creates an account\n" ++
   "  audit verify                      check the audit log's hash chain\n" ++
   "  client add <id> --redirect <uri>... [--public] [--scope <s>]... [--name <n>]\n" ++
-  "             [--rs256] [--post-logout <uri>]... [--min-acr sfa|mfa|phr|phrh]\n" ++
+  "             [--rs256] [--post-logout <uri>]... [--min-acr mfa|phr|phrh]\n" ++
   "                                    register an OpenID Connect client\n" ++
   "  client list                       list the clients\n" ++
   "  client remove <id>                remove a client and its tokens\n" ++
@@ -117,10 +117,10 @@ def clientAdd (path : System.FilePath) (id : String)
     (minAcr : Option String) : IO UInt32 := do
   let minAcr ← match minAcr with
     | none => pure Acr.mfa
-    | some m => match Acr.ofName? m with
+    | some m => match Acr.ofIdentifier? m with
       | some a => pure a
       | none =>
-        IO.eprintln s!"pyle: '{m}' is not a level (sfa, mfa, phr or phrh)"
+        IO.eprintln s!"pyle: '{m}' is not a level (mfa, phr or phrh)"
         return 2
   let store ← openStore path
   let settings : Store.ClientSettings :=

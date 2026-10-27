@@ -21,8 +21,8 @@ What an OpenID Connect client learns about the user (OpenID Connect Core
   (`AcrRequest.claim`);
 * `pyle_account_acr` — the strongest level the account could sign in at,
   given what it has registered (`Acr.Capabilities.level`), so that a service
-  can tell an account that only has a password from one that chose to use it;
-  absent for an account that has nothing that may sign in alone;
+  can tell an account that has no passkey from one that chose not to use it;
+  absent for an account that could not sign in again;
 * `name` and `groups` — the account's name when the scope includes `profile`,
   its groups when it includes `groups`.
 

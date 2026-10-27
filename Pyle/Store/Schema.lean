@@ -290,8 +290,7 @@ def migration5 : Migration where
   statements := [
     "ALTER TABLE clients ADD COLUMN min_acr TEXT NOT NULL
        DEFAULT 'https://refeds.org/profile/mfa'
-       CHECK (min_acr IN ('https://refeds.org/profile/sfa', 'https://refeds.org/profile/mfa',
-         'phr', 'phrh'))",
+       CHECK (min_acr IN ('https://refeds.org/profile/mfa', 'phr', 'phrh'))",
     "ALTER TABLE webauthn_credentials ADD COLUMN user_verified INTEGER NOT NULL DEFAULT 0",
     "UPDATE webauthn_credentials SET user_verified = 1 WHERE created =
        (SELECT created FROM users u WHERE u.id = webauthn_credentials.user_id)",

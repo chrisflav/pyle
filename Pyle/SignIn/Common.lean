@@ -197,12 +197,9 @@ def authenticationFailed : Reply :=
 def signInRequired : Reply :=
   Reply.error .unauthorized "sign_in_required" "sign in first"
 
-/-- `403`, for a change that needs a step-up within the window, at level
-`need` or better; the level is in the answer's `acr`, as a short name, for the
-page to ask for. -/
-def stepUpRequired (need : Acr) : Reply :=
-  .json (Json.mkObj [("error", "step_up_required"),
-    ("error_description", "confirm it is you first"), ("acr", need.shortName)]) .forbidden
+/-- `403`, for a change that needs a step-up within the window. -/
+def stepUpRequired : Reply :=
+  Reply.error .forbidden "step_up_required" "confirm it is you first"
 
 /-- The body as JSON, or the `400` to answer.  An empty body is `{}`. -/
 def jsonBody (r : Req) : Except Reply Json :=
@@ -236,45 +233,18 @@ def requireSession (ctx : Ctx) (r : Req) : IO (Except Reply Session) := do
   | some s => return .ok s
   | none => return .error signInRequired
 
-/-- The level a change to a user's account needs (DESIGN §4): the account's
-own best level or `mfa`, whichever is lower (`Acr.Capabilities.changeLevel`). -/
-def changeLevel (ctx : Ctx) (user : UserId) : IO Acr :=
-  return (← Policy.capabilities ctx user).changeLevel
-
-/-- The request's session if it authenticated within the step-up window at
-the level a change to the account needs (`changeLevel`), or the `401` or `403`
-to answer. -/
+/-- The request's session if it authenticated within the step-up window, or
+the `401` or `403` to answer. -/
 def requireStepUp (ctx : Ctx) (r : Req) : IO (Except Reply Session) := do
   match ← Session.current ctx r with
   | none => return .error signInRequired
   | some s =>
-    let need ← changeLevel ctx s.user
-    if Session.authenticatedWithin s (← ctx.clock) stepUpSeconds && s.level.satisfies need then
-      return .ok s
-    return .error (stepUpRequired need)
+    if Session.authenticatedWithin s (← ctx.clock) stepUpSeconds then return .ok s
+    return .error stepUpRequired
 
 /-- The name of a session's user, for the audit log. -/
 def userName (ctx : Ctx) (u : UserId) : IO (Option String) :=
   return (← ctx.store.findUser u).map (·.name)
-
-/-! ## Passwords -/
-
-/-- The shortest password accepted, in characters: REFEDS SFA Profile 1.0
-§4.1.1 asks twelve of a memorised secret drawn from the letters alone. -/
-def minPasswordLength : Nat := 12
-
-/-- The longest, so that hashing one costs a bounded amount. -/
-def maxPasswordLength : Nat := 1024
-
-/-- Why a new password is not acceptable, if it is not. -/
-def passwordProblem (pw : String) : Option Reply :=
-  if pw.length < minPasswordLength then
-    some (Reply.error .badRequest "password_too_short"
-      s!"a password has at least {minPasswordLength} characters")
-  else if pw.length > maxPasswordLength then
-    some (Reply.error .badRequest "password_too_long"
-      s!"a password has at most {maxPasswordLength} characters")
-  else none
 
 /-! ## Registration -/
 

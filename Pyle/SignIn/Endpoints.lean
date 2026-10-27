@@ -20,24 +20,21 @@ on its own, `phrh` from a device-bound credential.
 
 **Security keys and codes.**  `begin` with a name lists that account's
 credentials, for a security key that cannot be discovered or does not verify
-the user; such an assertion is one factor, reaching `sfa` alone and `mfa`
-with a TOTP code, a recovery code or a password.  The list is padded to a
-fixed length with ids derived from the name, so the answer has the same shape
-whether the name exists or not.
-`/signin/codes` signs in with a password alone (`sfa`, where passwords are
-allowed), or with two of a password, a TOTP code and a recovery code
-(`mfa`); a TOTP code or a recovery code alone is refused before anything is
-checked.
+the user; such an assertion is one factor, and `finish` needs a TOTP code, a
+recovery code or a password with it, which makes it `mfa`.  The list is
+padded to a fixed length with ids derived from the name, so the answer has the
+same shape whether the name exists or not.
+`/signin/codes` signs in with two of a password, a TOTP code and a recovery
+code (`mfa`); given fewer than two it refuses before checking anything, so a
+password alone is never even tried.
 
 **The level asked for.**  A body may name the level the sign-in must reach,
-as `acr` (a short name or an identifier, `Acr.ofName?`); the sign-in page
-passes on the one a service asked for.  Factors that cannot reach it are
-refused before they are checked when that can be told in advance — a code
-form at `phr`, a password alone at `mfa` — and otherwise after, without a
-session: `401 second_factor_required` when a second factor would make it
-`mfa`, `401 stronger_authentication_required` when only a passkey would do.
-Without `acr`, any level is accepted, and the service that sent the browser
-here asks again if it needs more.
+as `acr` (a short name or an identifier, `Acr.ofIdentifier?`); the sign-in
+page passes on the one a service asked for.  Every sign-in is at least `mfa`,
+so only `phr` and `phrh` can fall short: the code form and a security key
+without user verification are refused before any second factor is checked,
+and an assertion that verified the user but is not device-bound after, with
+`401 stronger_authentication_required` and no session.
 
 **Step-up.**  `/signin/stepup/*` re-authenticates the request's session
 (§4) without ending it.  Every finish does the same when the request already
@@ -118,12 +115,12 @@ def checkExtras (ctx : Ctx) (r : Req) (user : User) (e : Extras) :
     | none => return .error ("recovery", "wrong or spent recovery code")
   return .ok factors
 
-/-- The level a body asks the sign-in to reach, `sfa` (anything) if it names
+/-- The level a body asks the sign-in to reach, `mfa` (anything) if it names
 none; the `400` to answer if it names a level pyle does not know. -/
 def wantOf (j : Json) : Except Reply Acr :=
   match strField j "acr" with
-  | none => .ok .sfa
-  | some s => match Acr.ofName? s with
+  | none => .ok .mfa
+  | some s => match Acr.ofIdentifier? s with
     | some a => .ok a
     | none => .error (badRequest "'acr' is not a level pyle knows")
 
@@ -179,7 +176,7 @@ def concludeAndRecord (ctx : Ctx) (r : Req) (event : Audit.Event) (who : String)
     return c.reply
 
 /-- `401 second_factor_required`: one factor checked out, and it is not
-enough on its own for the level asked for. -/
+enough on its own. -/
 def secondFactorRequired : Reply :=
   Reply.error .unauthorized "second_factor_required"
     "this authenticator needs a second factor: a TOTP code, a recovery code or a password"
@@ -191,10 +188,6 @@ def strongerRequired (want : Acr) : Reply :=
     if want == .phrh then
       "this needs a passkey or security key that verifies you and keeps its key on the device"
     else "this needs a passkey, or a security key that verifies you"
-
-/-- The refusal for an authentication at `got` when `want` was asked for. -/
-def tooWeak (got want : Acr) : Reply :=
-  if want == .mfa && got == .sfa then secondFactorRequired else strongerRequired want
 
 /-- The audit event of a ceremony. -/
 def eventOf (purpose : ChallengePurpose) : Audit.Event :=
@@ -240,16 +233,20 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
       Audit.log ctx r event .failure (factor := some credLabel) (detail := e.reason)
       return authenticationFailed
     | .ok ca =>
-      -- What the assertion reaches alone, and what second factors could
-      -- raise it to.
-      let alone := Policy.level [ca.factor]
+      -- A phishing-resistant assertion stands alone, at its own level;
+      -- any other reaches `mfa` with a second factor, and nothing without.
+      let pr := decide ca.factor.PhishingResistant
       let extras : Extras :=
-        if Acr.phr ≤ alone then { totp := none, recovery := none, password := none } else extras
-      let best := if extras.count > 0 then Acr.max alone .mfa else alone
+        if pr then { totp := none, recovery := none, password := none } else extras
+      let best := if pr then Policy.level [ca.factor] else .mfa
       unless best.satisfies want do
         Audit.log ctx r event .failure (userName := some ca.user.name)
           (factor := some credLabel) (detail := s!"{want.identifier} asked for")
-        return tooWeak best want
+        return strongerRequired want
+      if !pr && extras.count == 0 then
+        Audit.log ctx r event .failure (userName := some ca.user.name)
+          (factor := some credLabel) (detail := "second factor required")
+        return secondFactorRequired
       let mut attempts := [attempt]
       if extras.count > 0 then
         -- The address was counted by `limited` already; the client key here
@@ -269,12 +266,12 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
       | .ok more =>
         let some sa := Authentication.ofFactors (ca.factor :: more)
           | Audit.log ctx r event .failure (userName := some ca.user.name)
-              (factor := some credLabel) (detail := "the factors do not satisfy the policy")
-            return authenticationFailed
+              (factor := some credLabel) (detail := "second factor required")
+            return secondFactorRequired
         unless sa.level.satisfies want do
           Audit.log ctx r event .failure (userName := some ca.user.name)
             (factor := some credLabel) (detail := s!"{want.identifier} asked for")
-          return tooWeak sa.level want
+          return strongerRequired want
         concludeAndRecord ctx r event ca.user.name sa ret stepUpOnly lim attempts
 
 /-- A user name as typed: trimmed and lower-cased, as names are stored. -/
@@ -323,7 +320,7 @@ def beginSignIn : Handler := fun ctx r => do
 /-- `POST /signin/stepup/begin`: options for re-authenticating the request's
 session with one of its user's credentials.  User verification is required
 unless the body asks for `"discouraged"`, for a security key that has none
-(alone, it then reaches only `sfa`). -/
+(it then needs a second factor at finish). -/
 def beginStepUp : Handler := fun ctx r => do
   let j ← match jsonBody r with
     | .ok j => pure j
@@ -339,10 +336,9 @@ def beginStepUp : Handler := fun ctx r => do
     | .error rep => return rep
   return .json (requestOptions ctx ch (creds.toList.map fun c => descriptor c.id c.transports) uv)
 
-/-- `POST /signin/codes`: sign in, or step up, with a password alone or with
-two of a password, a TOTP code and a recovery code.  What cannot reach the
-level the body asks for is refused before anything is checked: one code that
-is not a password, any codes above `mfa`, a password alone above `sfa`. -/
+/-- `POST /signin/codes`: sign in, or step up, with two of a password, a TOTP
+code and a recovery code.  Fewer than two, or a body asking for more than
+`mfa`, is refused before anything is checked. -/
 def signInWithCodes : Handler := fun ctx r => do
   let j ← match jsonBody r with
     | .ok j => pure j
@@ -356,11 +352,10 @@ def signInWithCodes : Handler := fun ctx r => do
     | .ok a => pure a
     | .error rep => return rep
   let extras := extrasOf j
-  if extras.count == 0 || (extras.count == 1 && extras.password.isNone) then
+  if extras.count < 2 then
     return Reply.error .badRequest "two_factors_required"
-      "a password, or two of a password, a TOTP code and a recovery code, are needed"
-  let best := if extras.count ≥ 2 then Acr.mfa else .sfa
-  unless best.satisfies want do return tooWeak best want
+      "two of a password, a TOTP code and a recovery code are needed"
+  unless Acr.mfa.satisfies want do return strongerRequired want
   limited ctx r .signIn (some name) fun lim attempt => do
     let user ← ctx.store.findUserByName name
     let some user := user.filter (!·.disabled)
@@ -379,7 +374,7 @@ def signInWithCodes : Handler := fun ctx r => do
       unless sa.level.satisfies want do
         Audit.log ctx r .signIn .failure (userName := some name)
           (detail := s!"{want.identifier} asked for")
-        return tooWeak sa.level want
+        return strongerRequired want
       concludeAndRecord ctx r .signIn name sa ret false lim [attempt]
 
 end SignIn

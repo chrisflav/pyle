@@ -178,7 +178,7 @@ private def asStrs : Json → Option (List String)
 
 /-- A protected host's entry in `forwardAuthHosts`: its policy as a string,
 or an object `{"policy": …, "minAcr": …}` whose `minAcr` is a level's short
-name or identifier (`Acr.ofName?`).  The policy, and the minimum if one is
+name or identifier (`Acr.ofIdentifier?`).  The policy, and the minimum if one is
 given. -/
 def forwardHost (host : String) : Json → Except String (String × Option Acr)
   | .str policy => .ok (policy, none)
@@ -191,8 +191,8 @@ def forwardHost (host : String) : Json → Except String (String × Option Acr)
     match v.getObjVal? "minAcr" with
     | .error _ => return (policy, none)
     | .ok m =>
-      let some a := (asStr m).bind Acr.ofName?
-        | throw s!"the 'minAcr' of '{host}' is not a level (sfa, mfa, phr or phrh)"
+      let some a := (asStr m).bind Acr.ofIdentifier?
+        | throw s!"the 'minAcr' of '{host}' is not a level (mfa, phr or phrh)"
       return (policy, some a)
   | _ => .error s!"the forward-auth host '{host}' must be a policy or an object with one"
 
@@ -274,8 +274,8 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   let deviceCodeSeconds ← positive "deviceCodeSeconds" 600
   let devicePollSeconds ← positive "devicePollSeconds" 5
   let attestationSeconds ← positive "attestationSeconds" 300
-  let kleisMinAcr ← opt j "kleisMinAcr" Acr.mfa (fun v => (asStr v).bind Acr.ofName?)
-    "a level (sfa, mfa, phr or phrh)"
+  let kleisMinAcr ← opt j "kleisMinAcr" Acr.mfa (fun v => (asStr v).bind Acr.ofIdentifier?)
+    "a level (mfa, phr or phrh)"
   let forwardAuthCookieSeconds ← positive "forwardAuthCookieSeconds" (8 * 3600)
   let hostEntries ← match j.getObjVal? "forwardAuthHosts" with
     | .error _ => pure []

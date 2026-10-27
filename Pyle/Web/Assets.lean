@@ -17,8 +17,7 @@ What the script relies on, and the Lean side provides:
   page adds `data-mode` (`signin` or `stepup`), `data-return`, a return
   address `SignIn.safeReturn` has already accepted, and `data-acr`, the level
   the sign-in must reach, which the script passes on to the endpoints; the
-  account page adds `data-passkey`, whether the account has a credential that
-  verifies the user; the invitation page adds `data-token`.
+  invitation page adds `data-token`.
 * The element ids each page's script looks up are the ones the page writes
   (`Pyle.Web.Pages`), and the JSON members it reads and sends are the ones
   the endpoints document.
@@ -91,7 +90,8 @@ async function post(url, body) {
 function describe(res) {
   const d = res.data || {};
   if (d.error === 'second_factor_required') {
-    return 'This needs a second factor: fill in a code or your password, then try again.';
+    return 'This authenticator needs a second factor: fill in a code or your password, ' +
+      'then try again.';
   }
   return d.error_description || d.error || ('The request failed (' + res.status + ').');
 }
@@ -185,7 +185,7 @@ function secondFactors() {
 // The sign-in page, which also serves step-up.
 function setupSignIn(body) {
   const ret = body.dataset.return || '/account';
-  const acr = body.dataset.acr || 'sfa';
+  const acr = body.dataset.acr || 'mfa';
   const stepUp = body.dataset.mode === 'stepup';
   const beginUrl = stepUp ? '/signin/stepup/begin' : '/signin/webauthn/begin';
   const finishUrl = stepUp ? '/signin/stepup/finish' : '/signin/webauthn/finish';
@@ -215,32 +215,24 @@ function setupSignIn(body) {
 }
 
 // The account page.  A change that needs a recent sign-in answers 403
-// step_up_required, naming the level it needs; then confirm with a passkey,
-// if the account has one, and try once more, or go to the sign-in page, which
-// offers every way in that reaches that level.
+// step_up_required; then confirm with an authenticator and try once more.
 async function stepUpHere() {
   const credential = await getAssertion('/signin/stepup/begin', {});
   const res = await post('/signin/stepup/finish', { credential: credential, return: '/account' });
   if (!res.ok) throw new Error(describe(res));
 }
 
-function signInAgain(acr) {
-  window.location.assign('/signin?return=%2Faccount&max_age=0&acr=' +
-    encodeURIComponent(acr || 'sfa'));
-  return new Error('Confirm it is you on the sign-in page.');
-}
-
 async function act(url, body) {
   let res = await post(url, body);
   if (res.status === 403 && res.data.error === 'step_up_required') {
     say('Confirm it is you first.');
-    if (document.body.dataset.passkey !== 'true') throw signInAgain(res.data.acr);
     try {
       await stepUpHere();
     } catch (e) {
       // No authenticator at hand that verifies the user: the sign-in page
       // offers the other ways.
-      throw signInAgain(res.data.acr);
+      window.location.assign('/signin?return=%2Faccount&max_age=0');
+      throw new Error('Confirm it is you on the sign-in page.');
     }
     res = await post(url, body);
   }
@@ -338,43 +330,22 @@ function setupAccount() {
   });
 }
 
-// The invitation page: create the account with its first way in — a passkey,
-// a security key or a password — say that it worked and how strong it is,
-// and leave signing in to the sign-in page, as a step of its own.
-function levelText(acr) {
-  if (acr === 'phr' || acr === 'phrh') {
-    return 'It can sign in with a passkey, which cannot be phished.';
-  }
-  if (acr === 'https://refeds.org/profile/sfa') {
-    return 'It can only sign in with one factor so far, which many services will not ' +
-      'accept. Add a passkey on your account page.';
-  }
-  return 'Add a passkey on your account page for stronger protection.';
-}
-
+// The invitation page: register the first passkey, say that it worked, and
+// leave signing in with it to the sign-in page, as a step of its own.
 function setupInvite(body) {
   const base = '/invite/' + encodeURIComponent(body.dataset.token);
-  function done(res) {
-    if (!res.ok) throw new Error(describe(res));
-    document.getElementById('invite-form').hidden = true;
-    document.getElementById('invite-done').hidden = false;
-    document.getElementById('invite-level').textContent = levelText(res.data.acr);
-    say('Your account is set up.');
-    document.getElementById('continue-signin').focus();
-  }
-  async function create(kind) {
+  on('create', 'click', async function () {
     try {
-      const begin = await post(base + '/begin', { kind: kind });
+      const begin = await post(base + '/begin', {});
       if (!begin.ok) throw new Error(describe(begin));
       const credential = await createCredential(begin.data);
-      done(await post(base + '/finish', { credential: credential, name: value('passkey-name') }));
-    } catch (e) { failed(e); }
-  }
-  on('create', 'click', function () { create('passkey'); });
-  on('create-key', 'click', function () { create('security-key'); });
-  on('create-password', 'click', async function () {
-    try {
-      done(await post(base + '/password', { password: rawValue('invite-password') }));
+      const res = await post(base + '/finish',
+        { credential: credential, name: value('passkey-name') });
+      if (!res.ok) throw new Error(describe(res));
+      document.getElementById('invite-form').hidden = true;
+      document.getElementById('invite-done').hidden = false;
+      say('Your passkey is registered.');
+      document.getElementById('continue-signin').focus();
     } catch (e) { failed(e); }
   });
   on('continue-signin', 'click', function () {

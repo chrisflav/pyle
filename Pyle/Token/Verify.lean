@@ -48,9 +48,9 @@ structure Identity where
   user : String
   /-- The authentication methods of the sign-in (RFC 8176). -/
   amr : List String
-  /-- The assurance level of the sign-in, as its identifier: `phrh`, `phr`,
-  `https://refeds.org/profile/mfa` or `https://refeds.org/profile/sfa`.  `none`
-  for a token issued before pyle stated levels. -/
+  /-- The assurance level of the sign-in, as its identifier: `phrh`, `phr` or
+  `https://refeds.org/profile/mfa`.  `none` for a token issued before pyle
+  stated levels. -/
   acr : Option String := none
   /-- The strongest level the account could sign in at, when the token was
   issued, if it had one. -/

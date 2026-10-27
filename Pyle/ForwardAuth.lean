@@ -16,8 +16,8 @@ only from a peer listed in `trustedProxies`; anyone else is refused.
 configuration's `forwardAuthHosts` with a policy, evaluated by `lean-biscuit`'s
 authorizer over the facts `user($u)`, `group($g)` (one per group), `host($h)`,
 `path($p)`, `method($m)`, and how the session signed in: `acr($a)`, its level
-as an identifier (`"phrh"`, `"phr"`, `"https://refeds.org/profile/mfa"`,
-`"https://refeds.org/profile/sfa"`), `amr($m)` (one per RFC 8176 value) and
+as an identifier (`"phrh"`, `"phr"` or `"https://refeds.org/profile/mfa"`),
+`amr($m)` (one per RFC 8176 value) and
 `account_acr($a)`, the strongest level the account could reach, if any:
 
 ```json

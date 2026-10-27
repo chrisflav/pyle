@@ -91,7 +91,7 @@ structure Requirements where
   /-- Authenticated within this many seconds. -/
   maxAge : Option Nat := none
   /-- At this level or better. -/
-  level : Acr := .sfa
+  level : Acr := .mfa
 
 /-- Whether a session satisfies the requirements at `now`. -/
 def Requirements.satisfied (q : Requirements) (s : Session) (now : Nat) : Bool :=
@@ -213,7 +213,7 @@ def authorizeParams (ctx : Ctx) (r : Req) (ps : List (String × String)) : IO Re
   if acrReq.essential && acrReq.named && acrReq.values.isEmpty then
     return fail "unmet_authentication_requirements" "pyle knows none of the acr values asked for"
   let settings := (← ctx.store.clientSettings clientId).getD {}
-  let level := Acr.max settings.minAcr (acrReq.level.getD .sfa)
+  let level := Acr.max settings.minAcr (acrReq.level.getD .mfa)
   let now ← ctx.clock
   -- `prompt=login` and `max_age=0` ask for an authentication now.
   let login := prompt.contains "login" || maxAge == some 0
@@ -225,7 +225,7 @@ def authorizeParams (ctx : Ctx) (r : Req) (ps : List (String × String)) : IO Re
     | -- An authentication too old for the request is renewed at sign-in, and the
       -- way back asks only for one no older than now, which the renewed one is,
       -- so the request cannot loop however long sign-in takes.
-      let freshness : Requirements := { req with level := .sfa }
+      let freshness : Requirements := { req with level := .mfa }
       let stale := !session.any (freshness.satisfied · now)
       if prompt.contains "none" then
         if stale then return fail "login_required" "the user must sign in"

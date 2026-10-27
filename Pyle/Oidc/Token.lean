@@ -67,14 +67,14 @@ def codeDecision (row : Option Store.AuthCode) (clientId redirectUri verifier : 
     else if Pkce.verifies verifier a.codeChallenge = false then .badVerifier
     else .issue a
 
-/-- The client's minimum level, if a sign-in with this `amr` falls below it.
-`/authorize` checked it when the code was issued, but the minimum may have been
-raised since — between the code and its exchange, or during the life of a
-refresh-token family — and the token endpoint answers to the minimum as it is
-now. -/
+/-- The client's minimum level, if a sign-in with this `amr` falls below it,
+or reads as no level at all.  `/authorize` checked it when the code was
+issued, but the minimum may have been raised since — between the code and its
+exchange, or during the life of a refresh-token family — and the token
+endpoint answers to the minimum as it is now. -/
 def belowMinimum (ctx : Ctx) (client : Store.Client) (amr : List String) : IO (Option Acr) := do
   let need := ((← ctx.store.clientSettings client.id).getD {}).minAcr
-  return if (Acr.ofAmr amr).satisfies need then none else some need
+  return if (Acr.ofAmr amr).any (·.satisfies need) then none else some need
 
 /-- The `invalid_grant` for a sign-in below the client's minimum. -/
 def tooWeakGrant (need : Acr) : Reply :=

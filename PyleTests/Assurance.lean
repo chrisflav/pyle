@@ -334,10 +334,23 @@ def kleisAssuranceTests : IO Unit := withCtx fun ctx _ => do
   checkEq "an mfa session passes the default" (jsonStr r "error") (some "invalid_request")
   let r ← attest ctx [("Authorization", s!"Bearer {access}")] "/kleis/attest"
   checkEq "and so does its token" (jsonStr r "error") (some "invalid_request")
-  let old : Pyle.Token.Identity := { (default : Pyle.Token.Identity) with user := "alice" }
-  check "a token from before levels counts as mfa" (Pyle.Token.tokenLevel old == .mfa)
+  let old : Pyle.Token.Identity :=
+    { (default : Pyle.Token.Identity) with user := "alice", amr := ["hwk", "otp", "mfa"] }
+  check "a token from before levels is read by its amr" (Pyle.Token.tokenLevel old == some .mfa)
+  check "and one whose amr is no level is no level"
+    (Pyle.Token.tokenLevel { old with amr := ["pwd"] }).isNone
   let stated : Pyle.Token.Identity := { old with acr := some "phr" }
-  check "and a stated level as itself" (Pyle.Token.tokenLevel stated == .phr)
+  check "a stated level is itself" (Pyle.Token.tokenLevel stated == some .phr)
+  check "and a stated level pyle does not know is none"
+    (Pyle.Token.tokenLevel { old with acr := some "gold" }).isNone
+  let now ← ctx.clock
+  let forged ← Pyle.Token.issue ctx.store ctx.rootKey
+    { user := "alice", amr := ["hwk", "user"], acr := "gold", authTime := now, groups := [],
+      client := "agent", audience := ["agent", Pyle.Token.pyleAudience],
+      scopes := ["openid", "kleis"] } now (now + 600)
+  let r ← attest ctx [("Authorization", s!"Bearer {forged}")] "/kleis/attest"
+  checkEq "a token stating an unknown acr gets no attestation"
+    (r.status.toCode, jsonStr r "error") (403, some "insufficient_acr")
   let parse (extra : String) := (Json.parse ("{\"issuer\":\"https://a.example\",\
     \"rpId\":\"a.example\",\"origins\":[\"https://a.example\"]" ++ extra ++ "}")).toOption
     |>.map (Config.ofJson · "/etc/pyle")
@@ -419,8 +432,55 @@ def ignoredExtrasTests : IO Unit := withCtx fun ctx _ => do
     ((replyJson r).getObjValAs? (List String) "amr").toOption (some ["hwk", "user"])
   checkEq "nor counted against TOTP" ((← ctx.store.findTotp una.id).map (·.failures)) (some 0)
 
+/-- Rows whose `amr` reads as no level fail closed: a session, a code, a
+refresh token and a device approval that `Policy` could not have written. -/
+def failClosedTests : IO Unit := withCtx fun ctx clock => do
+  group "assurance: an amr that is no level is refused"
+  let alice ← ctx.store.addUser "alice" [] 1
+  let (secret, _) ← addClients ctx
+  let now ← clock.get
+  let id ← Crypto.randomBytes 32
+  discard <| ctx.store.run fun c => Store.exec c
+    "INSERT INTO sessions (id_hash, user_id, amr, factors, auth_time, created, last_seen, \
+      client_address, user_agent) VALUES (?, ?, ?, '[]', ?, ?, ?, '', '')"
+    #[.blob (Store.SecretHash.of id).bytes, .int alice.id.val, .text "[\"pwd\"]", .int now,
+      .int now, .int now]
+  let cookie := Session.encodeId id
+  check "a session row whose amr is no level is no session"
+    (← Session.current ctx (withCookie cookie)).isNone
+  check "nor listed" (← Session.list ctx alice.id).isEmpty
+  checkEq "so /authorize sends to sign in"
+    ((location (← get ctx (authorizeUrl "app") cookie)).startsWith "/signin?") true
+  -- A code.
+  let code := "a-code-whose-amr-is-no-level"
+  ctx.store.addCode (tokenHash code)
+    { clientId := "app", redirectUri := appRedirect, codeChallenge := pkce.2, user := alice.id,
+      scope := "openid", nonce := none, amr := ["pwd"], authTime := now,
+      expires := now + 60 }
+  checkEq "a code whose amr is no level is refused" (jsonStr (← exchange ctx code secret) "error")
+    (some "invalid_grant")
+  -- A refresh token.
+  let rt := "a-refresh-token-whose-amr-is-no-level"
+  ctx.store.startRefreshFamily (tokenHash rt)
+    { family := ← Crypto.randomBytes 32, clientId := "app", user := alice.id,
+      scope := "openid", amr := ["hwk"], authTime := now, expires := now + 3600 } now
+  let r ← postForm ctx "/token" [("grant_type", "refresh_token"), ("refresh_token", rt)]
+    (basic "app" secret)
+  checkEq "a refresh token whose amr is no level is refused" (jsonStr r "error")
+    (some "invalid_grant")
+  -- A device approval.
+  let d ← deviceCodes ctx
+  let deviceCode := (jsonStr d "device_code").getD ""
+  let userCode := (jsonStr d "user_code").getD ""
+  discard <| ctx.store.decideDeviceCode (Device.normalise userCode |>.getD "")
+    (.approved alice.id ["otp"] now) now
+  clock.modify (· + ctx.config.devicePollSeconds + 1)
+  checkEq "a device approval whose amr is no level is refused"
+    (jsonStr (← pollDevice ctx deviceCode) "error") (some "invalid_grant")
+
 /-- The assurance tests. -/
 def assuranceTests : IO Unit := do
+  failClosedTests
   kleisAssuranceTests
   deviceMinimumTests
   tokenMinimumTests

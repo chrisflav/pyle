@@ -653,7 +653,9 @@ def establishTests : IO Unit := withCtx fun ctx _ => do
   for (amr, level) in [(["hwk", "user"], Acr.phrh), (["swk", "user"], .phr),
       (["swk", "user", "otp", "mfa"], .phr), (["hwk", "otp", "mfa"], .mfa),
       (["pwd", "otp", "mfa"], .mfa)] do
-    check s!"the level of {amr}" (Acr.ofAmr amr == level)
+    check s!"the level of {amr}" (Acr.ofAmr amr == some level)
+  for amr in [["pwd"], ["hwk"], ["swk"], ["otp"], ["rec"], ["user"], ["pwd", "otp"], []] do
+    check s!"{amr} is no level" (Acr.ofAmr amr).isNone
   let synced ← SoftKey.new (backupEligible := true)
   enrol ctx jo synced
   check "a synced passkey is phr" ((← authFor ctx synced).level == .phr)

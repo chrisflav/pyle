@@ -98,16 +98,18 @@ def min (a b : Acr) : Acr := if a ≤ b then a else b
 /-- Whether a sign-in at level `got` meets a demand for level `want`. -/
 def satisfies (got want : Acr) : Bool := decide (want ≤ got)
 
-/-- The level a list of `amr` values (RFC 8176) records: `phrh` with `user`
-and `hwk`, `phr` with `user` and `swk`, and `mfa` otherwise — every other
-authentication pyle accepts has two kinds of factor.
+/-- The level a list of `amr` values (RFC 8176) records, as `Policy` writes
+them: `phrh` with `user` and `hwk`, `phr` with `user` and `swk`, `mfa` with
+`mfa` (two kinds of factor), and none for anything else — `["pwd"]`, `["hwk"]`,
+`["otp"]` or `[]` are no level, and whatever reads them refuses them.
 `Policy.Authentication.level_eq_ofAmr` proves that for every authentication
 pyle accepts this gives back the level its factors reach, so a session, a code
 or a token that keeps the `amr` keeps the level. -/
-def ofAmr (amr : List String) : Acr :=
-  if amr.contains "user" && amr.contains "hwk" then .phrh
-  else if amr.contains "user" && amr.contains "swk" then .phr
-  else .mfa
+def ofAmr (amr : List String) : Option Acr :=
+  if amr.contains "user" && amr.contains "hwk" then some .phrh
+  else if amr.contains "user" && amr.contains "swk" then some .phr
+  else if amr.contains "mfa" then some .mfa
+  else none
 
 /-! ## The order -/
 

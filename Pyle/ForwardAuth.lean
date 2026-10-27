@@ -244,15 +244,14 @@ def setCookie (value : String) (maxAge : Nat) : String :=
 
 /-- The live session a forward-auth request carries: pyle's own cookie, when
 the protected host is pyle's, or a protected host's cookie for `host`. -/
-def sessionOf (ctx : Ctx) (r : Req) (host : String) : IO (Option Store.SessionRow) := do
+def sessionOf (ctx : Ctx) (r : Req) (host : String) : IO (Option Session) := do
   let now ← ctx.clock
-  if let some s ← Session.current ctx r then
-    return some { idHash := s.idHash, user := s.user, amr := s.amr, factors := s.factors,
-                  authTime := s.authTime, created := s.created, lastSeen := s.lastSeen,
-                  clientAddress := s.clientAddress, userAgent := s.userAgent }
+  if let some s ← Session.current ctx r then return some s
   let some value := r.cookie cookieName | return none
   let some hash := decodeCookie (macKey ctx.rootKey) value host now | return none
-  ctx.store.touchSession hash now ctx.config.sessionIdleSeconds ctx.config.sessionAbsoluteSeconds
+  let row ← ctx.store.touchSession hash now ctx.config.sessionIdleSeconds
+    ctx.config.sessionAbsoluteSeconds
+  return row.bind Session.ofRow
 
 /-- The cookie that ties a sign-in begun on a protected host to the browser
 that began it. -/
@@ -337,7 +336,7 @@ def check : Handler := fun ctx r => do
         "WWW-Authenticate" "Cookie"
   let some user ← ctx.store.findUser s.user
     | return Reply.error .unauthorized "login_required" "sign in first"
-  let level := Acr.ofAmr s.amr
+  let level := s.level
   unless level.satisfies (minAcrFor ctx host) do
     if method == "GET" || method == "HEAD" then
       return ← toGrant ctx scheme authority (path ++ query)

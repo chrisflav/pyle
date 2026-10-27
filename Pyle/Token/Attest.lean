@@ -31,9 +31,9 @@ Two routes answer, because they authenticate differently:
 
 Either attests only a sign-in at `kleisMinAcr` or better (`mfa` unless
 configured), and answers `403 insufficient_acr` otherwise: a kleis grant that
-trusts pyle's `user` fact must not be met by a password alone.  A token issued
-before pyle stated levels has no `acr` and counts as `mfa`, which every
-session then reached.
+trusts pyle's `user` fact must not be met by a weaker sign-in.  A token issued
+before pyle stated levels has no `acr`, and its level is read from its `amr`;
+a token whose `acr` pyle does not know is refused (`tokenLevel`).
 
 Either takes a form with `request`, the request in base64url, and answers
 `{"block": …, "public_key": "ed25519/…", "expires": …}`, the block being the
@@ -56,7 +56,8 @@ def decodeRequest (s : String) : Option LeanBiscuit.Proto.ThirdPartyBlockRequest
   (LeanBiscuit.Proto.Schema.decodeThirdPartyBlockRequest bytes).toOption
 
 /-- Attest a user in answer to the request in a form. -/
-def attestReply (ctx : Ctx) (r : Req) (user : Store.User) (amr : List String) : IO Reply := do
+def attestReply (ctx : Ctx) (r : Req) (user : Store.User) (amr : List String) (level : Acr) :
+    IO Reply := do
   let .ok form := r.form | return oauthError "invalid_request" "the body must be a form"
   let some raw := lookupOnce form "request"
     | return oauthError "invalid_request" "request is required"
@@ -65,7 +66,7 @@ def attestReply (ctx : Ctx) (r : Req) (user : Store.User) (amr : List String) : 
   let now ← ctx.clock
   let expires := now + ctx.config.attestationSeconds
   let (contents, key) ← attest ctx.store ctx.rootKey request user.name amr user.groups now expires
-    (Acr.ofAmr amr).identifier
+    level.identifier
   Audit.log ctx r .tokenIssued .success (userName := some user.name) (detail := "kleis attestation")
   return noStore <| Reply.json <| Json.mkObj
     [("block", Json.str (LeanBiscuit.Base64.encode
@@ -77,10 +78,13 @@ def levelTooLow (need : Acr) : Reply :=
   noStore <| Reply.error .forbidden "insufficient_acr"
     s!"a kleis attestation needs a sign-in at {need.identifier} or better"
 
-/-- The level a token states, read as `mfa` for a token from before pyle
-stated levels: every session then was at least that. -/
-def tokenLevel (identity : Identity) : Acr :=
-  (identity.acr.bind Acr.ofIdentifier?).getD .mfa
+/-- The level a token states, if pyle knows it.  A token from before pyle
+stated levels has no `acr`, and its level is read from its `amr` instead
+(`Acr.ofAmr`); a stated `acr` pyle does not know is no level, and refused. -/
+def tokenLevel (identity : Identity) : Option Acr :=
+  match identity.acr with
+  | some a => Acr.ofIdentifier? a
+  | none => Acr.ofAmr identity.amr
 
 /-- `POST /kleis/attest`, with a pyle access token. -/
 def attestBearer : Handler := fun ctx r => do
@@ -91,9 +95,9 @@ def attestBearer : Handler := fun ctx r => do
       return (noStore (Reply.error .forbidden "insufficient_scope"
         "the access token was not granted the kleis scope")).withHeader "WWW-Authenticate"
         "Bearer realm=\"pyle\", error=\"insufficient_scope\", scope=\"kleis\""
-    unless (tokenLevel identity).satisfies ctx.config.kleisMinAcr do
-      return levelTooLow ctx.config.kleisMinAcr
-    attestReply ctx r u identity.amr
+    let some level := tokenLevel identity | return levelTooLow ctx.config.kleisMinAcr
+    unless level.satisfies ctx.config.kleisMinAcr do return levelTooLow ctx.config.kleisMinAcr
+    attestReply ctx r u identity.amr level
 
 /-- `POST /kleis/attest/session`, from a signed-in browser. -/
 def attestSession : Handler := fun ctx r => do
@@ -102,7 +106,7 @@ def attestSession : Handler := fun ctx r => do
   let some u ← ctx.store.findUser s.user
     | return Reply.error .unauthorized "login_required" "sign in first"
   unless s.level.satisfies ctx.config.kleisMinAcr do return levelTooLow ctx.config.kleisMinAcr
-  attestReply ctx r u s.amr
+  attestReply ctx r u s.amr s.level
 
 end Token
 end Pyle

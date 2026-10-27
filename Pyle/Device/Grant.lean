@@ -21,7 +21,8 @@ code while the user approves it in a browser.
   `acr=phr`.  The page shows which client asks and for what before the user
   decides, and the decision is a form `POST`, under the `Origin` check.  The
   tokens issued record the approving session's `amr`, and so its level, and
-  the poll checks that level against the client's minimum once more.
+  the poll checks that level against the client's minimum once more; an `amr`
+  that reads as no level is refused.
 * **Polling** answers `authorization_pending` until a decision, `slow_down` to
   a client polling faster than the interval, `access_denied` once denied,
   `expired_token` once expired; an approved code yields tokens once, with a
@@ -133,7 +134,7 @@ def poll (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × S
       | return oauthError "invalid_grant" "the account is gone"
     if user.disabled then return oauthError "invalid_grant" "the account is disabled"
     let need ← approvalLevel ctx client.id
-    unless (Acr.ofAmr amr).satisfies need do
+    unless (Acr.ofAmr amr).any (·.satisfies need) do
       return oauthError "invalid_grant" s!"the approval was not at {need.identifier} or better"
     let family ← Crypto.randomBytes 32
     let refresh ← startRefresh ctx family client user scope amr authTime none

@@ -367,9 +367,10 @@ theorem mfa_not_mem_amr {f : Factor} : "mfa" ∉ f.amr := by
   cases k <;> cases uv <;> cases be <;> simp [Factor.amr]
 
 /-- **The level read back from the `amr` is the level the factors reach**,
-for factors whose kinds do not repeat — every authentication's. -/
-theorem level_eq_ofAmr {fs : List Factor} (hn : (fs.map (·.kind)).Nodup) :
-    Acr.ofAmr (amr fs) = level fs := by
+for factors that satisfy the policy and whose kinds do not repeat — every
+authentication's. -/
+theorem level_eq_ofAmr {fs : List Factor} (hsat : Satisfies fs)
+    (hn : (fs.map (·.kind)).Nodup) : Acr.ofAmr (amr fs) = some (level fs) := by
   have hu : "user" ∈ amr fs ↔ ∃ f ∈ fs, f.PhishingResistant := by
     simp only [mem_amr, user_mem_amr, Factor.PhishingResistant]
     constructor
@@ -391,6 +392,13 @@ theorem level_eq_ofAmr {fs : List Factor} (hn : (fs.map (·.kind)).Nodup) :
       · exact h
       · exact absurd h (by decide)
     · exact .inl
+  have hm : "mfa" ∈ amr fs ↔ TwoKinds fs := by
+    simp only [mem_amr]
+    constructor
+    · rintro (⟨f, -, hf⟩ | ⟨-, h⟩)
+      · exact absurd hf mfa_not_mem_amr
+      · exact h
+    · exact fun h => .inr ⟨by trivial, h⟩
   have e1 : ("user" ∈ amr fs ∧ "hwk" ∈ amr fs) ↔ ∃ f ∈ fs, f.HardwareBound := by
     rw [hu, hh]
     constructor
@@ -418,13 +426,16 @@ theorem level_eq_ofAmr {fs : List Factor} (hn : (fs.map (·.kind)).Nodup) :
   · rw [if_neg (fun h => h1 (e1.mp h)), if_neg h1]
     by_cases h2 : ∃ f ∈ fs, f.PhishingResistant
     · rw [if_pos ((e2 h1).mpr h2), if_pos h2]
-    · rw [if_neg (fun h => h2 ((e2 h1).mp h)), if_neg h2]
+    · rw [if_neg (fun h => h2 ((e2 h1).mp h)), if_neg h2,
+        if_pos (hm.mpr (hsat.resolve_left h2))]
 
 /-- **The level a session records is the level its authentication reached**:
-a session keeps the `amr` (`establish`, `stepUp`), and `Session.level` reads
+a session keeps the `amr` (`establish`, `stepUp`), and `Session.ofRow` reads
 the level back from it. -/
-theorem Authentication.level_eq_ofAmr (a : Authentication) : Acr.ofAmr a.amr = a.level :=
-  Policy.level_eq_ofAmr a.admissible.2
+theorem Authentication.level_eq_ofAmr (a : Authentication) :
+    Acr.ofAmr a.amr = some a.level :=
+  Policy.level_eq_ofAmr a.admissible.1 a.admissible.2
+
 /-! ## The checks
 
 Each check does everything that makes its factor good once: there is no way
@@ -636,7 +647,11 @@ def establish (ctx : Ctx) (r : Req) (a : Authentication) : IO (Session × String
       created := now, lastSeen := now, clientAddress := r.clientAddress,
       userAgent := ((r.header "user-agent").getD "").take 256 |>.toString }
   insertSession ctx.store row
-  return (Session.ofRow row, Session.encodeId id)
+  let s : Session :=
+    { idHash := row.idHash, user := a.user, amr := a.amr, level := a.level,
+      factors := row.factors, authTime := now, created := now, lastSeen := now,
+      clientAddress := row.clientAddress, userAgent := row.userAgent }
+  return (s, Session.encodeId id)
 
 /-- Record a fresh authentication on a session (the step-up of §4), rotating
 its identifier: `auth_time` becomes now, and the `amr` — and so the level —
@@ -652,8 +667,9 @@ def stepUp (ctx : Ctx) (s : Session) (a : Authentication) :
   let now ← ctx.clock
   let newHash := SecretHash.of id
   if ← reauthenticateSession ctx.store s.idHash newHash a.amr a.labels now then
-    return some ({ s with idHash := newHash, amr := a.amr, factors := a.labels,
-                          authTime := now, lastSeen := now }, Session.encodeId id)
+    return some ({ s with idHash := newHash, amr := a.amr, level := a.level,
+                          factors := a.labels, authTime := now, lastSeen := now },
+      Session.encodeId id)
   return none
 
 /-- Whether a session satisfies a request for a fresh or strong sign-in: its

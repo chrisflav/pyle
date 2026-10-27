@@ -573,7 +573,11 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
      `Authentication.level_eq_ofAmr` — the session keeps the `amr`, and
      `Acr.ofAmr` reads back exactly `Authentication.level`, the level computed
      from the factors (`level`).  It holds because an authentication uses
-     each kind of factor at most once;
+     each kind of factor at most once.  `Acr.ofAmr` fails closed: an `amr` that
+     shows neither a phishing-resistant factor nor two kinds (`mfa`) is no
+     level, and a session, code, refresh token, device approval or access
+     token carrying one is refused; so is an access token whose `acr` pyle
+     does not know;
    * a password alone, a security key without user verification alone, a
      TOTP code alone and a recovery code alone are no authentication
      (`password_alone`, `key_alone`, `totp_alone`, `recovery_alone`, all from

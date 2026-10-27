@@ -27,7 +27,9 @@ def familyOfCode (codeHash : Store.SecretHash) : ByteArray :=
 /-- Issue an access token, and an ID token if `openid` is in `scope`, for a
 user at a client, and answer with them and the refresh token `refresh`.
 
-The level of the sign-in is read back from its `amr` (`Acr.ofAmr`); the access
+The level of the sign-in is read back from its `amr` (`Acr.ofAmr`), and an
+`amr` that reads as no level — which nothing pyle writes does — is refused
+with `invalid_grant` rather than given one; the access
 token states it as `acr`, and the ID token too, unless the authorization asked
 for an essential `acr` claim, whose answer is `acrClaim`.  Both state the
 account's own strongest level, read afresh, as `account_acr` and
@@ -38,7 +40,8 @@ def tokenResponse (ctx : Ctx) (r : Req) (client : Store.Client) (user : Store.Us
     IO Reply := do
   let now ← ctx.clock
   let expires := now + ctx.config.accessTokenSeconds
-  let level := Acr.ofAmr amr
+  let some level := Acr.ofAmr amr
+    | return oauthError "invalid_grant" "the sign-in behind this grant states no level"
   let account ← Policy.accountLevel ctx user.id
   let access ← Token.issue ctx.store ctx.rootKey
     { user := user.name, amr, acr := level.identifier, accountAcr := account.map (·.identifier),

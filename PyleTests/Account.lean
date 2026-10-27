@@ -501,7 +501,8 @@ def sessionListTests : IO Unit := withCtx fun ctx _ => do
   let some mine ← Session.current ctx (withCookie id) | check "mine" false
   check "both are listed, the other with a button to sign out there"
     ((page.splitOn "<li>").length == 3 &&
-      sessions.all fun s => s.handle == mine.handle || containsStr page s!"data-handle=\"{s.handle}\"")
+      sessions.all fun s =>
+        s.handle == mine.handle || containsStr page s!"data-handle=\"{s.handle}\"")
   check "and this one marked" (containsStr page "this browser")
   let some otherSession ← Session.current ctx (withCookie other) | check "other" false
   let r ← postJson ctx "/account/sessions/end" (Json.mkObj [("handle", otherSession.handle)])

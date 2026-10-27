@@ -306,7 +306,8 @@ def accountContent (ctx : Ctx) (s : Session) (u : User) (added : Option String) 
     "<div class=\"section-head\">\n<h2 id=\"methods-title\">How you sign in</h2>\n\
      <a class=\"button\" id=\"add-method\" href=\"/account/add\">Add a sign-in method</a>\n\
      </div>\n\
-     <div class=\"table-scroll\" role=\"region\" aria-labelledby=\"methods-title\" tabindex=\"0\">\n\
+     <div class=\"table-scroll\" role=\"region\" aria-labelledby=\"methods-title\" \
+     tabindex=\"0\">\n\
      <table class=\"methods\">\n<thead>\n<tr>\n<th scope=\"col\">Name</th>\n\
      <th scope=\"col\">Details</th>\n<th scope=\"col\">Last used</th>\n\
      <th scope=\"col\"><span class=\"visually-hidden\">Actions</span></th>\n</tr>\n</thead>\n" ++

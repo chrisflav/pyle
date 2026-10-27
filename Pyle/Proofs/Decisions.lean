@@ -254,7 +254,8 @@ theorem verifyAny_increasing {α : Type} {apps : List (α × ByteArray × Option
 app changes. -/
 def acceptStep {α : Type} [DecidableEq α] (apps : List (α × ByteArray × Option Nat)) (a : α)
     (n : Nat) : List (α × ByteArray × Option Nat) :=
-  apps.map fun (id, secret, lastStep) => if id = a then (id, secret, some n) else (id, secret, lastStep)
+  apps.map fun (id, secret, lastStep) =>
+    if id = a then (id, secret, some n) else (id, secret, lastStep)
 
 /-- **A code is good once per app**: once step `n` is recorded for app `a`,
 every code later accepted for `a` is for a step after `n` — the code that was

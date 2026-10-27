@@ -289,7 +289,8 @@ def totpConfirm : Handler := fun ctx r => withStepUp ctx r fun s j => do
 /-- An authenticator app's id from a body: a number, or a string of digits. -/
 def appIdOf (j : Json) : Except Reply Int :=
   match j.getObjVal? "id" with
-  | .ok (.num n) => if n.exponent == 0 then .ok n.mantissa else .error (badRequest "'id' is not an app")
+  | .ok (.num n) =>
+    if n.exponent == 0 then .ok n.mantissa else .error (badRequest "'id' is not an app")
   | .ok (.str t) => match t.toInt? with
     | some i => .ok i
     | none => .error (badRequest "'id' is not an app")

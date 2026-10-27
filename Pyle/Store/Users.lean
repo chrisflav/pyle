@@ -224,9 +224,9 @@ def Store.renameCredential (s : Store) (user : UserId) (id : ByteArray) (name : 
 An account must always be able to sign in again (§1), so a removal is checked
 against what it leaves, inside the transaction that makes it: the factors
 left must reach a level (`Acr.Capabilities.level`, at least `mfa`) without
-counting recovery codes, and there must still be two authenticators — WebAuthn credentials, and the account's
-authenticator apps counted once, since they are one kind of factor and often
-on one phone.  A removal that fails either is rolled back.
+counting recovery codes, and there must still be two authenticators —
+WebAuthn credentials, and the account's authenticator apps counted once,
+since they are one kind of factor and often on one phone.  A removal that fails either is rolled back.
 
 Recovery codes are left out of the level here because they are the last
 resort (§3): each sign-in spends one, so an account that signs in only thanks

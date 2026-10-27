@@ -202,6 +202,26 @@ def wayInTests : IO Unit := withCtx fun ctx _ => do
   discard <| addApp s x.id "phone"
   checkEq "with an app beside the key, the password can go" (← s.removePassword x.id) .removed
   checkEq "and once" (← s.removePassword x.id) .notFound
+  -- Recovery codes are the last resort: no removal may leave them as the
+  -- only second factor, since each sign-in spends one.
+  let codes := ["c1", "c2", "c3"].map (·.toUTF8)
+  let r ← s.addUser "rosa" [] 1
+  s.addCredential (sampleCredential r.id "r0".toUTF8)
+  s.addCredential (sampleCredential r.id "r1".toUTF8 (userVerified := false))
+  s.addCredential (sampleCredential r.id "r2".toUTF8 (userVerified := false))
+  s.setRecoveryCodes r.id codes
+  checkEq "the key that verifies cannot go, leaving touch-only keys and recovery codes"
+    (← s.removeCredential r.id "r0".toUTF8) .wouldLockOut
+  check "and is kept" ((← s.findCredential "r0".toUTF8).isSome)
+  let q ← s.addUser "quin" [] 1
+  s.addCredential (sampleCredential q.id "q1".toUTF8 (userVerified := false))
+  s.addCredential (sampleCredential q.id "q2".toUTF8 (userVerified := false))
+  s.setPassword q.id "phc" 1
+  s.setRecoveryCodes q.id codes
+  checkEq "the password cannot go, leaving touch-only keys and recovery codes"
+    (← s.removePassword q.id) .wouldLockOut
+  check "though the account's level still counts the codes"
+    ((← s.capabilities q.id true).recovery)
   -- At most five apps.
   let y ← s.addUser "yan" [] 1
   for i in [0:maxTotpApps] do discard <| addApp s y.id s!"app {i}"

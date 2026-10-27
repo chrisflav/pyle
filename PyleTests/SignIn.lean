@@ -9,11 +9,10 @@ browser.  `SoftKey` stands in for both: it makes the client data a browser
 would and the authenticator data and signature an authenticator would, with
 `lean-biscuit`'s signers (in tests only, DESIGN §6.2).
 
-The negative cases are the point: a TOTP code alone and a recovery code alone
-get no session, and a password alone and a security key without user
-verification alone get one only at `sfa`, and none when more is asked for;
-each level is reached by the factors that justify it and by no others; a
-replayed challenge, a wrong origin, a counter that went
+The negative cases are the point: a password alone, a TOTP code alone, a
+recovery code alone and a security key without user verification alone get
+no session; each level is reached by the factors that justify it and by no
+others; a replayed challenge, a wrong origin, a counter that went
 backwards and an open-redirect `return` are refused; five wrong TOTP codes
 lock TOTP; and the rate limiter answers `429`.
 
@@ -389,30 +388,12 @@ def secondFactorTests : IO Unit := withCtx fun ctx clock => do
   let allowIds := ((opts.getObjValAs? (Array Json) "allowCredentials").toOption.getD #[]).toList
     |>.map (jstr · "id")
   checkEq "and lists the account's credentials first" (allowIds.take 1) [b64u k.id]
-  let notEnough ← postJson ctx "/signin/webauthn/finish"
-    (Json.mkObj [("credential", ← k.assert opts (withHandle := false)), ("acr", "mfa")])
-  checkEq "a security key without user verification alone is not mfa"
-    (notEnough.status.toCode, errorOf notEnough) (401, "second_factor_required")
-  check "and gets no cookie" (sessionCookieOf notEnough).isNone
-  check "and no session row" ((← ctx.store.listSessions carol.id).isEmpty)
-  let b1 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
   let alone ← postJson ctx "/signin/webauthn/finish"
-    (Json.mkObj [("credential", ← k.assert (replyJson b1) (withHandle := false))])
-  checkEq "asked for nothing more, it signs in alone" alone.status.toCode 200
-  checkEq "at sfa" (jstr (replyJson alone) "acr") "https://refeds.org/profile/sfa"
-  checkEq "amr: the key, no user" ((replyJson alone).getObjValAs? (List String) "amr").toOption
-    (some ["hwk"])
-  check "with a session" (sessionCookieOf alone).isSome
-  let b1' ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
-  let notPhr ← postJson ctx "/signin/webauthn/finish"
-    (Json.mkObj [("credential", ← k.assert (replyJson b1') (withHandle := false)),
-      ("totp", "123456"), ("acr", "phr")])
-  checkEq "phr is refused before a second factor is checked"
-    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
-  let unknownAcr ← postJson ctx "/signin/webauthn/finish"
-    (Json.mkObj [("credential", ← k.assert (replyJson b1') (withHandle := false)),
-      ("acr", "gold")])
-  checkEq "an unknown level is a bad request" unknownAcr.status.toCode 400
+    (Json.mkObj [("credential", ← k.assert opts (withHandle := false))])
+  checkEq "a security key without user verification alone gets no session"
+    (alone.status.toCode, errorOf alone) (401, "second_factor_required")
+  check "and no cookie" (sessionCookieOf alone).isNone
+  check "and no session row" ((← ctx.store.listSessions carol.id).isEmpty)
   -- With a TOTP code.
   let secret ← giveTotp ctx carol
   let b2 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
@@ -426,6 +407,16 @@ def secondFactorTests : IO Unit := withCtx fun ctx clock => do
     (some ["hwk", "otp", "mfa"])
   checkEq "acr: mfa, not phishing-resistant" (jstr (replyJson withCode) "acr")
     "https://refeds.org/profile/mfa"
+  let b2' ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
+  let notPhr ← postJson ctx "/signin/webauthn/finish"
+    (Json.mkObj [("credential", ← k.assert (replyJson b2') (withHandle := false)),
+      ("totp", totpAt secret (← clock.get)), ("acr", "phr")])
+  checkEq "asked for phr, it is refused before the code is checked"
+    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
+  let unknownAcr ← postJson ctx "/signin/webauthn/finish"
+    (Json.mkObj [("credential", ← k.assert (replyJson b2') (withHandle := false)),
+      ("acr", "https://refeds.org/profile/sfa")])
+  checkEq "REFEDS SFA is not a level pyle knows" unknownAcr.status.toCode 400
   -- The same code again, in the next sign-in.
   let b3 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
   let reused ← postJson ctx "/signin/webauthn/finish"
@@ -470,13 +461,10 @@ def codeTests : IO Unit :=
     postJson ctx "/signin/codes" (Json.mkObj ([("name", Json.str "dave")] ++ fields))
       (client := client)
   let pw := Json.str "correct horse battery"
-  let notEnough ← signIn [("password", pw), ("acr", "mfa")]
-  checkEq "a password alone is not mfa"
-    (notEnough.status.toCode, errorOf notEnough) (401, "second_factor_required")
-  check "and gets no cookie" (sessionCookieOf notEnough).isNone
-  let notPhr ← signIn [("password", pw), ("totp", "123456"), ("acr", "phr")]
-  checkEq "codes are never phr"
-    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
+  let alone ← signIn [("password", pw)]
+  checkEq "a password alone gets no session"
+    (alone.status.toCode, errorOf alone) (400, "two_factors_required")
+  check "and no cookie" (sessionCookieOf alone).isNone
   let now ← clock.get
   let totpAlone ← signIn [("totp", totpAt secret now)]
   checkEq "a TOTP code alone gets no session" totpAlone.status.toCode 400
@@ -486,15 +474,6 @@ def codeTests : IO Unit :=
     ((← ctx.store.unspentRecoveryCodes dave.id) == 10 &&
       ((← ctx.store.findTotp dave.id).bind (·.lastStep)).isNone)
   check "and no session exists" ((← ctx.store.listSessions dave.id).isEmpty)
-  let alone ← signIn [("password", pw)]
-  checkEq "a password alone signs in" alone.status.toCode 200
-  checkEq "at sfa" (jstr (replyJson alone) "acr") "https://refeds.org/profile/sfa"
-  checkEq "amr: pwd" ((replyJson alone).getObjValAs? (List String) "amr").toOption (some ["pwd"])
-  let log ← Audit.entries ctx.store
-  check "the level reached is audited"
-    (log.any fun e => e.event == "sign-in" && e.detail == "acr https://refeds.org/profile/sfa")
-  let wrongAlone ← signIn [("password", "incorrect horse")]
-  checkEq "a wrong password alone is refused" wrongAlone.status.toCode 401
   let wrongPw ← signIn [("password", "incorrect horse"), ("totp", totpAt secret now)]
   checkEq "a wrong password with a right code is refused" wrongPw.status.toCode 401
   check "without using up the code" ((← ctx.store.findTotp dave.id).bind (·.lastStep)).isNone
@@ -502,6 +481,12 @@ def codeTests : IO Unit :=
   checkEq "a password and a TOTP code sign in" ok.status.toCode 200
   checkEq "amr: pwd, otp, mfa" ((replyJson ok).getObjValAs? (List String) "amr").toOption
     (some ["pwd", "otp", "mfa"])
+  let log ← Audit.entries ctx.store
+  check "the level reached is audited"
+    (log.any fun e => e.event == "sign-in" && e.detail == "acr https://refeds.org/profile/mfa")
+  let notPhr ← signIn [("password", pw), ("totp", "123456"), ("acr", "phr")]
+  checkEq "codes are never phr"
+    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
   let unknown ← postJson ctx "/signin/codes"
     (Json.mkObj [("name", "nobody"), ("password", pw), ("totp", "123456")])
     (client := "198.51.100.8")
@@ -546,10 +531,6 @@ def passwordsOffTests : IO Unit := withCtx fun ctx clock => do
   let r ← postJson ctx "/signin/codes" (Json.mkObj [("name", "erin"),
     ("password", "correct horse battery"), ("totp", totpAt secret (← clock.get))])
   checkEq "a stored password counts for nothing when passwords are off" r.status.toCode 401
-  let alone ← postJson ctx "/signin/codes" (Json.mkObj [("name", "erin"),
-    ("password", "correct horse battery")])
-  checkEq "nor alone" alone.status.toCode 401
-  check "and makes no session" ((← ctx.store.listSessions erin.id).isEmpty)
 
 /-- The rate limiter. -/
 def signInRateLimitTests : IO Unit := withCtx fun ctx _ => do
@@ -671,14 +652,15 @@ def establishTests : IO Unit := withCtx fun ctx _ => do
   check "which records the level" (s.level == .phrh)
   for (amr, level) in [(["hwk", "user"], Acr.phrh), (["swk", "user"], .phr),
       (["swk", "user", "otp", "mfa"], .phr), (["hwk", "otp", "mfa"], .mfa),
-      (["pwd", "otp", "mfa"], .mfa), (["pwd"], .sfa), (["hwk"], .sfa), (["swk"], .sfa)] do
+      (["pwd", "otp", "mfa"], .mfa)] do
     check s!"the level of {amr}" (Acr.ofAmr amr == level)
   let synced ← SoftKey.new (backupEligible := true)
   enrol ctx jo synced
   check "a synced passkey is phr" ((← authFor ctx synced).level == .phr)
   let touch ← SoftKey.new (uv := false)
   enrol ctx jo touch
-  check "a security key touched alone is sfa" ((← authFor ctx touch).level == .sfa)
+  check "a security key touched alone is no authentication"
+    (← (do discard <| authFor ctx touch; pure false) <|> pure true)
   let kim ← ctx.store.addUser "kim" [] 1
   let (ks, _) ← Policy.establish ctx (Req.mk' .post "/") (← authFor ctx (← do
     let kk ← SoftKey.new

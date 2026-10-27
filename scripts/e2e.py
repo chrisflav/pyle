@@ -788,97 +788,6 @@ def run(a):
     check(r.status in (302, 303) and r.location == f"{bye}?state=x1",
           "without a session, logout goes straight back", repr(r) + " " + r.location)
 
-    single_factor(a, origin)
-
-
-SFA = "https://refeds.org/profile/sfa"
-MFA = "https://refeds.org/profile/mfa"
-
-
-def single_factor(a, origin):
-    """A password-only account: created from an invitation with a password,
-    signed in at sfa, taken by a client registered for sfa, sent to step up by
-    one that wants the default mfa, and stepped up with a recovery code."""
-    section("a password-only account, stepped up to mfa")
-    pat = Client("127.0.0.1", a.port, origin, "198.51.100.2")
-    rp = Client("127.0.0.1", a.port, origin, "203.0.113.2")
-    password = "correct horse battery staple"
-    invite = path_of(a.invite2)
-    r = pat.get(invite)
-    check(r.status == 200 and 'id="invite-password"' in r.text,
-          "the invitation offers a password", repr(r))
-    r = pat.post_json(invite + "/password", {"password": password})
-    check(r.status == 201 and r.json().get("acr") == SFA,
-          "a password creates the account, able to sign in at sfa", repr(r))
-    r = pat.post_json("/signin/codes", {"name": a.user2, "password": password, "acr": "mfa"})
-    check(r.status == 401 and r.json().get("error") == "second_factor_required",
-          "asked for mfa, a password alone is refused", repr(r))
-    r = pat.post_json("/signin/codes", {"name": a.user2, "password": password})
-    check(r.status == 200 and r.json().get("acr") == SFA and r.json().get("amr") == ["pwd"],
-          "the password alone signs in at sfa", repr(r))
-    r = pat.get("/account")
-    check(r.status == 200 and "This account can only sign in with a password." in r.text,
-          "the account page says so, and asks for a passkey", repr(r))
-
-    verifier = b64u(os.urandom(32))
-    challenge = b64u(hashlib.sha256(verifier.encode()).digest())
-
-    def authorize_url(client, extra=None):
-        ps = {"response_type": "code", "client_id": client, "redirect_uri": a.redirect,
-              "scope": "openid", "state": "pat", "code_challenge": challenge,
-              "code_challenge_method": "S256"}
-        ps.update(extra or {})
-        return "/authorize?" + urllib.parse.urlencode(ps)
-
-    def exchange(client, secret, code):
-        r = rp.post_form("/token", {"grant_type": "authorization_code", "code": code,
-                                    "redirect_uri": a.redirect, "code_verifier": verifier},
-                         origin=False, headers=basic(client, secret), cookies=False)
-        try:
-            return jwt_parts(r.json().get("id_token", ""))[1]
-        except Exception:  # noqa: BLE001 -- a missing token is a failed check
-            return {}
-
-    r = pat.get(authorize_url(a.sfa_client))
-    code = query_of(r.location).get("code", "")
-    check(bool(code), "a client registered with --min-acr sfa takes the session",
-          repr(r) + " " + r.location)
-    claims = exchange(a.sfa_client, a.sfa_secret, code)
-    check(claims.get("acr") == SFA and claims.get("pyle_account_acr") == SFA,
-          "its ID token says sfa, for the session and the account", repr(claims))
-    r = pat.get(authorize_url(a.client, {"prompt": "none"}))
-    check(query_of(r.location).get("error") == "interaction_required",
-          "a client with the default floor answers prompt=none with interaction_required",
-          r.location)
-    wanted = authorize_url(a.client)
-    r = pat.get(wanted)
-    q = query_of(r.location)
-    check(r.location.startswith("/signin?") and q.get("acr") == "mfa"
-          and q.get("return") == wanted,
-          "and otherwise sends the browser to step up to mfa", r.location)
-    r = pat.get(r.location)
-    check(r.status == 200 and 'data-mode="stepup"' in r.text and 'data-acr="mfa"' in r.text
-          and "nothing that can sign in this strongly" in r.text,
-          "where the page says the account cannot reach mfa yet", repr(r))
-    r = pat.post_json("/account/recovery-codes", {})
-    codes = r.json().get("codes", []) if r.status == 200 else []
-    check(len(codes) == 10, "the password is enough to add recovery codes", repr(r))
-    r = pat.post_json("/account/recovery-codes", {})
-    check(r.status == 403 and r.json().get("acr") == "mfa",
-          "after which changes need two factors", repr(r))
-    r = pat.post_json("/signin/codes", {"name": a.user2, "password": password,
-                                        "recovery": codes[0] if codes else "", "acr": "mfa",
-                                        "return": wanted})
-    check(r.status == 200 and r.json().get("acr") == MFA
-          and r.json().get("redirect") == wanted,
-          "the password and a recovery code step the session up to mfa", repr(r))
-    r = pat.get(wanted)
-    code = query_of(r.location).get("code", "")
-    check(bool(code), "and the client takes it", r.location)
-    claims = exchange(a.client, a.secret, code)
-    check(claims.get("acr") == MFA and "mfa" in claims.get("amr", []),
-          "with acr mfa in the ID token", repr(claims))
-
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -894,10 +803,6 @@ def main():
     p.add_argument("--fa-host", required=True)
     p.add_argument("--fa-other", required=True)
     p.add_argument("--fa-secret", required=True)
-    p.add_argument("--invite2", required=True)
-    p.add_argument("--user2", required=True)
-    p.add_argument("--sfa-client", required=True)
-    p.add_argument("--sfa-secret", required=True)
     p.add_argument("--counts", required=True)
     a = p.parse_args()
     try:

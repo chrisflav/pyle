@@ -239,11 +239,12 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   checkEq "and user verification" (jstr sel "userVerification") "required"
   checkEq "for the invited name" (jstr ((opts.getObjVal? "user").toOption.getD .null) "name")
     "newbie"
-  -- A registration that fails leaves the invitation as it was.
-  let weak ← SoftKey.new
+  -- A security key that does not verify the user is refused, and the
+  -- invitation survives.
+  let weak ← SoftKey.new (uv := false)
   let r1 ← postJson ctx (path ++ "/finish")
-    (Json.mkObj [("credential", ← weak.create opts (origin := "https://evil.example"))])
-  checkEq "a credential from another origin is refused" r1.status.toCode 400
+    (Json.mkObj [("credential", ← weak.create opts)])
+  checkEq "a credential without user verification is refused" r1.status.toCode 400
   check "the invitation is still good"
     ((← ctx.store.findInvitation (.of ((Base64Url.decode token).getD .empty)) now).isSome)
   -- A passkey.
@@ -254,7 +255,6 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   let r2 ← postJson ctx (path ++ "/finish")
     (Json.mkObj [("credential", cred), ("name", "phone")])
   checkEq "a passkey registers" (r2.status.toCode, jstr (replyJson r2) "name") (201, "newbie")
-  checkEq "and the account can sign in at phr" (jstr (replyJson r2) "acr") "phr"
   check "and no session yet" (sessionCookieOf r2).isNone
   let some u ← ctx.store.findUserByName "newbie" | check "the account exists" false
   checkEq "with the invitation's groups" u.groups ["staff"]
@@ -283,70 +283,6 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   checkEq "an expired invitation is 404" (← getPage ctx path2).status.toCode 404
   checkEq "and cannot begin" (← postJson ctx (path2 ++ "/begin") emptyObj).status.toCode 404
 
-/-- An invitation redeemed with one factor: a security key touched without a
-PIN, or a password. -/
-def singleFactorInvitationTests : IO Unit :=
-    withSignInCtx (fun c => { c with allowPasswords := true }) fun ctx clock => do
-  group "web: single-factor invitations"
-  let invite (name : String) : IO String := do
-    let url ← SignIn.createInvitation ctx.store ctx.config.issuer name [] 3600 (← clock.get)
-    return (url.drop ctx.config.issuer.length).toString
-  -- A security key.
-  let path ← invite "keyed"
-  let page ← getPage ctx path
-  check "the page offers a security key" (containsStr page.bodyText "id=\"create-key\"")
-  check "and a password" (containsStr page.bodyText "id=\"invite-password\"")
-  let b ← postJson ctx (path ++ "/begin") (Json.mkObj [("kind", "security-key")])
-  let sel := ((replyJson b).getObjVal? "authenticatorSelection").toOption.getD .null
-  checkEq "a security key need not be discoverable" (jstr sel "residentKey") "discouraged"
-  checkEq "or verify the user" (jstr sel "userVerification") "preferred"
-  let key ← SoftKey.new (uv := false)
-  let r ← postJson ctx (path ++ "/finish")
-    (Json.mkObj [("credential", ← key.create (replyJson b)), ("name", "yubikey")])
-  checkEq "it creates the account" r.status.toCode 201
-  checkEq "able to sign in at sfa" (jstr (replyJson r) "acr") "https://refeds.org/profile/sfa"
-  let some u ← ctx.store.findUserByName "keyed" | check "the account exists" false
-  checkEq "the key is recorded as not verifying the user"
-    ((← ctx.store.listCredentials u.id).toList.map (·.userVerified)) [false]
-  let b2 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "keyed")])
-  let signIn ← postJson ctx "/signin/webauthn/finish"
-    (Json.mkObj [("credential", ← key.assert (replyJson b2) (withHandle := false))])
-  checkEq "it signs in alone" signIn.status.toCode 200
-  checkEq "at sfa" (jstr (replyJson signIn) "acr") "https://refeds.org/profile/sfa"
-  let acct ← getPage ctx "/account" (sessionCookieOf signIn)
-  check "the account page says how weak that is"
-    (containsStr acct.bodyText "<p id=\"safety\" class=\"notice\">This account can only sign \
-      in with a security key that does not ask for a PIN or fingerprint. Add a passkey for \
-      stronger protection.</p>")
-  -- A password.
-  let path2 ← invite "worded"
-  let short ← postJson ctx (path2 ++ "/password") (Json.mkObj [("password", "short")])
-  checkEq "a short password is refused" (short.status.toCode, errorOf short)
-    (400, "password_too_short")
-  let pw ← postJson ctx (path2 ++ "/password")
-    (Json.mkObj [("password", "correct horse battery")])
-  checkEq "a password creates the account" pw.status.toCode 201
-  checkEq "at sfa" (jstr (replyJson pw) "acr") "https://refeds.org/profile/sfa"
-  check "and no session yet" (sessionCookieOf pw).isNone
-  let reused ← postJson ctx (path2 ++ "/password")
-    (Json.mkObj [("password", "correct horse battery")])
-  checkEq "the invitation is used up" reused.status.toCode 404
-  let s ← postJson ctx "/signin/codes"
-    (Json.mkObj [("name", "worded"), ("password", "correct horse battery")])
-  checkEq "the password signs in alone" s.status.toCode 200
-  let acct2 ← getPage ctx "/account" (sessionCookieOf s)
-  check "and the account page asks for a passkey"
-    (containsStr acct2.bodyText "This account can only sign in with a password. Add a passkey \
-      for stronger protection.")
-  check "the page knows it has no passkey"
-    (containsStr acct2.bodyText "data-passkey=\"false\"")
-  -- Without passwords.
-  let path3 ← invite "nopass"
-  let off ← postJson { ctx with config := { ctx.config with allowPasswords := false } }
-    (path3 ++ "/password") (Json.mkObj [("password", "correct horse battery")])
-  checkEq "without passwords, none is taken" off.status.toCode 403
-  check "and the invitation stays" ((← ctx.store.findUserByName "nopass").isNone)
-
 /-- What the account page says about how well an account is protected. -/
 def safetyTests : IO Unit := do
   group "web: account safety"
@@ -357,13 +293,12 @@ def safetyTests : IO Unit := do
   says { verifying := true, webauthn := true } "a passkey, which cannot be phished" false
   says { webauthn := true, totp := true } "two factors, but has no passkey" true
   says { password := true, recovery := true } "two factors" true
-  says { password := true } "only sign in with a password" true
-  says { webauthn := true } "a security key that does not ask for a PIN" true
-  says { totp := true } "no way to sign in on its own" true
-  says {} "no way to sign in on its own" true
+  says { password := true } "cannot sign in again" true
+  says { webauthn := true } "cannot sign in again" true
+  says {} "cannot sign in again" true
   for (c, level) in [(({ totp := true, recovery := true } : Acr.Capabilities), some Acr.mfa),
-      ({ totp := true }, none), ({ recovery := true }, none), ({ password := true }, some .sfa),
-      ({ webauthn := true }, some .sfa), ({ verifying := true, webauthn := true }, some .phr)] do
+      ({ totp := true }, none), ({ recovery := true }, none), ({ password := true }, none),
+      ({ webauthn := true }, none), ({ verifying := true, webauthn := true }, some .phr)] do
     check s!"the level of {repr c}" (c.level == level)
 
 /-- The web tests. -/
@@ -373,7 +308,6 @@ def webTests : IO Unit := do
   assetTests
   pageEscapeTests
   invitationTests
-  singleFactorInvitationTests
   safetyTests
 
 end PyleTests

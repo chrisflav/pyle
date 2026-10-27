@@ -3,41 +3,25 @@ import PyleTests.ForwardAuth
 /-!
 # Assurance levels
 
-What each level is worth to the services behind pyle (DESIGN.md §1, §5): the
-default `mfa` floor sends a single-factor session to step up, and a client or
-a protected host can ask for more or opt down; `acr_values` and the `claims`
-parameter are read in order, with their aliases, ignoring what pyle does not
-know; `prompt=none` answers `login_required` or `interaction_required`; the ID
-token, the access token, `/userinfo` and the forward-auth policy all state the
-session's level and the account's strongest one; the device grant still
-needs `phr`; and a change to the account needs the level its own factors
-allow, or `mfa`.
+What each level is worth to the services behind pyle (DESIGN.md §1, §5): a
+client or a protected host can ask for more than the `mfa` floor, never less;
+`acr_values` and the `claims` parameter are read in order, with their
+aliases, ignoring what pyle does not know — REFEDS SFA among it;
+`prompt=none` answers `interaction_required` for a level too low; the ID
+token, the access token, `/userinfo`, the kleis attestation and the
+forward-auth policy all state the session's level and the account's strongest
+one; the device grant needs `phr` or the client's minimum; and the token
+endpoint answers to the client's minimum as it is now.
 
-Single-factor sessions are made here as everywhere, through a checked factor:
-`sfaFor` signs in with a security key touched without user verification,
-through `Policy.checkAssertion` and `Policy.establish`.
+Sessions below a requirement are made as everywhere, through checked factors:
+`weakFor` signs in with a security key without user verification and a TOTP
+code, at `mfa`.
 -/
 
 namespace PyleTests
 
 open Pyle Pyle.Http Pyle.Oidc
 open Lean (Json)
-
-/-- A session for `user` at `sfa`: a fresh security key that does not verify
-the user, alone.  The cookie value. -/
-def sfaFor (ctx : Ctx) (user : Store.User) : IO String := do
-  let k ← SoftKey.new (uv := false)
-  enrol ctx user k "touch-only key"
-  let ch ← match ← SignIn.newChallenge ctx (Req.mk' .post "/") .authenticate none with
-    | .ok ch => pure ch
-    | .error _ => throw (.userError "sfaFor: no challenge")
-  let cred ← k.assert (SignIn.requestOptions ctx ch [] "discouraged")
-  let resp ← IO.ofExcept (SignIn.parseAssertion cred)
-  let .ok ca ← Policy.checkAssertion ctx .authenticate resp
-    | throw (.userError "sfaFor: the assertion was refused")
-  let some a := Policy.Authentication.ofFactors [ca.factor]
-    | throw (.userError "sfaFor: no authentication")
-  return (← Policy.establish ctx (Req.mk' .post "/") a).2
 
 /-- The claims of a verified ID token from a token response, or `null`. -/
 def idClaims (ctx : Ctx) (t : Reply) : IO Json :=
@@ -53,51 +37,32 @@ def oidcAssuranceTests : IO Unit := withCtx fun ctx _ => do
   let (secret, _) ← addClients ctx
   let d := bodyJson (← get ctx "/.well-known/openid-configuration")
   check "discovery lists the four levels" (d.getObjVal? "acr_values_supported" ==
-    .ok (Json.arr #["https://refeds.org/profile/sfa", "https://refeds.org/profile/mfa", "phr",
-      "phrh"]))
+    .ok (Json.arr #["https://refeds.org/profile/mfa", "phr", "phrh"]))
   check "and supports the claims parameter"
     (d.getObjVal? "claims_parameter_supported" == .ok (Json.bool true))
   check "and names the account claim"
     (((d.getObjValAs? (List String) "claims_supported").toOption.getD []).contains
       "pyle_account_acr")
-  -- The default floor.
-  let sfa ← sfaFor ctx alice
-  let r ← get ctx (authorizeUrl "app") sfa
-  check "an sfa session is sent to sign in" ((location r).startsWith "/signin?")
-  checkEq "for mfa, the default floor" (param (location r) "acr") (some "mfa")
-  checkEq "and back to the request" (param (location r) "return") (some (authorizeUrl "app"))
-  let page ← get ctx ((location r).drop 0 |>.toString) sfa
-  check "where the sign-in page steps the session up"
-    (containsStr page.bodyText "data-mode=\"stepup\"" &&
-      containsStr page.bodyText "data-acr=\"mfa\"")
-  let r ← get ctx (authorizeUrl "app" [("prompt", "none")]) sfa
-  checkEq "under prompt=none: interaction_required" (param (location r) "error")
-    (some "interaction_required")
-  let r ← get ctx (authorizeUrl "app" [("acr_values", "https://refeds.org/profile/sfa")]) sfa
-  checkEq "asking for sfa does not lower the floor" (param (location r) "acr") (some "mfa")
   -- Per-client minimums.
-  let some kioskSecret ← registerClient ctx.store "kiosk" "Kiosk" [appRedirect] [] false
-      { minAcr := .sfa } 1
-    | check "kiosk registers" false
   let some vaultSecret ← registerClient ctx.store "vault" "Vault" [appRedirect] [] false
       { minAcr := .phr } 1
     | check "vault registers" false
   checkEq "the minimum is stored" ((← ctx.store.clientSettings "vault").map (·.minAcr))
     (some .phr)
-  let code ← obtainCode ctx sfa "kiosk"
-  let claims ← idClaims ctx (← exchange ctx code kioskSecret (client := "kiosk"))
-  checkEq "a client that opts down to sfa takes the session"
-    (claimStr claims "acr") (some "https://refeds.org/profile/sfa")
-  checkEq "with its amr" (claims.getObjVal? "amr" |>.toOption.map (·.compress))
-    (some "[\"hwk\"]")
-  checkEq "and the account's own level" (claimStr claims "pyle_account_acr")
-    (some "https://refeds.org/profile/sfa")
   let weak ← weakFor ctx alice
   let r ← get ctx (authorizeUrl "vault") weak
   checkEq "a client with phr as its minimum sends an mfa session to sign in"
     (param (location r) "acr") (some "phr")
   check "the default client takes it" (param (location (← get ctx (authorizeUrl "app") weak))
     "code").isSome
+  let r ← get ctx (authorizeUrl "vault") weak
+  let page ← get ctx (location r) weak
+  check "where the sign-in page steps the session up"
+    (containsStr page.bodyText "data-mode=\"stepup\"" &&
+      containsStr page.bodyText "data-acr=\"phr\"")
+  let r ← get ctx (authorizeUrl "vault" [("prompt", "none")]) weak
+  checkEq "under prompt=none: interaction_required" (param (location r) "error")
+    (some "interaction_required")
   -- acr_values: in order of preference, with aliases, unknown values ignored.
   for (values, want) in [("gold phr", "phr"), ("phrh phr", "phr"), ("phr phrh", "phr"),
       ("https://refeds.org/profile/mfa/phr", "phr"), ("phrh", "phrh")] do
@@ -167,18 +132,18 @@ def oidcAssuranceTests : IO Unit := withCtx fun ctx _ => do
 /-- The levels as functions: the order, reading identifiers and the `amr`. -/
 def acrTests : IO Unit := do
   group "assurance: levels"
-  checkEq "lowest first" (Acr.all.map (·.rank)) [0, 1, 2, 3]
+  checkEq "lowest first" (Acr.all.map (·.rank)) [0, 1, 2]
   for a in Acr.all do
     check s!"{a} is read back" (Acr.ofIdentifier? a.identifier == some a)
-    check s!"{a.shortName} is read back" (Acr.ofName? a.shortName == some a)
+    check s!"{a.shortName} is read back" (Acr.ofIdentifier? a.shortName == some a)
     for b in Acr.all do
       check s!"{a} satisfies {b} exactly when it is at least as strong"
         (a.satisfies b == decide (b.rank ≤ a.rank))
   checkEq "the bare mfa is an alias" (Acr.ofIdentifier? "mfa") (some .mfa)
   checkEq "REFEDS phishing-resistant MFA is phr"
     (Acr.ofIdentifier? "https://refeds.org/profile/mfa/phr") (some .phr)
-  checkEq "the short sfa is for people only" (Acr.ofIdentifier? "sfa", Acr.ofName? "sfa")
-    (none, some .sfa)
+  checkEq "REFEDS SFA is not a level"
+    (Acr.ofIdentifier? "https://refeds.org/profile/sfa", Acr.ofIdentifier? "sfa") (none, none)
   checkEq "an unknown value is none" (Acr.ofIdentifier? "gold") none
   checkEq "the weakest value named"
     ((acrValuesRequest "phrh gold https://refeds.org/profile/mfa").level) (some .mfa)
@@ -188,62 +153,25 @@ def acrTests : IO Unit := do
     (some "phr")
   checkEq "a voluntary one does not"
     ({ values := [("phr", .phr)] : AcrRequest }.claim .phrh) none
-  -- The account-change rule.
-  for (c, need) in [(({ password := true } : Acr.Capabilities), Acr.sfa),
-      ({ webauthn := true }, .sfa), ({ webauthn := true, totp := true }, .mfa),
-      ({ verifying := true, webauthn := true }, .mfa),
-      ({ verifyingDeviceBound := true, verifying := true, webauthn := true }, .mfa),
-      ({ totp := true }, .mfa), ({}, .mfa)] do
-    check s!"a change to {repr c} needs {need}" (c.changeLevel == need)
+  checkEq "a single factor of any kind reaches no level"
+    ([({ password := true } : Acr.Capabilities), { webauthn := true }, { totp := true },
+      { recovery := true }].map (·.level)) [none, none, none, none]
 
-/-- A change to the account needs the level its own factors allow, or `mfa`. -/
-def accountChangeTests : IO Unit :=
-    withSignInCtx (fun c => { c with allowPasswords := true }) fun ctx _ => do
-  group "assurance: changes to the account"
-  -- An account with only a password manages itself with it.
-  let pia ← ctx.store.addUser "pia" [] 1
-  ctx.store.setPassword pia.id (← Factor.Password.hash "correct horse battery") 1
-  let s ← postJson ctx "/signin/codes"
-    (Json.mkObj [("name", "pia"), ("password", "correct horse battery")])
-  let some pid := sessionCookieOf s | check "pia signs in" false
-  let b ← postJson ctx "/account/authenticators/register/begin" emptyObj (some pid)
-  checkEq "a password-only account adds a passkey with its password" b.status.toCode 200
-  let k ← SoftKey.new
-  let f ← postJson ctx "/account/authenticators/register/finish"
-    (Json.mkObj [("credential", ← k.create (replyJson b))]) (some pid)
-  checkEq "and the passkey is registered" f.status.toCode 201
-  check "verifying the user" ((← ctx.store.listCredentials pia.id).toList.map (·.userVerified)
-    == [true])
-  let again ← postJson ctx "/account/authenticators/register/begin" emptyObj (some pid)
-  checkEq "now that it has a passkey, the password alone is no longer enough"
-    (again.status.toCode, errorOf again, jstr (replyJson again) "acr")
-    (403, "step_up_required", "mfa")
-  let rm ← postJson ctx "/account/password/remove" emptyObj (some pid)
-  checkEq "nor for removing the password" rm.status.toCode 403
-  -- The password of an account that has nothing else stays.
-  let quin ← ctx.store.addUser "quin" [] 1
-  ctx.store.setPassword quin.id (← Factor.Password.hash "correct horse battery") 1
-  let qs ← postJson ctx "/signin/codes"
-    (Json.mkObj [("name", "quin"), ("password", "correct horse battery")])
-  let some qid := sessionCookieOf qs | check "quin signs in" false
-  let last ← postJson ctx "/account/password/remove" emptyObj (some qid)
-  checkEq "the password of an account with nothing else cannot be removed"
-    (last.status.toCode, errorOf last) (409, "last_way_in")
-  -- An account with two factors needs two.
+/-- The account page says how well a passkey account is protected. -/
+def accountSafetyTests : IO Unit := withCtx fun ctx _ => do
+  group "assurance: the account page"
   let ray ← ctx.store.addUser "ray" [] 1
   let (rid, _) ← sessionFor ctx ray
-  discard <| giveTotp ctx ray
-  let sfa ← sfaFor ctx ray
-  let r ← postJson ctx "/account/recovery-codes" emptyObj (some sfa)
-  checkEq "an account with a passkey refuses an sfa session"
-    (r.status.toCode, jstr (replyJson r) "acr") (403, "mfa")
-  let r ← postJson ctx "/account/recovery-codes" emptyObj (some rid)
-  checkEq "and takes a passkey's" r.status.toCode 200
   let page ← getPage ctx "/account" (some rid)
-  check "whose page says it is well protected"
+  check "says a device-bound passkey account is well protected"
     (containsStr page.bodyText "<p id=\"safety\">This account can sign in with a security key \
       that verifies you and keeps its key on the device")
-  check "and knows it has a passkey" (containsStr page.bodyText "data-passkey=\"true\"")
+  let sam ← ctx.store.addUser "sam" [] 1
+  let weak ← weakFor ctx sam
+  let page ← getPage ctx "/account" (some weak)
+  check "and asks an account without a passkey for one"
+    (containsStr page.bodyText "<p id=\"safety\" class=\"notice\">This account signs in \
+      with two factors, but has no passkey")
 
 /-- The device grant still needs `phr`, and its tokens state the level. -/
 def deviceAssuranceTests : IO Unit := withCtx fun ctx clock => do
@@ -254,11 +182,9 @@ def deviceAssuranceTests : IO Unit := withCtx fun ctx clock => do
   let deviceCode := (jsonStr r "device_code").getD ""
   let userCode := (jsonStr r "user_code").getD ""
   let page := s!"/device?{queryString [("user_code", userCode)]}"
-  let sfa ← sfaFor ctx alice
-  checkEq "an sfa session is sent to sign in for phr" (param (location (← get ctx page sfa)) "acr")
-    (some "phr")
   let weak ← weakFor ctx alice
-  checkEq "and so is an mfa one" (param (location (← get ctx page weak)) "acr") (some "phr")
+  checkEq "an mfa session is sent to sign in for phr"
+    (param (location (← get ctx page weak)) "acr") (some "phr")
   let post ← postForm ctx "/device" [("user_code", userCode), ("decision", "approve")] sameOrigin
     (cookie := some weak)
   check "which cannot approve either" ((location post).startsWith "/signin?")
@@ -282,21 +208,15 @@ def forwardAuthAssuranceTests : IO Unit := withCtx fun ctx0 _ => do
       [("open.example.org", "allow if user($u);"),
        ("vault.example.org", "allow if amr(\"user\"), acr(\"phrh\");"),
        ("acct.example.org", "allow if account_acr(\"phrh\");")],
-    forwardAuthMinAcr := [("open.example.org", .sfa), ("vault.example.org", .phr),
-      ("acct.example.org", .sfa)] } }
+    forwardAuthMinAcr := [("vault.example.org", .phr)] } }
   let alice ← ctx.store.addUser "alice" ["admin"] 1
-  let sfa ← sfaFor ctx alice
-  let some openCookie ← forwardSignIn ctx sfa "open.example.org" "/"
-    | check "an sfa session reaches a host whose minimum is sfa" false
-  checkEq "an sfa session reaches a host whose minimum is sfa"
+  let weak ← weakFor ctx alice
+  let some openCookie ← forwardSignIn ctx weak "open.example.org" "/"
+    | check "an mfa session reaches a plain-policy host" false
+  checkEq "an mfa session reaches a plain-policy host, whose floor is mfa"
     (← askProxy ctx "open.example.org" "/" (cookies := [openCookie])).status.toCode 200
-  let begun ← askProxy ctx "app.example.org" "/"
-  let g ← get ctx ((location begun).drop issuer.length |>.toString) sfa
-  check "a plain policy has the mfa floor: the grant sends an sfa session to sign in"
-    ((location g).startsWith "/signin?")
-  checkEq "for mfa" (param (location g) "acr") (some "mfa")
   let raised := { ctx with config := { ctx.config with
-    forwardAuthMinAcr := [("open.example.org", .mfa)] } }
+    forwardAuthMinAcr := [("open.example.org", .phr)] } }
   let r ← askProxy raised "open.example.org" "/x" (cookies := [openCookie])
   checkEq "a cookie whose session is below the host's minimum goes round the grant again"
     r.status.toCode 302
@@ -313,13 +233,13 @@ def forwardAuthAssuranceTests : IO Unit := withCtx fun ctx0 _ => do
     | check "a passkey session reaches it" false
   checkEq "a policy over acr and amr lets a passkey session in"
     (← askProxy ctx "vault.example.org" "/" (cookies := [vaultCookie])).status.toCode 200
-  let some acctCookie ← forwardSignIn ctx sfa "acct.example.org" "/"
-    | check "an sfa session of an account with a passkey reaches acct" false
+  let some acctCookie ← forwardSignIn ctx weak "acct.example.org" "/"
+    | check "an mfa session of an account with a passkey reaches acct" false
   checkEq "account_acr is the account's, not the session's"
     (← askProxy ctx "acct.example.org" "/" (cookies := [acctCookie])).status.toCode 200
   let bob ← ctx.store.addUser "bob" [] 1
-  let bobSfa ← sfaFor ctx bob
-  let g ← throughGrant ctx bobSfa "acct.example.org" "/"
+  let bobWeak ← weakFor ctx bob
+  let g ← throughGrant ctx bobWeak "acct.example.org" "/"
   check "an account without one is refused" (forwardCookie g).isNone
   -- The configuration's two forms.
   let parse (hosts : String) := (Json.parse ("{\"issuer\":\"https://a.example\",\
@@ -375,28 +295,13 @@ def migrationTests : IO Unit := IO.FS.withTempDir fun dir => do
   check "which raises the flag"
     ((← s.recordCredentialUse (ByteArray.mk #[4]) 0 1 false true 9) &&
       ((← s.findCredential (ByteArray.mk #[4])).map (·.userVerified)) == some true)
-  let refused ← try
-      discard <| s.run fun c => Store.exec c "UPDATE clients SET min_acr = 'gold'"
-      pure false
-    catch _ => pure true
-  check "a minimum that is not a level is refused by the schema" refused
-
-/-- Single-factor sign-in is limited per account like the rest. -/
-def singleFactorLimitTests : IO Unit :=
-    withSignInCtx (fun c => { c with allowPasswords := true }) fun ctx _ => do
-  group "assurance: single-factor sign-in is rate limited"
-  let sam ← ctx.store.addUser "sam" [] 1
-  ctx.store.setPassword sam.id (← Factor.Password.hash "correct horse battery") 1
-  let codes ← (List.range 6).mapM fun i => do
-    let r ← postJson ctx "/signin/codes"
-      (Json.mkObj [("name", "sam"), ("password", "wrong password")])
-      (client := s!"192.0.2.{40 + i}")
-    return r.status.toCode
-  checkEq "a password alone is limited per account across addresses" codes
-    [401, 401, 401, 401, 429, 429]
-  let ok ← postJson ctx "/signin/codes"
-    (Json.mkObj [("name", "sam"), ("password", "correct horse battery")]) (client := "192.0.2.99")
-  checkEq "even the right one, for now" ok.status.toCode 429
+  for bad in ["gold", "https://refeds.org/profile/sfa"] do
+    let refused ← try
+        discard <| s.run fun c =>
+          Store.exec c "UPDATE clients SET min_acr = ?" #[.text bad]
+        pure false
+      catch _ => pure true
+    check s!"a minimum of {bad} is refused by the schema" refused
 
 /-- Set a client's minimum level, keeping its other settings. -/
 def setMinAcr (ctx : Ctx) (client : String) (a : Acr) : IO Unit := do
@@ -408,32 +313,31 @@ def kleisAssuranceTests : IO Unit := withCtx fun ctx _ => do
   group "assurance: kleis attestations"
   let alice ← ctx.store.addUser "alice" [] 1
   let some agentSecret ← registerClient ctx.store "agent" "An agent" [appRedirect]
-      ["openid", "kleis"] false { minAcr := .sfa } 1
+      ["openid", "kleis"] false {} 1
     | check "an agent client" false
   -- What is in the request does not matter: the level is checked first.
   let attest (c : Ctx) (headers : List (String × String)) (path : String)
       (cookie : Option String := none) :=
     postForm c path [("request", "x")] headers cookie
-  let sfa ← sfaFor ctx alice
-  let r ← attest ctx sameOrigin "/kleis/attest/session" (some sfa)
-  checkEq "an sfa session gets no attestation" (r.status.toCode, jsonStr r "error")
-    (403, some "insufficient_acr")
-  let code ← obtainCode ctx sfa "agent" (scope := "openid kleis")
+  let weak ← weakFor ctx alice
+  let strict := { ctx with config := { ctx.config with kleisMinAcr := .phr } }
+  let r ← attest strict sameOrigin "/kleis/attest/session" (some weak)
+  checkEq "with kleisMinAcr phr, an mfa session gets no attestation"
+    (r.status.toCode, jsonStr r "error") (403, some "insufficient_acr")
+  let code ← obtainCode ctx weak "agent" (scope := "openid kleis")
   let access := (jsonStr (← exchange ctx code agentSecret (client := "agent")) "access_token"
     ).getD ""
-  let r ← attest ctx [("Authorization", s!"Bearer {access}")] "/kleis/attest"
+  let r ← attest strict [("Authorization", s!"Bearer {access}")] "/kleis/attest"
   checkEq "nor does a token from one" (r.status.toCode, jsonStr r "error")
     (403, some "insufficient_acr")
-  let lenient := { ctx with config := { ctx.config with kleisMinAcr := .sfa } }
-  let r ← attest lenient sameOrigin "/kleis/attest/session" (some sfa)
-  checkEq "unless kleisMinAcr allows sfa" (jsonStr r "error") (some "invalid_request")
-  let weak ← weakFor ctx alice
   let r ← attest ctx sameOrigin "/kleis/attest/session" (some weak)
   checkEq "an mfa session passes the default" (jsonStr r "error") (some "invalid_request")
+  let r ← attest ctx [("Authorization", s!"Bearer {access}")] "/kleis/attest"
+  checkEq "and so does its token" (jsonStr r "error") (some "invalid_request")
   let old : Pyle.Token.Identity := { (default : Pyle.Token.Identity) with user := "alice" }
   check "a token from before levels counts as mfa" (Pyle.Token.tokenLevel old == .mfa)
-  let stated : Pyle.Token.Identity := { old with acr := some "https://refeds.org/profile/sfa" }
-  check "and a stated level as itself" (Pyle.Token.tokenLevel stated == .sfa)
+  let stated : Pyle.Token.Identity := { old with acr := some "phr" }
+  check "and a stated level as itself" (Pyle.Token.tokenLevel stated == .phr)
   let parse (extra : String) := (Json.parse ("{\"issuer\":\"https://a.example\",\
     \"rpId\":\"a.example\",\"origins\":[\"https://a.example\"]" ++ extra ++ "}")).toOption
     |>.map (Config.ofJson · "/etc/pyle")
@@ -523,9 +427,8 @@ def assuranceTests : IO Unit := do
   ignoredExtrasTests
   acrTests
   migrationTests
-  singleFactorLimitTests
   oidcAssuranceTests
-  accountChangeTests
+  accountSafetyTests
   deviceAssuranceTests
   forwardAuthAssuranceTests
 

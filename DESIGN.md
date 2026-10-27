@@ -82,10 +82,10 @@ comes from an agent acting for Christian, on this one pull request".
 | Kind | Role | Notes |
 | --- | --- | --- |
 | Passkey (discoverable WebAuthn credential, user verification) | primary, alone `phr` | Phishing-resistant: bound to the origin by the browser. |
-| Security key (WebAuthn, possibly non-discoverable) | primary: `phr` with UV, `sfa` without; or second factor | Same ceremony, different flags. |
+| Security key (WebAuthn, possibly non-discoverable) | primary with UV (`phr`), or second factor | Same ceremony, different flags. |
 | TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports. |
 | Recovery codes | last resort, second factor only | Ten single-use codes, stored hashed, shown once. |
-| Password | optional: alone `sfa`, or a first factor | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
+| Password | optional first factor, never alone | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
 
 A sign-in yields an **authentication method reference** (`amr`, RFC 8176):
 `hwk`/`swk` with `user` for WebAuthn, `otp` for TOTP, `pwd` for a password,
@@ -96,26 +96,28 @@ says `pop`.  The `amr` is carried into every token (§5), so a service can
 demand a phishing-resistant sign-in for something sensitive without trusting
 a boolean that only means "some second factor happened".
 
-**Assurance levels.**  A sign-in reaches a level, its `acr`, and the session
-records it; pyle does not refuse a single factor, and each service decides
-what it needs.  The levels are published identifiers, lowest first:
+**Assurance policy.**  A session is *strong* if it was established by a WebAuthn
+assertion with user verification, or by any two distinct factors.  Only strong
+sessions exist.  A password alone, a security key without user verification
+alone, a TOTP code alone or a recovery code alone produces no session at all —
+each is only a step.
+
+**Assurance levels.**  Every session records the level its sign-in reached,
+its `acr`, and each service decides which it needs.  The levels are published
+identifiers, lowest first:
 
 | level | identifier | reached by |
 | --- | --- | --- |
-| `sfa` | `https://refeds.org/profile/sfa` (REFEDS Single Factor Authentication Profile 1.0) | one factor that may stand alone: a password (only with `allowPasswords`), or a WebAuthn assertion without user verification |
 | `mfa` | `https://refeds.org/profile/mfa` (REFEDS MFA Profile) | two factors of distinct kinds |
 | `phr` | `phr` (OpenID Connect EAP ACR Values 1.0 §2, "phishing-resistant") | a WebAuthn assertion with user verification |
 | `phrh` | `phrh` (the same, "phishing-resistant hardware-protected") | the same from a credential that is not backup-eligible (the BE flag clear), whose key never leaves the authenticator |
 
-Each level satisfies the ones below it, and the order is total.  A TOTP code
-or a recovery code alone reaches no level and makes no session: either is only
-ever a second factor.  A password meets REFEDS SFA's twelve characters
-(§4.1.1), and every factor is rate limited (§4.1.3, our §7).
-
-The default floor is `mfa`: a service that asks for nothing and has no
-configured minimum gets only `mfa` or better, and opts down to `sfa` by being
-registered for it (§5).  A request can raise the level it needs, never lower
-it: whoever controls the browser controls the request.
+Each level satisfies the ones below it, and the order is total.  There is no
+single-factor level (§12 says why), so `mfa` is the floor of every comparison,
+and REFEDS SFA's `https://refeds.org/profile/sfa` is a value pyle does not
+know.  A service, a forward-auth host or kleis can be configured to need more
+(§5); a request can raise the level it needs, never lower it: whoever controls
+the browser controls the request.
 
 Two definitions are a matter of reading.  `phr` asks that a party under the
 relying party's control learn nothing that would let it authenticate as the
@@ -127,24 +129,21 @@ WebAuthn comes without attestation (§2.2, where an AAGUID allow-list makes it
 closer).  So without `attestationRoots` and an allow-list, `phrh` rests on the
 authenticator's own word about its backup-eligible flag.
 
-Passwords are a deployment switch: an account whose only way in is a password
-is stranded, unable to sign in at all, if `allowPasswords` is turned off, and
-needs a new invitation.
+Passwords are a deployment switch: turning `allowPasswords` off takes them
+away as a factor, so an account that has no WebAuthn credential and relied on
+a password with a TOTP or recovery code can no longer sign in, and needs a new
+invitation.
 
 **Account safety.**  What an account has registered bounds the level it can
 reach: `phrh` or `phr` with a credential that has verified the user
-(device-bound for `phrh`), `mfa` with two kinds of factor, `sfa` with only a
-password or a touch-only key.  pyle states it to services as
-`pyle_account_acr` and `account_acr` (§5), shows it on the account page in
-plain words, and asks for a passkey until there is one.  An invitation may
-create the account with a single factor (a touch-only key, or a password where
-allowed), so the first sign-in can happen on a device without a platform
-authenticator.
+(device-bound for `phrh`), `mfa` with two kinds of factor, and none with
+fewer.  pyle states it to services as `pyle_account_acr` and `account_acr`
+(§5), shows it on the account page in plain words, and asks for a passkey
+until there is one.
 
 **At least two.**  A user cannot remove their second-to-last authenticator, and
 is nagged until they have registered two.  Losing a single key should never be
-an administrator's problem.  The password of an account with no WebAuthn
-credential cannot be removed either: it is that account's only way in.
+an administrator's problem.
 
 ## 2. WebAuthn ceremonies
 
@@ -239,17 +238,10 @@ short, so the round trip cannot loop.  A step-up replaces the session's level
 with the new authentication's, as it replaces `auth_time`: it says how the user
 signed in just now.
 
-**Account changes.**  Removing an authenticator, adding one, renaming one,
-and setting up TOTP, recovery codes or a password require a step-up within the
-last five minutes, at the account's own best level or `mfa`, whichever is
-lower.  An account that can only sign in with one factor can still manage
-itself with that factor — otherwise a password-only account could never add
-the passkey the account page asks for.  An account that has a passkey or two
-kinds of factor needs `mfa`, which a passkey meets: the protection such an
-account had before levels existed, and REFEDS MFA §3.2's factor independence,
-since one stolen factor cannot then add another.  Requiring `phr` of accounts
-that have a passkey would close the relayed-codes hole below, at the cost of
-the recovery path; that is still §12's question.
+**Account changes.**  Removing an authenticator, adding one and minting
+long-lived tokens always require a step-up within the last five minutes; every
+session is at least `mfa`, so a change needs two factors or a passkey, as
+REFEDS MFA §3.2's factor independence asks.
 
 A step-up need not be WebAuthn: two factors through the code form (a
 password and a TOTP code, or a recovery code and another factor) are accepted
@@ -582,23 +574,21 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
      `Acr.ofAmr` reads back exactly `Authentication.level`, the level computed
      from the factors (`level`).  It holds because an authentication uses
      each kind of factor at most once;
-   * a TOTP code alone and a recovery code alone are no authentication
-     (`totp_alone`, `recovery_alone`), nor are two factors of one kind
-     (`ofFactors_same_kind`) or of two users (`ofFactors_two_users`);
-   * a password alone and a security key without user verification alone
-     sign in at `sfa` (`password_alone`, `key_alone`), and `sfa` comes from
-     nothing else (`level_sfa`: exactly one factor, a password or WebAuthn
-     without user verification);
-   * `mfa` or better needs a phishing-resistant factor or two kinds of factor
-     (`level_mfa`), and two kinds reach at least `mfa` (`mfa_le_level`);
+   * a password alone, a security key without user verification alone, a
+     TOTP code alone and a recovery code alone are no authentication
+     (`password_alone`, `key_alone`, `totp_alone`, `recovery_alone`, all from
+     `ofFactors_single`: one factor that is not phishing-resistant), nor are
+     two factors of one kind (`ofFactors_same_kind`) or of two users
+     (`ofFactors_two_users`);
+   * every authentication has a phishing-resistant factor or two kinds of
+     factor (`strong`), and one at `mfa` has two kinds (`level_mfa`);
    * `phr` needs WebAuthn with user verification (`level_phr`), and `phrh` the
      same from a credential that is not backup-eligible (`level_phrh`);
    * in `Session/Acr.lean`, the order of the levels is a total order
      (`Acr.le_refl`, `le_trans`, `le_antisymm`, `le_total`), `satisfies` is
      monotone in both arguments (`Acr.satisfies_mono`), a request added to a
-     floor never lowers it (`Acr.satisfies_max`), and a change to an account
-     never needs more than `mfa` and needs exactly `mfa` of an account that
-     can reach it (`Capabilities.changeLevel_le_mfa`, `changeLevel_eq_mfa`).
+     floor never lowers it (`Acr.satisfies_max`), `mfa` is the least level
+     (`Acr.mfa_le`), and REFEDS SFA is not a level (`Acr.ofIdentifier_sfa`).
 
    Not proved: that the endpoints ask for the right level.  `Authorize`,
    `ForwardAuth` and the device page compare the session's level with what
@@ -703,6 +693,14 @@ deployment.
   (backup-eligible flag clear) for administrators is a policy knob to decide.
   A service can already ask for it, as `phrh`; what is open is whether pyle
   should enforce it per group.
+- **Single-factor accounts and sessions: considered and rejected.**  An
+  `sfa` level — a password or a touch-only security key alone, accounts
+  created with one, services opting down to it — was built and taken out
+  again.  The trouble is enrolment: an account that may be managed with its
+  one factor can use that factor to add a second and a passkey, and so mint
+  `mfa` and `phrh` sessions from a stolen password (review finding H1).
+  Requiring more for enrolment than for sign-in strands the account instead.
+  So nothing is weaker than before levels: every session is strong.
 - **The `acr` answered to `acr_values`.**  REFEDS MFA 2.0 §4.2.2.1 asks an OP
   that performed phishing-resistant MFA for a request of plain MFA to assert
   only `https://refeds.org/profile/mfa`.  pyle does so when the request is an

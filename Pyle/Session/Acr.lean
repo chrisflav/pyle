@@ -100,9 +100,10 @@ def satisfies (got want : Acr) : Bool := decide (want ≤ got)
 
 /-- The level a list of `amr` values (RFC 8176) records: `phrh` with `user`
 and `hwk`, `phr` with `user` and `swk`, and `mfa` otherwise — every other
-authentication pyle accepts has two kinds of factor.  `Policy.Authentication.level_eq_ofAmr` proves that for every
-authentication pyle accepts this gives back the level its factors reach, so a
-session, a code or a token that keeps the `amr` keeps the level. -/
+authentication pyle accepts has two kinds of factor.
+`Policy.Authentication.level_eq_ofAmr` proves that for every authentication
+pyle accepts this gives back the level its factors reach, so a session, a code
+or a token that keeps the `amr` keeps the level. -/
 def ofAmr (amr : List String) : Acr :=
   if amr.contains "user" && amr.contains "hwk" then .phrh
   else if amr.contains "user" && amr.contains "swk" then .phr

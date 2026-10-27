@@ -16,9 +16,9 @@ Three pages, rendered here and driven by `/assets/pyle.js`:
   shown the sign-in page.  The page offers only what can reach the level: at
   `phr` and `phrh` a passkey alone, since nothing else is phishing-resistant;
   at `mfa` a passkey, a security key with a code or a password, or two codes.
-  It passes the level on to the endpoints, which refuse what falls short.  A step-up for an account that
-  has nothing that could reach the level says so, and points to the account
-  page.  A `return` that is not a path on this origin is refused with `400`
+  It passes the level on to the endpoints, which refuse what falls short.  A
+  step-up for an account that has nothing that could reach the level says so,
+  and points to the account page.  A `return` that is not a path on this origin is refused with `400`
   rather than replaced, so a link that tried to misuse it fails visibly.
 * `GET /account` — the account: how well it is protected (`safety`), its
   authenticators, the authenticator app, recovery codes, the password if the

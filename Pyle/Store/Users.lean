@@ -144,12 +144,17 @@ structure Credential where
   created : Nat
   /-- When it was last used to sign in. -/
   lastUsed : Option Nat
+  /-- Whether it has verified the user (a PIN or a fingerprint), at
+  registration or in any assertion since: what makes it a passkey rather than
+  a security key that is only touched.  Of the credentials registered before
+  migration 5, only the one an invitation created is assumed to. -/
+  userVerified : Bool := false
 
 /-- The columns of `webauthn_credentials`, in the order `readCredential` reads
 them. -/
 def credentialColumns : String :=
   "id, user_id, algorithm, public_key, sign_count, backup_eligible, backup_state, aaguid, \
-    transports, name, created, last_used"
+    transports, name, created, last_used, user_verified"
 
 /-- Read a credential row selected with `credentialColumns`. -/
 def readCredential (stmt : SQLite.Stmt) : IO Credential := do
@@ -165,7 +170,8 @@ def readCredential (stmt : SQLite.Stmt) : IO Credential := do
     transports := ← colList stmt 8
     name := ← colText stmt 9
     created := ← colNat stmt 10
-    lastUsed := ← colOpt colNat stmt 11 }
+    lastUsed := ← colOpt colNat stmt 11
+    userVerified := (← colInt stmt 12) != 0 }
 
 /-- A flag as an integer column. -/
 private def flag (b : Bool) : Value := .int (if b then 1 else 0)
@@ -176,11 +182,11 @@ itself rather than by a check that could race. -/
 def Store.addCredential (s : Store) (cred : Credential) : IO Unit := s.run fun c => do
   discard <| exec c
     "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
-      backup_eligible, backup_state, aaguid, transports, name, created) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      backup_eligible, backup_state, aaguid, transports, name, created, user_verified) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     #[cred.id, cred.user, cred.algorithm, cred.publicKey, cred.signCount,
       flag cred.backupEligible, flag cred.backupState, cred.aaguid,
-      encodeList cred.transports, cred.name, cred.created]
+      encodeList cred.transports, cred.name, cred.created, flag cred.userVerified]
 
 /-- Look a credential up by id. -/
 def Store.findCredential (s : Store) (id : ByteArray) : IO (Option Credential) :=
@@ -193,16 +199,17 @@ def Store.listCredentials (s : Store) (user : UserId) : IO (Array Credential) :=
     s!"SELECT {credentialColumns} FROM webauthn_credentials WHERE user_id = ? \
       ORDER BY created, id" #[user] readCredential
 
-/-- Record a successful assertion: the new counter, backup state and time.
+/-- Record a successful assertion: the new counter, backup state and time,
+and that the credential verified the user, if it did this time.
 The update only applies if the stored counter is still the one the assertion
 was checked against, so two assertions racing with the same counter cannot
 both be recorded.  Whether it applied. -/
 def Store.recordCredentialUse (s : Store) (id : ByteArray) (expectedCount newCount : Nat)
-    (backupState : Bool) (now : Nat) : IO Bool := s.run fun c => do
+    (backupState userVerified : Bool) (now : Nat) : IO Bool := s.run fun c => do
   let n ← exec c
-    "UPDATE webauthn_credentials SET sign_count = ?, backup_state = ?, last_used = ? \
-      WHERE id = ? AND sign_count = ?"
-    #[newCount, flag backupState, now, id, expectedCount]
+    "UPDATE webauthn_credentials SET sign_count = ?, backup_state = ?, last_used = ?, \
+      user_verified = MAX(user_verified, ?) WHERE id = ? AND sign_count = ?"
+    #[newCount, flag backupState, now, flag userVerified, id, expectedCount]
   return n > 0
 
 /-- Rename a credential.  Whether it belonged to that user. -/

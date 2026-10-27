@@ -42,7 +42,7 @@ def signedIn (ctx : Ctx) (user : Store.User) : IO String :=
 
 /-- A session for `user` that is not phishing-resistant: a security key without
 user verification and a TOTP code, through `Policy.establish`.  Its `amr` is
-`["hwk", "otp", "mfa"]` and its `acr` `mfa`.  The cookie value. -/
+`["hwk", "otp", "mfa"]` and its level `mfa`.  The cookie value. -/
 def weakFor (ctx : Ctx) (user : Store.User) : IO String := do
   let k ← SoftKey.new (uv := false)
   enrol ctx user k "no-uv key"
@@ -56,7 +56,7 @@ def weakFor (ctx : Ctx) (user : Store.User) : IO String := do
     | throw (.userError "weakFor: the assertion was refused")
   let .ok totp ← Policy.checkTotp ctx user.id (totpAt secret (← ctx.clock))
     | throw (.userError "weakFor: the TOTP code was refused")
-  let some sa := Policy.StrongAuthentication.ofFactors [ca.factor, totp]
+  let some sa := Policy.Authentication.ofFactors [ca.factor, totp]
     | throw (.userError "weakFor: the factors do not satisfy the policy")
   return (← Policy.establish ctx (Req.mk' .post "/") sa).2
 
@@ -239,7 +239,7 @@ def codeFlowTests : IO Unit := withCtx fun ctx clock => do
     checkEq "name" (str "name") (some "alice")
     check "groups" (claims.getObjVal? "groups" == .ok (Json.arr #["admin", "ops"]))
     check "amr" (claims.getObjVal? "amr" == .ok (Json.arr #["hwk", "user"]))
-    checkEq "acr" (str "acr") (some "phr")
+    checkEq "acr" (str "acr") (some "phrh")
   check "a tampered ID token does not verify"
     ((← verifyEs256 ctx (idToken.dropEnd 2 |>.toString)) matches .error _)
   -- userinfo, with the access token.
@@ -468,7 +468,7 @@ def promptTests : IO Unit := withCtx fun ctx clock => do
   let t ← exchange ctx code secret
   let claims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
   checkEq "a security key without UV and TOTP is acr mfa"
-    (claims.getObjValAs? String "acr").toOption (some "mfa")
+    (claims.getObjValAs? String "acr").toOption (some "https://refeds.org/profile/mfa")
   checkEq "with its amr" (claims.getObjVal? "amr" |>.toOption.map (·.compress))
     (some "[\"hwk\",\"otp\",\"mfa\"]")
   -- RS256 for the client that needs it.

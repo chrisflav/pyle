@@ -1,4 +1,5 @@
 import Pyle.Store.Oidc
+import Pyle.Session.Acr
 
 /-!
 # Queries for the protocols
@@ -26,19 +27,25 @@ structure ClientSettings where
   /-- Where RP-initiated logout may send the browser afterwards, compared byte
   for byte. -/
   postLogoutRedirectUris : List String := []
+  /-- The lowest level a session must reach to sign in to the client
+  (`--min-acr`, migration 5): `mfa` unless the client was registered with
+  another.  A request may ask for more, never for less. -/
+  minAcr : Acr := .mfa
   deriving Inhabited, BEq, Repr
 
 /-- A client's settings, if the client exists. -/
 def Store.clientSettings (s : Store) (id : String) : IO (Option ClientSettings) :=
   s.run fun c => queryOne c
-    "SELECT id_token_alg, post_logout_redirect_uris FROM clients WHERE id = ?" #[id]
-    fun st => return { idTokenAlg := ← colText st 0, postLogoutRedirectUris := ← colList st 1 }
+    "SELECT id_token_alg, post_logout_redirect_uris, min_acr FROM clients WHERE id = ?" #[id]
+    fun st => return { idTokenAlg := ← colText st 0, postLogoutRedirectUris := ← colList st 1,
+                       minAcr := (Acr.ofIdentifier? (← colText st 2)).getD .mfa }
 
 /-- Replace a client's settings.  Whether the client exists. -/
 def Store.setClientSettings (s : Store) (id : String) (cs : ClientSettings) : IO Bool :=
   s.run fun c => return (← exec c
-    "UPDATE clients SET id_token_alg = ?, post_logout_redirect_uris = ? WHERE id = ?"
-    #[cs.idTokenAlg, encodeList cs.postLogoutRedirectUris, id]) > 0
+    "UPDATE clients SET id_token_alg = ?, post_logout_redirect_uris = ?, min_acr = ? \
+      WHERE id = ?"
+    #[cs.idTokenAlg, encodeList cs.postLogoutRedirectUris, cs.minAcr.identifier, id]) > 0
 
 /-! ## Keys by algorithm -/
 

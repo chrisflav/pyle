@@ -47,6 +47,10 @@ structure Grant where
   user : String
   /-- The authentication methods of the sign-in. -/
   amr : List String
+  /-- The level of the sign-in, as its identifier. -/
+  acr : String := ""
+  /-- The account's strongest level, as its identifier, if it has one. -/
+  accountAcr : Option String := none
   /-- When the user authenticated. -/
   authTime : Nat
   /-- The user's groups. -/
@@ -65,6 +69,8 @@ def pyleAudience : String := "pyle"
 /-- The authority block of an access token expiring at `expires`. -/
 def authoritySource (g : Grant) (expires : Nat) : String :=
   let facts := [s!"user({quote g.user});"] ++ g.amr.map (s!"amr({quote ·});") ++
+    (if g.acr.isEmpty then [] else [s!"acr({quote g.acr});"]) ++
+    (g.accountAcr.map fun a => [s!"account_acr({quote a});"]).getD [] ++
     [s!"auth_time({date g.authTime});"] ++ g.groups.map (s!"group({quote ·});") ++
     [s!"client({quote g.client});"] ++ g.scopes.map (s!"scope({quote ·});")
   let checks := [s!"check if time($t), $t < {date expires};",
@@ -105,14 +111,15 @@ def verifyForPyle (store : Store.Store) (token : String) (now : Nat) :
   return verify (← publishedRoots store) pyleAudience now token
 
 /-- The contents of a third-party block attesting a user to kleis (§5.4):
-`user`, `amr` and `group` facts and a check that the block is used before
-`expires`.  Signed by the current biscuit root key through OpenSSL in answer to
+`user`, `amr`, `acr` and `group` facts and a check that the block is used
+before `expires`.  Signed by the current biscuit root key through OpenSSL in answer to
 a token's third-party block request. -/
 def attest (store : Store.Store) (rootKey : ByteArray) (request : Proto.ThirdPartyBlockRequest)
-    (user : String) (amr groups : List String) (now expires : Nat) :
+    (user : String) (amr groups : List String) (now expires : Nat) (acr : String := "") :
     IO (Proto.ThirdPartyBlockContents × PublicKey) := do
   let (_, root) ← Keys.current store rootKey .biscuitRoot now
   let source := "\n".intercalate ([s!"user({quote user});"] ++ amr.map (s!"amr({quote ·});") ++
+    (if acr.isEmpty then [] else [s!"acr({quote acr});"]) ++
     groups.map (s!"group({quote ·});") ++ [s!"check if time($t), $t < {date expires};"])
   let block ← match BlockBuilder.code {} source with
     | .ok b => pure b

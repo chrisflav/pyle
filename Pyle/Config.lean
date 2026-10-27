@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import LeanBiscuit.Parser
+import Pyle.Session.Acr
 
 /-!
 # Configuration
@@ -98,9 +99,17 @@ structure Config where
   devicePollSeconds : Nat := 5
   /-- How long a kleis attestation block is good for, in seconds (§5.4). -/
   attestationSeconds : Nat := 300
+  /-- The lowest level a sign-in must reach for pyle to attest it to kleis
+  (§5.4): `mfa` unless configured.  A kleis grant that trusts pyle's `user`
+  facts trusts them at this level. -/
+  kleisMinAcr : Acr := .mfa
   /-- The hosts forward authentication answers for, each with the datalog
   policy deciding who may reach it (§5.3).  A host not listed is refused. -/
   forwardAuthHosts : List (String × String) := []
+  /-- The lowest level a session must reach for a protected host, for the
+  hosts configured with one (`minAcr`); every other protected host has the
+  floor, `mfa`. -/
+  forwardAuthMinAcr : List (String × Acr) := []
   /-- How long the forward-authentication cookie a protected host is given
   lives, in seconds; the session behind it is checked on every request. -/
   forwardAuthCookieSeconds : Nat := 8 * 3600
@@ -121,8 +130,8 @@ def knownKeys : List String :=
    "sessionIdleSeconds", "sessionAbsoluteSeconds", "trustedProxies",
    "allowPasswords", "attestationRoots", "aaguidAllowList",
    "accessTokenSeconds", "idTokenSeconds", "refreshTokenSeconds", "deviceCodeSeconds",
-   "devicePollSeconds", "attestationSeconds", "forwardAuthHosts", "forwardAuthCookieSeconds",
-   "forwardAuthSecret"]
+   "devicePollSeconds", "attestationSeconds", "kleisMinAcr", "forwardAuthHosts",
+   "forwardAuthCookieSeconds", "forwardAuthSecret"]
 
 /-- A required string field. -/
 private def reqStr (j : Json) (k : String) : Except String String :=
@@ -167,10 +176,25 @@ private def asStrs : Json → Option (List String)
   | .arr xs => xs.toList.mapM asStr
   | _ => none
 
-/-- A JSON object of strings, in order. -/
-private def asStrMap : Json → Option (List (String × String))
-  | .obj kvs => kvs.toArray.toList.mapM fun (k, v) => (k, ·) <$> asStr v
-  | _ => none
+/-- A protected host's entry in `forwardAuthHosts`: its policy as a string,
+or an object `{"policy": …, "minAcr": …}` whose `minAcr` is a level's short
+name or identifier (`Acr.ofIdentifier?`).  The policy, and the minimum if one is
+given. -/
+def forwardHost (host : String) : Json → Except String (String × Option Acr)
+  | .str policy => .ok (policy, none)
+  | v@(.obj kvs) => do
+    for (k, _) in kvs.toArray do
+      unless k == "policy" || k == "minAcr" do
+        throw s!"'{k}' is not a key of a forward-auth host ('{host}')"
+    let some policy := (v.getObjValAs? String "policy").toOption
+      | throw s!"the forward-auth host '{host}' needs a 'policy' string"
+    match v.getObjVal? "minAcr" with
+    | .error _ => return (policy, none)
+    | .ok m =>
+      let some a := (asStr m).bind Acr.ofIdentifier?
+        | throw s!"the 'minAcr' of '{host}' is not a level (mfa, phr or phrh)"
+      return (policy, some a)
+  | _ => .error s!"the forward-auth host '{host}' must be a policy or an object with one"
 
 /-- Split an `https://host[:port][/path]` URL into scheme, authority and path,
 if it is one pyle accepts as an issuer or origin: `https` with a non-empty
@@ -250,9 +274,16 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
   let deviceCodeSeconds ← positive "deviceCodeSeconds" 600
   let devicePollSeconds ← positive "devicePollSeconds" 5
   let attestationSeconds ← positive "attestationSeconds" 300
+  let kleisMinAcr ← opt j "kleisMinAcr" Acr.mfa (fun v => (asStr v).bind Acr.ofIdentifier?)
+    "a level (mfa, phr or phrh)"
   let forwardAuthCookieSeconds ← positive "forwardAuthCookieSeconds" (8 * 3600)
-  let forwardAuthHosts ← opt j "forwardAuthHosts" [] asStrMap
-    "an object from host names to datalog policies"
+  let hostEntries ← match j.getObjVal? "forwardAuthHosts" with
+    | .error _ => pure []
+    | .ok (.obj kvs) => kvs.toArray.toList.mapM fun (k, v) => do
+      return (k, ← forwardHost k v)
+    | .ok _ => throw "'forwardAuthHosts' must be an object from host names to datalog policies"
+  let forwardAuthHosts := hostEntries.map fun (h, p, _) => (h, p)
+  let forwardAuthMinAcr := hostEntries.filterMap fun (h, _, m) => m.map (h, ·)
   let forwardAuthSecret ← opt j "forwardAuthSecret" none (fun v => (asStr v).map some)
     "a string"
   if forwardAuthSecret.any (·.length < 16) then
@@ -276,8 +307,8 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
            sessionIdleSeconds := idle, sessionAbsoluteSeconds := absolute, trustedProxies,
            allowPasswords, attestationRoots := attestationRoots.map resolve, aaguidAllowList,
            accessTokenSeconds, idTokenSeconds, refreshTokenSeconds, deviceCodeSeconds,
-           devicePollSeconds, attestationSeconds, forwardAuthHosts, forwardAuthCookieSeconds,
-           forwardAuthSecret }
+           devicePollSeconds, attestationSeconds, kleisMinAcr, forwardAuthHosts, forwardAuthMinAcr,
+           forwardAuthCookieSeconds, forwardAuthSecret }
 
 /-- Read and check a configuration file. -/
 def load (path : System.FilePath) : IO Config := do

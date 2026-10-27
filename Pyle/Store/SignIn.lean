@@ -119,12 +119,13 @@ def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteAr
     let k := cred u.id
     discard <| exec c
       "INSERT INTO webauthn_credentials (id, user_id, algorithm, public_key, sign_count, \
-        backup_eligible, backup_state, aaguid, transports, name, created) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        backup_eligible, backup_state, aaguid, transports, name, created, user_verified) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       #[k.id, u.id, k.algorithm, k.publicKey, k.signCount,
         Value.int (if k.backupEligible then 1 else 0),
         Value.int (if k.backupState then 1 else 0), k.aaguid,
-        encodeList k.transports, k.name, k.created]
+        encodeList k.transports, k.name, k.created,
+        Value.int (if k.userVerified then 1 else 0)]
     return .ok u
 
 end Store

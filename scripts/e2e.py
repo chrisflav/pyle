@@ -438,8 +438,8 @@ def run(a):
     body = r.json()
     check(r.status == 200 and body.get("redirect") == "/account", "the passkey signs in",
           repr(r))
-    check(body.get("acr") == "phr" and "user" in body.get("amr", []),
-          "phishing-resistantly, with user verification", repr(body))
+    check(body.get("acr") == "phrh" and "user" in body.get("amr", []),
+          "phishing-resistantly, with user verification, from a device-bound key", repr(body))
     session = r.cookie("__Host-pyle")
     check(bool(session), "and sets the session cookie")
     setc = " ".join(r.all("Set-Cookie"))
@@ -555,8 +555,10 @@ def run(a):
         check(claims.get("nonce") == nonce, "the nonce comes back", repr(claims.get("nonce")))
         check(claims.get("iat", 0) <= now + 5 < claims.get("exp", 0) + 5
               and claims.get("auth_time", 0) <= now + 5, "iat, exp and auth_time", repr(claims))
-        check(claims.get("acr") == "phr" and "hwk" in claims.get("amr", []),
-              "acr phr and amr hwk", repr(claims))
+        check(claims.get("acr") == "phrh" and "hwk" in claims.get("amr", []),
+              "acr phrh and amr hwk", repr(claims))
+        check(claims.get("pyle_account_acr") == "phrh", "and the account's level",
+              repr(claims.get("pyle_account_acr")))
         check(claims.get("name") == a.user and claims.get("groups") == ["admin"],
               "name and groups, as the scopes allow", repr(claims))
         sub = claims.get("sub")

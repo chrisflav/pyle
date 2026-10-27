@@ -19,15 +19,34 @@ Every response sent back to the client — a code or an error — carries `iss`
 (RFC 9207), so a client that talks to several providers can tell which one
 answered.
 
-**The session.**  The user must be signed in, and the request may ask for more:
+**The session.**  The user must be signed in, at the client's minimum level
+or better (`ClientSettings.minAcr`, `pyle client add --min-acr`; `mfa` unless
+set), and the request may ask for more:
 
 * `prompt=login` — a fresh authentication now;
 * `max_age=n` — one within the last `n` seconds;
-* `acr_values` naming `phr` — a phishing-resistant one.
+* `acr_values` — a level, as a space-separated list of `acr` values in order
+  of preference (OpenID Connect Core §3.1.2.1): the four of `Acr`, and the
+  aliases `Acr.ofIdentifier?` reads.  Any of those listed will do, so the
+  session must reach the weakest of them; values pyle does not know are
+  ignored, as the parameter is voluntary;
+* the `claims` parameter (§5.5) asking for the ID token's `acr`, with
+  `value` or `values`: read as `acr_values` is, and when it is `essential`
+  (§5.5.1.1) the ID token's `acr` is the first of those values, in the order
+  given, that the session meets, and a request none of whose values pyle knows
+  is refused with `unmet_authentication_requirements`.  The `claims`
+  parameter, when it asks about `acr`, takes the place of `acr_values`.
+
+A request can only add to the client's minimum, never lower it: the request
+comes through the browser, and whoever controls the browser could otherwise
+ask for less than the client relies on (`Acr.satisfies_max`).  Otherwise the
+ID token's `acr` is the session's own level, which may be more than was asked.
 
 When the session does not satisfy them, the browser is sent to sign in and back
-here (`Oidc.signinRedirect`), or, under `prompt=none`, the client gets
-`login_required`.  `max_age=0` means the same as `prompt=login`.  When the
+here (`Oidc.signinRedirect`) with the level it needs, or, under `prompt=none`,
+the client gets `login_required` (no session, or too old) or
+`interaction_required` (a level too low).  `max_age=0` means the same as
+`prompt=login`.  When the
 authentication is too old — `prompt=login`, or older than `max_age` — the way
 back carries, instead of `prompt` and `max_age`, the parameter
 `pyle_auth_after` with the time of the request, so that the authentication that
@@ -45,6 +64,7 @@ namespace Oidc
 
 open Http
 open Store
+open Lean (Json)
 
 /-- How long an authorization code is accepted, in seconds. -/
 def codeSeconds : Nat := 60
@@ -70,13 +90,62 @@ structure Requirements where
   notBefore : Option Nat := none
   /-- Authenticated within this many seconds. -/
   maxAge : Option Nat := none
-  /-- With a phishing-resistant authenticator. -/
-  phr : Bool := false
+  /-- At this level or better. -/
+  level : Acr := .mfa
 
 /-- Whether a session satisfies the requirements at `now`. -/
 def Requirements.satisfied (q : Requirements) (s : Session) (now : Nat) : Bool :=
   q.notBefore.all (· ≤ s.authTime) && q.maxAge.all (fun a => now ≤ s.authTime + a) &&
-    (!q.phr || Policy.acr s.amr == "phr")
+    s.level.satisfies q.level
+
+/-- What a request asks of the `acr`: the values it names that pyle knows, in
+its order of preference, each with the level it names, and whether it asked
+for them as an essential claim. -/
+structure AcrRequest where
+  /-- The values, as sent, with their levels. -/
+  values : List (String × Acr) := []
+  /-- Whether the `claims` parameter marked `acr` essential. -/
+  essential : Bool := false
+  /-- Whether it named values, known or not. -/
+  named : Bool := false
+
+/-- The values of a list that name a level pyle knows, with their levels. -/
+def knownAcrValues (vs : List String) : List (String × Acr) :=
+  vs.filterMap fun v => (Acr.ofIdentifier? v).map (v, ·)
+
+/-- The `acr` request of an `acr_values` parameter. -/
+def acrValuesRequest (s : String) : AcrRequest :=
+  { values := knownAcrValues (words s), named := !(words s).isEmpty }
+
+/-- The `acr` request in a `claims` parameter (OpenID Connect Core §5.5): its
+`id_token` member's `acr`, if it has one.  `none` when it says nothing about
+`acr`; an error when it is not the JSON object §5.5 describes. -/
+def claimsAcrRequest (claims : String) : Except String (Option AcrRequest) := do
+  let j ← Json.parse claims
+  let .obj _ := j | throw "claims must be a JSON object"
+  let some idToken := (j.getObjVal? "id_token").toOption | return none
+  match idToken.getObjVal? "acr" with
+  | .error _ => return none
+  | .ok .null => return some {}
+  | .ok acr =>
+    let essential := (acr.getObjValAs? Bool "essential").toOption.getD false
+    let vs := match acr.getObjValAs? String "value", acr.getObjValAs? (Array String) "values" with
+      | .ok v, _ => [v]
+      | _, .ok vs => vs.toList
+      | _, _ => []
+    return some { values := knownAcrValues vs, essential, named := !vs.isEmpty }
+
+/-- The weakest level a request names, if it names any pyle knows: any of
+them will do. -/
+def AcrRequest.level (q : AcrRequest) : Option Acr :=
+  q.values.foldl (fun m (_, a) => some (match m with | some b => Acr.min a b | none => a)) none
+
+/-- The `acr` an ID token states for a session at `level`, when the request
+made it an essential claim with values: the first value, in the order given,
+that the level meets.  `none` otherwise — the token then states the session's
+own level. -/
+def AcrRequest.claim (q : AcrRequest) (level : Acr) : Option String :=
+  if q.essential then (q.values.find? fun (_, a) => level.satisfies a).map (·.1) else none
 
 /-- The `max_age` to ask sign-in for: zero for a fresh authentication. -/
 def Requirements.signinMaxAge (q : Requirements) : Option Nat :=
@@ -136,37 +205,46 @@ def authorizeParams (ctx : Ctx) (r : Req) (ps : List (String × String)) : IO Re
       | none => return fail "invalid_request" "pyle_auth_after must be a time"
   let nonce := lookupOnce ps "nonce"
   if nonce.any (·.length > 512) then return fail "invalid_request" "the nonce is too long"
-  let phr := words ((lookupOnce ps "acr_values").getD "") |>.contains "phr"
+  let fromClaims ← match (lookupOnce ps "claims").map claimsAcrRequest with
+    | none => pure none
+    | some (.ok q) => pure q
+    | some (.error e) => return fail "invalid_request" s!"the claims parameter is malformed: {e}"
+  let acrReq := fromClaims.getD (acrValuesRequest ((lookupOnce ps "acr_values").getD ""))
+  if acrReq.essential && acrReq.named && acrReq.values.isEmpty then
+    return fail "unmet_authentication_requirements" "pyle knows none of the acr values asked for"
+  let settings := (← ctx.store.clientSettings clientId).getD {}
+  let level := Acr.max settings.minAcr (acrReq.level.getD .mfa)
   let now ← ctx.clock
   -- `prompt=login` and `max_age=0` ask for an authentication now.
   let login := prompt.contains "login" || maxAge == some 0
   let req : Requirements :=
     { notBefore := if login then some now else authAfter,
-      maxAge := if login then none else maxAge, phr }
+      maxAge := if login then none else maxAge, level }
   let session ← Session.current ctx r
   let some s := session.filter (req.satisfied · now)
-    | if prompt.contains "none" then
-        return fail "login_required" "the user must sign in"
-      -- An authentication too old for the request is renewed at sign-in, and the
+    | -- An authentication too old for the request is renewed at sign-in, and the
       -- way back asks only for one no older than now, which the renewed one is,
       -- so the request cannot loop however long sign-in takes.
-      let freshness : Requirements := { req with phr := false }
-      let stale := (req.notBefore.isSome || req.maxAge.isSome) &&
-        !session.any (freshness.satisfied · now)
-      if stale then
+      let freshness : Requirements := { req with level := .mfa }
+      let stale := !session.any (freshness.satisfied · now)
+      if prompt.contains "none" then
+        if stale then return fail "login_required" "the user must sign in"
+        return fail "interaction_required"
+          s!"the user must sign in again at {level.identifier} or better"
+      if stale && (req.notBefore.isSome || req.maxAge.isSome) then
         let kept := ps.filter fun (k, _) =>
           k != "prompt" && k != "max_age" && k != "pyle_auth_after"
         return signinRedirect
           ("/authorize?" ++ queryString (kept ++ [("pyle_auth_after", toString now)]))
-          req.signinMaxAge phr
-      return signinRedirect (Req.pathAndQuery r) none phr
+          req.signinMaxAge level
+      return signinRedirect (Req.pathAndQuery r) none level
   let some user ← ctx.store.findUser s.user
     | return fail "server_error" "the account is gone"
   let code ← randomToken
   ctx.store.addCode (tokenHash code)
     { clientId, redirectUri, codeChallenge := challenge, user := user.id,
       scope := " ".intercalate scopes, nonce, amr := s.amr, authTime := s.authTime,
-      expires := now + codeSeconds }
+      expires := now + codeSeconds, acr := acrReq.claim s.level }
   ctx.store.setCodeSession (tokenHash code) s.idHash
   return Reply.redirect <| addQuery redirectUri <|
     [("code", code)] ++ (state.map fun st => [("state", st)]).getD [] ++

@@ -283,6 +283,24 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   checkEq "an expired invitation is 404" (← getPage ctx path2).status.toCode 404
   checkEq "and cannot begin" (← postJson ctx (path2 ++ "/begin") emptyObj).status.toCode 404
 
+/-- What the account page says about how well an account is protected. -/
+def safetyTests : IO Unit := do
+  group "web: account safety"
+  let says (c : Acr.Capabilities) (text : String) (nudge : Bool) : IO Unit := do
+    let (t, n) := Web.safety c
+    check s!"says {text.take 40}…" (containsStr t text && n == nudge) s!"{t} {n}"
+  says { verifyingDeviceBound := true, verifying := true, webauthn := true } "strongest" false
+  says { verifying := true, webauthn := true } "a passkey, which cannot be phished" false
+  says { webauthn := true, totp := true } "two factors, but has no passkey" true
+  says { password := true, recovery := true } "two factors" true
+  says { password := true } "cannot sign in again" true
+  says { webauthn := true } "cannot sign in again" true
+  says {} "cannot sign in again" true
+  for (c, level) in [(({ totp := true, recovery := true } : Acr.Capabilities), some Acr.mfa),
+      ({ totp := true }, none), ({ recovery := true }, none), ({ password := true }, none),
+      ({ webauthn := true }, none), ({ verifying := true, webauthn := true }, some .phr)] do
+    check s!"the level of {repr c}" (c.level == level)
+
 /-- The web tests. -/
 def webTests : IO Unit := do
   escapeTests
@@ -290,5 +308,6 @@ def webTests : IO Unit := do
   assetTests
   pageEscapeTests
   invitationTests
+  safetyTests
 
 end PyleTests

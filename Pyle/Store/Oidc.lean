@@ -103,15 +103,19 @@ structure AuthCode where
   authTime : Nat
   /-- When the code stops being accepted (60 s after issue). -/
   expires : Nat
+  /-- The `acr` its ID tokens state, when the request asked for one as an
+  essential claim (OpenID Connect Core §5.5.1.1); otherwise `none`, and they
+  state the level the `amr` records. -/
+  acr : Option String := none
 
 /-- Record an issued code under its hash. -/
 def Store.addCode (s : Store) (codeHash : SecretHash) (a : AuthCode) : IO Unit :=
   s.run fun c => do
     discard <| exec c
       "INSERT INTO codes (code_hash, client_id, redirect_uri, code_challenge, user_id, scope, \
-        nonce, amr, auth_time, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        nonce, amr, auth_time, expires, acr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       #[codeHash, a.clientId, a.redirectUri, a.codeChallenge, a.user, a.scope,
-        Value.opt a.nonce, encodeList a.amr, a.authTime, a.expires]
+        Value.opt a.nonce, encodeList a.amr, a.authTime, a.expires, Value.opt a.acr]
 
 /-- Consume a code: delete it and return what it was bound to, if it existed
 and had not expired at `now`.  An expired code is deleted all the same. -/
@@ -119,7 +123,7 @@ def Store.consumeCode (s : Store) (codeHash : SecretHash) (now : Nat) :
     IO (Option AuthCode) := s.run fun c => do
   let row ← queryOne c
     "DELETE FROM codes WHERE code_hash = ? RETURNING client_id, redirect_uri, code_challenge, \
-      user_id, scope, nonce, amr, auth_time, expires"
+      user_id, scope, nonce, amr, auth_time, expires, acr"
     #[codeHash] fun st => do
       return {
         clientId := ← colText st 0
@@ -130,7 +134,8 @@ def Store.consumeCode (s : Store) (codeHash : SecretHash) (now : Nat) :
         nonce := ← colOpt colText st 5
         amr := ← colList st 6
         authTime := ← colNat st 7
-        expires := ← colNat st 8 : AuthCode }
+        expires := ← colNat st 8
+        acr := ← colOpt colText st 9 : AuthCode }
   return row.filter (now < ·.expires)
 
 /-! ## Refresh tokens -/
@@ -151,6 +156,9 @@ structure RefreshGrant where
   authTime : Nat
   /-- When this token stops being accepted. -/
   expires : Nat
+  /-- The `acr` the ID tokens of the grant state, if the authorization asked
+  for one as an essential claim (`AuthCode.acr`). -/
+  acr : Option String := none
 
 /-- Insert a refresh token row.  Internal: a successor is only ever inserted by
 `rotateRefreshToken`, in the transaction that used its predecessor, and the
@@ -159,9 +167,9 @@ private def insertRefreshToken (c : SQLite) (tokenHash : SecretHash) (g : Refres
     (now : Nat) : IO Unit := do
   discard <| exec c
     "INSERT INTO refresh_tokens (token_hash, family, client_id, user_id, scope, amr, auth_time, \
-      created, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      created, expires, acr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     #[tokenHash, g.family, g.clientId, g.user, g.scope, encodeList g.amr, g.authTime, now,
-      g.expires]
+      g.expires, Value.opt g.acr]
 
 /-- Issue the first refresh token of a new family, after a code exchange or a
 device grant.  Refused if the family already has tokens or has been revoked:
@@ -239,7 +247,7 @@ def Store.rotateRefreshToken (s : Store) (old new : SecretHash) (clientId : Stri
     (now expires : Nat) : IO RefreshOutcome := s.atomically fun c => do
   let row ← queryOne c
     "SELECT family, client_id, user_id, scope, amr, auth_time, expires, used_at, \
-      EXISTS (SELECT 1 FROM revoked_families r WHERE r.family = refresh_tokens.family) \
+      EXISTS (SELECT 1 FROM revoked_families r WHERE r.family = refresh_tokens.family), acr \
       FROM refresh_tokens WHERE token_hash = ?"
     #[old] fun st => do
       return {
@@ -250,7 +258,8 @@ def Store.rotateRefreshToken (s : Store) (old new : SecretHash) (clientId : Stri
           scope := ← colText st 3
           amr := ← colList st 4
           authTime := ← colNat st 5
-          expires := ← colNat st 6 }
+          expires := ← colNat st 6
+          acr := ← colOpt colText st 9 }
         usedAt := ← colOpt colNat st 7
         familyRevoked := (← colInt st 8) != 0 : RefreshRow }
   match refreshDecision row clientId now expires with

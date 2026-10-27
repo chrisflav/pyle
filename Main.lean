@@ -12,11 +12,13 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
 * `pyle user add <name> [--group <group>]…` creates an account.
 * `pyle user list` lists the accounts.
 * `pyle invite <name> [--group <group>]… [--ttl <7d>]` prints a link that
-  creates the account `<name>` with its first passkey.
+  creates the account `<name>` with its first way in.
 * `pyle audit verify` checks the audit log's hash chain.
 * `pyle client add <id> --redirect <uri>… [--public] [--scope <s>]… [--name <n>]
-  [--rs256] [--post-logout <uri>]…` registers an OpenID Connect client and
-  prints its secret, once.
+  [--rs256] [--post-logout <uri>]… [--min-acr <level>]` registers an OpenID
+  Connect client and prints its secret, once.  `--min-acr` is the lowest level
+  a session must reach to sign in to it: `mfa` (the default), `phr` or `phrh`,
+  or the identifier of one.
 * `pyle client list` and `pyle client remove <id>`.
 * `pyle keys rotate [es256|rs256|biscuit]` promotes the waiting next key of
   each named use (all three by default) and announces a fresh one.
@@ -37,7 +39,7 @@ def usage : String :=
   "                                    print a link that creates an account\n" ++
   "  audit verify                      check the audit log's hash chain\n" ++
   "  client add <id> --redirect <uri>... [--public] [--scope <s>]... [--name <n>]\n" ++
-  "             [--rs256] [--post-logout <uri>]...\n" ++
+  "             [--rs256] [--post-logout <uri>]... [--min-acr mfa|phr|phrh]\n" ++
   "                                    register an OpenID Connect client\n" ++
   "  client list                       list the clients\n" ++
   "  client remove <id>                remove a client and its tokens\n" ++
@@ -111,10 +113,19 @@ def userList (path : System.FilePath) : IO UInt32 := do
 
 /-- `pyle client add`. -/
 def clientAdd (path : System.FilePath) (id : String)
-    (redirects scopes names postLogout : List String) (isPublic rs256 : Bool) : IO UInt32 := do
+    (redirects scopes names postLogout : List String) (isPublic rs256 : Bool)
+    (minAcr : Option String) : IO UInt32 := do
+  let minAcr ← match minAcr with
+    | none => pure Acr.mfa
+    | some m => match Acr.ofIdentifier? m with
+      | some a => pure a
+      | none =>
+        IO.eprintln s!"pyle: '{m}' is not a level (mfa, phr or phrh)"
+        return 2
   let store ← openStore path
   let settings : Store.ClientSettings :=
-    { idTokenAlg := if rs256 then "RS256" else "ES256", postLogoutRedirectUris := postLogout }
+    { idTokenAlg := if rs256 then "RS256" else "ES256", postLogoutRedirectUris := postLogout,
+      minAcr }
   let secret ← Oidc.registerClient store id (names.getLast?.getD id) redirects scopes isPublic
     settings (← Http.systemClock)
   match secret with
@@ -130,8 +141,8 @@ def clientList (path : System.FilePath) : IO UInt32 := do
   for c in ← store.listClients do
     let settings := (← store.clientSettings c.id).getD {}
     let kind := if c.secretHash.isSome then "confidential" else "public"
-    IO.println s!"{c.id}\t{kind}\t{settings.idTokenAlg}\tscopes: {" ".intercalate c.scopes}\t\
-      redirects: {" ".intercalate c.redirectUris}"
+    IO.println s!"{c.id}\t{kind}\t{settings.idTokenAlg}\tmin-acr: {settings.minAcr.shortName}\t\
+      scopes: {" ".intercalate c.scopes}\tredirects: {" ".intercalate c.redirectUris}"
   return 0
 
 /-- `pyle client remove`. -/
@@ -213,6 +224,7 @@ def main (args : List String) : IO UInt32 := do
   let (isPublic, args) := takeSwitch "--public" args
   let (rs256, args) := takeSwitch "--rs256" args
   let (ttls, args) := takeFlag "--ttl" args
+  let (minAcrs, args) := takeFlag "--min-acr" args
   try
     match args with
     | ["version"] =>
@@ -228,6 +240,7 @@ def main (args : List String) : IO UInt32 := do
     | ["audit", "verify"] => auditVerify (← configPath configs)
     | ["client", "add", id] =>
       clientAdd (← configPath configs) id redirects scopes names postLogout isPublic rs256
+        minAcrs.getLast?
     | ["client", "list"] => clientList (← configPath configs)
     | ["client", "remove", id] => clientRemove (← configPath configs) id
     | "keys" :: "rotate" :: uses => keysRotate (← configPath configs) uses

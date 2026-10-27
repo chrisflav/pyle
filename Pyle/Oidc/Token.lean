@@ -67,6 +67,19 @@ def codeDecision (row : Option Store.AuthCode) (clientId redirectUri verifier : 
     else if Pkce.verifies verifier a.codeChallenge = false then .badVerifier
     else .issue a
 
+/-- The client's minimum level, if a sign-in with this `amr` falls below it,
+or reads as no level at all.  `/authorize` checked it when the code was
+issued, but the minimum may have been raised since — between the code and its
+exchange, or during the life of a refresh-token family — and the token
+endpoint answers to the minimum as it is now. -/
+def belowMinimum (ctx : Ctx) (client : Store.Client) (amr : List String) : IO (Option Acr) := do
+  let need := ((← ctx.store.clientSettings client.id).getD {}).minAcr
+  return if (Acr.ofAmr amr).any (·.satisfies need) then none else some need
+
+/-- The `invalid_grant` for a sign-in below the client's minimum. -/
+def tooWeakGrant (need : Acr) : Reply :=
+  oauthError "invalid_grant" s!"the sign-in is below this client's minimum, {need.identifier}"
+
 /-- The authorization-code grant.  The code is deleted first, whatever comes
 next, and `codeDecision` decides on what was deleted. -/
 def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String × String)) :
@@ -93,9 +106,11 @@ def codeGrant (ctx : Ctx) (r : Req) (client : Store.Client) (form : List (String
     return oauthError "invalid_grant" "the code verifier does not match the challenge"
   | .issue a =>
     let some user ← liveUser ctx a.user | return oauthError "invalid_grant" "the account is gone"
+    if let some need ← belowMinimum ctx client a.amr then return tooWeakGrant need
     let refresh ← startRefresh ctx (familyOfCode h) client user a.scope a.amr a.authTime session
+      a.acr
     tokenResponse ctx r client user a.scope a.amr a.authTime a.nonce (some refresh)
-      "authorization_code"
+      "authorization_code" a.acr
 
 /-- The refresh-token grant. -/
 def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
@@ -114,6 +129,12 @@ def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
     return oauthError "invalid_grant" "the refresh token was already used"
   | .rotated g =>
     let some user ← liveUser ctx g.user | return oauthError "invalid_grant" "the account is gone"
+    if let some need ← belowMinimum ctx client g.amr then
+      -- The family cannot meet the client's minimum again: end it.
+      discard <| ctx.store.revokeRefreshFamily g.family now
+      Audit.log ctx r .tokenIssued .refused (userName := some user.name)
+        (detail := s!"refresh for {client.id} below {need.identifier}; family revoked")
+      return tooWeakGrant need
     let granted := words g.scope
     let scope ← match lookupOnce form "scope" with
       | none => pure g.scope
@@ -122,7 +143,7 @@ def refreshGrant (ctx : Ctx) (r : Req) (client : Store.Client)
         unless asked.all granted.contains do
           return oauthError "invalid_scope" "the scope exceeds the original grant"
         pure (" ".intercalate asked)
-    tokenResponse ctx r client user scope g.amr g.authTime none (some new) "refresh_token"
+    tokenResponse ctx r client user scope g.amr g.authTime none (some new) "refresh_token" g.acr
 
 /-- `POST /token`. -/
 def token : Handler := fun ctx r => do

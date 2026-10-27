@@ -269,8 +269,37 @@ def migration4 : Migration where
      ) STRICT"
   ]
 
+/-- Assurance levels (DESIGN.md §1, §5):
+
+* per client, the lowest level a session must reach to sign in to it
+  (`pyle client add --min-acr`), the default floor `mfa` for every client
+  registered before;
+* per WebAuthn credential, whether it has verified the user, at registration
+  or in an assertion since, so that an account's strongest level can be told
+  from what it has registered.  Of the credentials registered before this
+  migration, only an account's first — the one its invitation created, which
+  had to verify the user, and which has the account's own creation time — is
+  taken to; any other is not, until an assertion with user verification
+  raises the flag, which nothing lowers;
+* per authorization code and refresh token, the `acr` its ID tokens state
+  when the authorization request asked for one as an essential claim (OpenID
+  Connect Core §5.5.1.1), `NULL` otherwise. -/
+def migration5 : Migration where
+  version := 5
+  description := "assurance levels: client minimums, credential user verification, essential acr"
+  statements := [
+    "ALTER TABLE clients ADD COLUMN min_acr TEXT NOT NULL
+       DEFAULT 'https://refeds.org/profile/mfa'
+       CHECK (min_acr IN ('https://refeds.org/profile/mfa', 'phr', 'phrh'))",
+    "ALTER TABLE webauthn_credentials ADD COLUMN user_verified INTEGER NOT NULL DEFAULT 0",
+    "UPDATE webauthn_credentials SET user_verified = 1 WHERE created =
+       (SELECT created FROM users u WHERE u.id = webauthn_credentials.user_id)",
+    "ALTER TABLE codes ADD COLUMN acr TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN acr TEXT"
+  ]
+
 /-- Every migration, in order.  Append only. -/
-def migrations : List Migration := [migration1, migration2, migration3, migration4]
+def migrations : List Migration := [migration1, migration2, migration3, migration4, migration5]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

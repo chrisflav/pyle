@@ -1,0 +1,233 @@
+/-!
+# Assurance levels
+
+What a sign-in is worth, as the `acr` (authentication context class
+reference) a relying service receives (DESIGN.md §1).  pyle records three
+levels, each a published identifier, lowest first:
+
+| level | identifier | means |
+| --- | --- | --- |
+| `mfa` | `https://refeds.org/profile/mfa` | two factors of distinct kinds (REFEDS MFA Profile) |
+| `phr` | `phr` | phishing-resistant (OpenID Connect EAP ACR Values 1.0 §2) |
+| `phrh` | `phrh` | phishing-resistant, the key held in hardware (the same, §2) |
+
+Each level satisfies every level below it (`satisfies`), and the order is a
+total order (`le_total`, `le_antisymm`, `le_trans`).  For pyle, `phr` is a
+WebAuthn assertion with user verification — the browser binds it to the
+origin, so a party in the middle learns nothing it can replay elsewhere — and
+`phrh` is one from a credential that is not backup-eligible, whose private key
+therefore never leaves the authenticator.  The policy that decides which
+factors reach which level is `Pyle.Policy`; this module only knows the
+levels, how they are written, and how to read one back from the `amr` values
+a sign-in recorded (`ofAmr`).
+
+There is no single-factor level: every sign-in pyle accepts is at least
+`mfa`, so `mfa` is the floor of every comparison, and REFEDS SFA's
+`https://refeds.org/profile/sfa` is a value pyle does not know.
+
+**Identifiers on the wire.**  `ofIdentifier?` reads what a relying party may
+send in `acr_values` or the `claims` parameter, and what the command line, the
+configuration and pyle's own sign-in links name: the three identifiers, the
+bare `mfa` (pyle's own value before levels existed, and the short name of the
+level), and REFEDS MFA 2.0's `https://refeds.org/profile/mfa/phr`, which asks
+for two factors one of which is phishing-resistant and is met by a passkey
+that verifies the user.
+-/
+
+namespace Pyle
+
+/-- The assurance levels pyle records, lowest first. -/
+inductive Acr where
+  /-- Two factors of distinct kinds. -/
+  | mfa
+  /-- Phishing-resistant: WebAuthn with user verification. -/
+  | phr
+  /-- Phishing-resistant from a device-bound credential: WebAuthn with user
+  verification from a credential that is not backup-eligible. -/
+  | phrh
+  deriving DecidableEq, Repr, Inhabited
+
+namespace Acr
+
+/-- The position of a level in the order. -/
+def rank : Acr → Nat
+  | .mfa => 0
+  | .phr => 1
+  | .phrh => 2
+
+/-- `a ≤ b` when `b` is at least as strong as `a`. -/
+instance : LE Acr := ⟨fun a b => a.rank ≤ b.rank⟩
+
+instance (a b : Acr) : Decidable (a ≤ b) := inferInstanceAs (Decidable (a.rank ≤ b.rank))
+
+/-- Every level, lowest first. -/
+def all : List Acr := [.mfa, .phr, .phrh]
+
+/-- The identifier a level is written as in tokens and discovery. -/
+def identifier : Acr → String
+  | .mfa => "https://refeds.org/profile/mfa"
+  | .phr => "phr"
+  | .phrh => "phrh"
+
+/-- The short name of a level, for people and for pyle's own links. -/
+def shortName : Acr → String
+  | .mfa => "mfa"
+  | .phr => "phr"
+  | .phrh => "phrh"
+
+instance : ToString Acr := ⟨identifier⟩
+
+/-- A level as a relying party, an administrator or pyle's own pages name it:
+one of the three identifiers, the bare `mfa`, or REFEDS MFA 2.0's
+phishing-resistant MFA (see the module documentation).  Anything else —
+REFEDS SFA among it — is not a level pyle knows. -/
+def ofIdentifier? : String → Option Acr
+  | "https://refeds.org/profile/mfa" => some .mfa
+  | "mfa" => some .mfa
+  | "https://refeds.org/profile/mfa/phr" => some .phr
+  | "phr" => some .phr
+  | "phrh" => some .phrh
+  | _ => none
+
+/-- The stronger of two levels. -/
+def max (a b : Acr) : Acr := if a ≤ b then b else a
+
+/-- The weaker of two levels. -/
+def min (a b : Acr) : Acr := if a ≤ b then a else b
+
+/-- Whether a sign-in at level `got` meets a demand for level `want`. -/
+def satisfies (got want : Acr) : Bool := decide (want ≤ got)
+
+/-- The level a list of `amr` values (RFC 8176) records, as `Policy` writes
+them: `phrh` with `user` and `hwk`, `phr` with `user` and `swk`, `mfa` with
+`mfa` (two kinds of factor), and none for anything else — `["pwd"]`, `["hwk"]`,
+`["otp"]` or `[]` are no level, and whatever reads them refuses them.
+`Policy.Authentication.level_eq_ofAmr` proves that for every authentication
+pyle accepts this gives back the level its factors reach, so a session, a code
+or a token that keeps the `amr` keeps the level. -/
+def ofAmr (amr : List String) : Option Acr :=
+  if amr.contains "user" && amr.contains "hwk" then some .phrh
+  else if amr.contains "user" && amr.contains "swk" then some .phr
+  else if amr.contains "mfa" then some .mfa
+  else none
+
+/-! ## The order -/
+
+/-- The order is the order of the ranks. -/
+theorem le_iff {a b : Acr} : a ≤ b ↔ a.rank ≤ b.rank := Iff.rfl
+
+/-- Every level is at least itself. -/
+theorem le_refl (a : Acr) : a ≤ a := Nat.le_refl _
+
+/-- The order is transitive. -/
+theorem le_trans {a b c : Acr} (h₁ : a ≤ b) (h₂ : b ≤ c) : a ≤ c := Nat.le_trans h₁ h₂
+
+/-- **The order is total**: of two levels, one is at least the other. -/
+theorem le_total (a b : Acr) : a ≤ b ∨ b ≤ a := Nat.le_total _ _
+
+/-- Two levels of one rank are one level. -/
+theorem rank_injective {a b : Acr} (h : a.rank = b.rank) : a = b := by
+  cases a <;> cases b <;> first | rfl | (simp [rank] at h)
+
+/-- The order is antisymmetric. -/
+theorem le_antisymm {a b : Acr} (h₁ : a ≤ b) (h₂ : b ≤ a) : a = b :=
+  rank_injective (Nat.le_antisymm h₁ h₂)
+
+/-- `mfa` is the least level. -/
+theorem mfa_le (a : Acr) : Acr.mfa ≤ a := Nat.zero_le _
+
+/-- `phrh` is the greatest level. -/
+theorem le_phrh (a : Acr) : a ≤ Acr.phrh := by cases a <;> decide
+
+/-- The stronger of two levels is at least the first. -/
+theorem le_max_left (a b : Acr) : a ≤ max a b := by
+  unfold max; split
+  · assumption
+  · exact le_refl a
+
+/-- The stronger of two levels is at least the second. -/
+theorem le_max_right (a b : Acr) : b ≤ max a b := by
+  unfold max; split
+  · exact le_refl b
+  · rcases le_total a b with h | h
+    · contradiction
+    · exact h
+
+/-- The weaker of two levels is at most the first. -/
+theorem min_le_left (a b : Acr) : min a b ≤ a := by
+  unfold min; split
+  · exact le_refl a
+  · rcases le_total a b with h | h
+    · contradiction
+    · exact h
+
+/-- The weaker of two levels is at most the second. -/
+theorem min_le_right (a b : Acr) : min a b ≤ b := by
+  unfold min; split
+  · assumption
+  · exact le_refl b
+
+/-! ## Satisfying a demand -/
+
+/-- `satisfies` is the order. -/
+theorem satisfies_iff {h w : Acr} : satisfies h w = true ↔ w ≤ h := by
+  simp [satisfies]
+
+/-- Every level satisfies itself. -/
+theorem satisfies_refl (a : Acr) : satisfies a a = true := satisfies_iff.mpr (le_refl a)
+
+/-- **`satisfies` is monotone**: a stronger sign-in meets every demand a weaker
+one meets, and a sign-in that meets a demand meets every weaker demand. -/
+theorem satisfies_mono {h h' w w' : Acr} (hs : satisfies h w = true) (hh : h ≤ h')
+    (hw : w' ≤ w) : satisfies h' w' = true :=
+  satisfies_iff.mpr (le_trans hw (le_trans (satisfies_iff.mp hs) hh))
+
+/-- Meeting the stronger of two demands meets both: a demand a request adds
+to a floor never lowers the floor. -/
+theorem satisfies_max {h a b : Acr} (hs : satisfies h (max a b) = true) :
+    satisfies h a = true ∧ satisfies h b = true :=
+  ⟨satisfies_mono hs (le_refl h) (le_max_left a b),
+   satisfies_mono hs (le_refl h) (le_max_right a b)⟩
+
+/-- Every level is read back from its identifier. -/
+theorem ofIdentifier_identifier (a : Acr) : ofIdentifier? a.identifier = some a := by
+  cases a <;> rfl
+
+/-- Every level is read back from its short name. -/
+theorem ofIdentifier_shortName (a : Acr) : ofIdentifier? a.shortName = some a := by
+  cases a <;> rfl
+
+/-- REFEDS SFA is not a level pyle knows. -/
+theorem ofIdentifier_sfa : ofIdentifier? "https://refeds.org/profile/sfa" = none := rfl
+
+/-! ## What an account could reach -/
+
+/-- What kinds of factor an account has registered, for working out the
+strongest level it could sign in at (`level`). -/
+structure Capabilities where
+  /-- A WebAuthn credential that verifies the user and is not backup-eligible. -/
+  verifyingDeviceBound : Bool := false
+  /-- A WebAuthn credential that verifies the user. -/
+  verifying : Bool := false
+  /-- Any WebAuthn credential. -/
+  webauthn : Bool := false
+  /-- A TOTP secret. -/
+  totp : Bool := false
+  /-- A password, in a deployment that allows them. -/
+  password : Bool := false
+  /-- Unspent recovery codes. -/
+  recovery : Bool := false
+  deriving Repr, BEq, Inhabited
+
+/-- The strongest level an account with these factors could sign in at:
+`phrh` or `phr` with a credential that verifies the user (device-bound for
+`phrh`), `mfa` with two kinds of factor, and none otherwise — one factor alone
+signs nobody in. -/
+def Capabilities.level (c : Capabilities) : Option Acr :=
+  if c.verifyingDeviceBound then some .phrh
+  else if c.verifying then some .phr
+  else if [c.webauthn, c.totp, c.password, c.recovery].count true ≥ 2 then some .mfa
+  else none
+
+end Acr
+end Pyle

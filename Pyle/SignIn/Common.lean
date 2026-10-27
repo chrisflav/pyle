@@ -292,7 +292,7 @@ def credentialRow (c : WebAuthn.NewCredential) (user : UserId) (name : String)
   { id := c.id, user, algorithm := c.publicKey.algorithm.toInt, publicKey := c.publicKey.bytes,
     signCount := c.signCount.toNat, backupEligible := c.backupEligible,
     backupState := c.backupState, aaguid := c.aaguid, transports, name, created := now,
-    lastUsed := none }
+    lastUsed := none, userVerified := c.userVerified }
 
 /-- The longest name an authenticator may be given. -/
 def maxCredentialName : Nat := 64

@@ -8,25 +8,33 @@ The endpoints behind the sign-in page, as JSON over `fetch`:
 | | body | answer |
 | --- | --- | --- |
 | `POST /signin/webauthn/begin` | `{}` or `{"name"}` | request options |
-| `POST /signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?}` | `{"redirect", "amr", "acr"}` |
+| `POST /signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?, "acr"?}` | `{"redirect", "amr", "acr"}` |
 | `POST /signin/stepup/begin` | `{"userVerification"?}` | request options |
 | `POST /signin/stepup/finish` | as `/signin/webauthn/finish` | as `/signin/webauthn/finish` |
-| `POST /signin/codes` | `{"name", "password"?, "totp"?, "recovery"?, "return"?}` | as `/signin/webauthn/finish` |
+| `POST /signin/codes` | `{"name", "password"?, "totp"?, "recovery"?, "return"?, "acr"?}` | as `/signin/webauthn/finish` |
 
 **Passkeys.**  `begin` with no name starts the discoverable flow of DESIGN
 §7: no username is asked for, user verification is required, and the
-browser must return the user handle.  A passkey's assertion is a strong
-authentication on its own.
+browser must return the user handle.  A passkey's assertion reaches `phr`
+on its own, `phrh` from a device-bound credential.
 
 **Security keys and codes.**  `begin` with a name lists that account's
 credentials, for a security key that cannot be discovered or does not verify
 the user; such an assertion is one factor, and `finish` needs a TOTP code, a
-recovery code or a password with it.  The list is padded to a fixed length
-with ids derived from the name, so the answer has the same shape whether the
-name exists or not.
+recovery code or a password with it, which makes it `mfa`.  The list is
+padded to a fixed length with ids derived from the name, so the answer has the
+same shape whether the name exists or not.
 `/signin/codes` signs in with two of a password, a TOTP code and a recovery
-code; given fewer than two it refuses before checking anything, so a
+code (`mfa`); given fewer than two it refuses before checking anything, so a
 password alone is never even tried.
+
+**The level asked for.**  A body may name the level the sign-in must reach,
+as `acr` (a short name or an identifier, `Acr.ofIdentifier?`); the sign-in
+page passes on the one a service asked for.  Every sign-in is at least `mfa`,
+so only `phr` and `phrh` can fall short: the code form and a security key
+without user verification are refused before any second factor is checked,
+and an assertion that verified the user but is not device-bound after, with
+`401 stronger_authentication_required` and no session.
 
 **Step-up.**  `/signin/stepup/*` re-authenticates the request's session
 (§4) without ending it.  Every finish does the same when the request already
@@ -107,14 +115,23 @@ def checkExtras (ctx : Ctx) (r : Req) (user : User) (e : Extras) :
     | none => return .error ("recovery", "wrong or spent recovery code")
   return .ok factors
 
-/-- The reply to a strong authentication: `{"redirect", "amr", "acr"}` with
-the new session cookie. -/
+/-- The level a body asks the sign-in to reach, `mfa` (anything) if it names
+none; the `400` to answer if it names a level pyle does not know. -/
+def wantOf (j : Json) : Except Reply Acr :=
+  match strField j "acr" with
+  | none => .ok .mfa
+  | some s => match Acr.ofIdentifier? s with
+    | some a => .ok a
+    | none => .error (badRequest "'acr' is not a level pyle knows")
+
+/-- The reply to an authentication: `{"redirect", "amr", "acr"}` with the new
+session cookie, `acr` being the session's level. -/
 def signedIn (ctx : Ctx) (s : Session) (id : String) (ret : String) : IO Reply := do
   let body := Json.mkObj [("redirect", ret), ("amr", toJson s.amr),
-    ("acr", Policy.acr s.amr)]
+    ("acr", s.level.identifier)]
   return Session.setCookie ctx s id (← ctx.clock) (.json body)
 
-/-- What finishing with a strong authentication came to. -/
+/-- What finishing with an authentication came to. -/
 structure Concluded where
   /-- The reply, with the new cookie. -/
   reply : Reply
@@ -124,11 +141,11 @@ structure Concluded where
   it. -/
   ended : Option Session
 
-/-- Finish with a strong authentication: step up the request's session if it
-is the same user's, otherwise establish a new one (which ends the request's
-session, if any).  With `stepUpOnly`, there must be a session to step up, and
-`none` if there is not. -/
-def conclude (ctx : Ctx) (r : Req) (sa : StrongAuthentication) (ret : String)
+/-- Finish with an authentication: step up the request's session if it is the
+same user's, otherwise establish a new one (which ends the request's session,
+if any).  With `stepUpOnly`, there must be a session to step up, and `none` if
+there is not. -/
+def conclude (ctx : Ctx) (r : Req) (sa : Authentication) (ret : String)
     (stepUpOnly : Bool) : IO (Option Concluded) := do
   let current ← Session.current ctx r
   if let some s := current then
@@ -140,9 +157,10 @@ def conclude (ctx : Ctx) (r : Req) (sa : StrongAuthentication) (ret : String)
   return some { reply := ← signedIn ctx s id ret, steppedUp := false, ended := current }
 
 /-- Conclude, and only then count the attempts as successes and audit: the
-sign-in or step-up, and the session a new sign-in ended. -/
+sign-in or step-up with the level it reached, and the session a new sign-in
+ended. -/
 def concludeAndRecord (ctx : Ctx) (r : Req) (event : Audit.Event) (who : String)
-    (sa : StrongAuthentication) (ret : String) (stepUpOnly : Bool) (lim : RateLimiter)
+    (sa : Authentication) (ret : String) (stepUpOnly : Bool) (lim : RateLimiter)
     (attempts : List Attempt) : IO Reply := do
   match ← conclude ctx r sa ret stepUpOnly with
   | none =>
@@ -151,7 +169,7 @@ def concludeAndRecord (ctx : Ctx) (r : Req) (event : Audit.Event) (who : String)
   | some c =>
     for a in attempts do lim.succeed a
     Audit.log ctx r (if c.steppedUp then .stepUp else event) .success (userName := some who)
-      (factor := some (", ".intercalate sa.labels))
+      (factor := some (", ".intercalate sa.labels)) (detail := s!"acr {sa.level.identifier}")
     if let some old := c.ended then
       Audit.log ctx r .signOut .success (userName := ← userName ctx old.user)
         (detail := "replaced by a new sign-in")
@@ -163,13 +181,27 @@ def secondFactorRequired : Reply :=
   Reply.error .unauthorized "second_factor_required"
     "this authenticator needs a second factor: a TOTP code, a recovery code or a password"
 
+/-- `401 stronger_authentication_required`: the factors checked out, or would
+have, but cannot reach `want`; only a passkey can. -/
+def strongerRequired (want : Acr) : Reply :=
+  Reply.error .unauthorized "stronger_authentication_required" <|
+    if want == .phrh then
+      "this needs a passkey or security key that verifies you and keeps its key on the device"
+    else "this needs a passkey, or a security key that verifies you"
+
 /-- The audit event of a ceremony. -/
 def eventOf (purpose : ChallengePurpose) : Audit.Event :=
   if purpose == .stepUp then .stepUp else .signIn
 
 /-- `POST /signin/webauthn/finish` (`purpose = authenticate`) and
 `POST /signin/stepup/finish` (`purpose = stepUp`): check the assertion and any
-second factors with it, and sign in or step up.
+second factors with it, and sign in or step up, if together they reach the
+level the body asks for.  Second factors with an assertion that is
+phishing-resistant on its own (`phr` or better) are ignored, neither checked
+nor counted: they could not raise its level, and a mistyped code must not fail
+a passkey.  With any other assertion they are checked — unless even with them
+the level asked for is out of reach (above `mfa`), in which case the attempt is
+refused before they are touched.
 
 The attempt counts against the client address from the start.  Once the
 assertion has said whose account it is, second factors that come with it
@@ -182,6 +214,9 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
     | .error rep => return rep
   let ret ← match returnOf j with
     | .ok t => pure t
+    | .error rep => return rep
+  let want ← match wantOf j with
+    | .ok a => pure a
     | .error rep => return rep
   let some credJ := (j.getObjVal? "credential").toOption | return badRequest "'credential' is missing"
   let resp ← match parseAssertion credJ with
@@ -198,6 +233,20 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
       Audit.log ctx r event .failure (factor := some credLabel) (detail := e.reason)
       return authenticationFailed
     | .ok ca =>
+      -- A phishing-resistant assertion stands alone, at its own level;
+      -- any other reaches `mfa` with a second factor, and nothing without.
+      let pr := decide ca.factor.PhishingResistant
+      let extras : Extras :=
+        if pr then { totp := none, recovery := none, password := none } else extras
+      let best := if pr then Policy.level [ca.factor] else .mfa
+      unless best.satisfies want do
+        Audit.log ctx r event .failure (userName := some ca.user.name)
+          (factor := some credLabel) (detail := s!"{want.identifier} asked for")
+        return strongerRequired want
+      if !pr && extras.count == 0 then
+        Audit.log ctx r event .failure (userName := some ca.user.name)
+          (factor := some credLabel) (detail := "second factor required")
+        return secondFactorRequired
       let mut attempts := [attempt]
       if extras.count > 0 then
         -- The address was counted by `limited` already; the client key here
@@ -215,10 +264,14 @@ def finishAssertion (purpose : ChallengePurpose) : Handler := fun ctx r => do
           (detail := why)
         return authenticationFailed
       | .ok more =>
-        let some sa := StrongAuthentication.ofFactors (ca.factor :: more)
+        let some sa := Authentication.ofFactors (ca.factor :: more)
           | Audit.log ctx r event .failure (userName := some ca.user.name)
               (factor := some credLabel) (detail := "second factor required")
             return secondFactorRequired
+        unless sa.level.satisfies want do
+          Audit.log ctx r event .failure (userName := some ca.user.name)
+            (factor := some credLabel) (detail := s!"{want.identifier} asked for")
+          return strongerRequired want
         concludeAndRecord ctx r event ca.user.name sa ret stepUpOnly lim attempts
 
 /-- A user name as typed: trimmed and lower-cased, as names are stored. -/
@@ -284,7 +337,8 @@ def beginStepUp : Handler := fun ctx r => do
   return .json (requestOptions ctx ch (creds.toList.map fun c => descriptor c.id c.transports) uv)
 
 /-- `POST /signin/codes`: sign in, or step up, with two of a password, a TOTP
-code and a recovery code. -/
+code and a recovery code.  Fewer than two, or a body asking for more than
+`mfa`, is refused before anything is checked. -/
 def signInWithCodes : Handler := fun ctx r => do
   let j ← match jsonBody r with
     | .ok j => pure j
@@ -294,10 +348,14 @@ def signInWithCodes : Handler := fun ctx r => do
     | .error rep => return rep
   let some name := (strField j "name").map normaliseName |>.filter (!·.isEmpty)
     | return badRequest "'name' is missing"
+  let want ← match wantOf j with
+    | .ok a => pure a
+    | .error rep => return rep
   let extras := extrasOf j
   if extras.count < 2 then
     return Reply.error .badRequest "two_factors_required"
       "two of a password, a TOTP code and a recovery code are needed"
+  unless Acr.mfa.satisfies want do return strongerRequired want
   limited ctx r .signIn (some name) fun lim attempt => do
     let user ← ctx.store.findUserByName name
     let some user := user.filter (!·.disabled)
@@ -309,10 +367,14 @@ def signInWithCodes : Handler := fun ctx r => do
       Audit.log ctx r .signIn .failure (userName := some name) (factor := some f) (detail := why)
       return authenticationFailed
     | .ok factors =>
-      let some sa := StrongAuthentication.ofFactors factors
+      let some sa := Authentication.ofFactors factors
         | Audit.log ctx r .signIn .failure (userName := some name)
             (detail := "the factors do not satisfy the policy")
           return authenticationFailed
+      unless sa.level.satisfies want do
+        Audit.log ctx r .signIn .failure (userName := some name)
+          (detail := s!"{want.identifier} asked for")
+        return strongerRequired want
       concludeAndRecord ctx r .signIn name sa ret false lim [attempt]
 
 end SignIn

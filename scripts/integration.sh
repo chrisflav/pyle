@@ -96,9 +96,18 @@ SECRET="$(tail -1 "$WORK/client.log")"
 check $? "the secret is printed and only its hash kept"
 "$PYLE" client add tv --public --name TV --redirect "http://127.0.0.1/cb" > "$WORK/tv.log" 2>&1
 check $? "pyle client add tv --public" "$(cat "$WORK/tv.log")"
+"$PYLE" client add vault --name Vault --redirect "$REDIRECT" --min-acr phr > "$WORK/vault.log" 2>&1
+check $? "pyle client add vault --min-acr phr" "$(cat "$WORK/vault.log")"
+for LEVEL in gold sfa https://refeds.org/profile/sfa; do
+  OUT="$("$PYLE" client add odd --redirect "$REDIRECT" --min-acr "$LEVEL" 2>&1)"
+  [ $? -ne 0 ] && grep -q "is not a level" <<< "$OUT"
+  check $? "--min-acr $LEVEL is refused" "$OUT"
+done
 CLIENTS="$("$PYLE" client list 2>&1)"
-grep -q "^app	confidential	ES256" <<< "$CLIENTS"
-check $? "pyle client list" "$CLIENTS"
+grep -q "^app	confidential	ES256	min-acr: mfa" <<< "$CLIENTS"
+check $? "pyle client list, with the mfa floor by default" "$CLIENTS"
+grep -q "^vault	confidential	ES256	min-acr: phr" <<< "$CLIENTS"
+check $? "and the minimum given" "$CLIENTS"
 
 # ---------------------------------------------------------------- the server
 "$PYLE" serve > "$WORK/pyle.log" 2>&1 &

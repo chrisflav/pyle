@@ -14,9 +14,10 @@ lines that turn base64url into `ArrayBuffer`s and back, call
 What the script relies on, and the Lean side provides:
 
 * `body[data-page]` is `signin`, `account`, `invite` or `message`; the sign-in
-  page adds `data-mode` (`signin` or `stepup`) and `data-return`, a return
-  address `SignIn.safeReturn` has already accepted; the invitation page adds
-  `data-token`.
+  page adds `data-mode` (`signin` or `stepup`), `data-return`, a return
+  address `SignIn.safeReturn` has already accepted, and `data-acr`, the level
+  the sign-in must reach, which the script passes on to the endpoints; the
+  invitation page adds `data-token`.
 * The element ids each page's script looks up are the ones the page writes
   (`Pyle.Web.Pages`), and the JSON members it reads and sends are the ones
   the endpoints document.
@@ -184,13 +185,14 @@ function secondFactors() {
 // The sign-in page, which also serves step-up.
 function setupSignIn(body) {
   const ret = body.dataset.return || '/account';
+  const acr = body.dataset.acr || 'mfa';
   const stepUp = body.dataset.mode === 'stepup';
   const beginUrl = stepUp ? '/signin/stepup/begin' : '/signin/webauthn/begin';
   const finishUrl = stepUp ? '/signin/stepup/finish' : '/signin/webauthn/finish';
   on('passkey', 'click', async function () {
     try {
       const credential = await getAssertion(beginUrl, {});
-      await finish(finishUrl, { credential: credential, return: ret });
+      await finish(finishUrl, { credential: credential, return: ret, acr: acr });
     } catch (e) { failed(e); }
   });
   on('security-key', 'click', async function () {
@@ -200,14 +202,14 @@ function setupSignIn(body) {
       const credential = await getAssertion(beginUrl,
         stepUp ? { userVerification: 'discouraged' } : { name: name });
       await finish(finishUrl,
-        Object.assign({ credential: credential, return: ret }, secondFactors()));
+        Object.assign({ credential: credential, return: ret, acr: acr }, secondFactors()));
     } catch (e) { failed(e); }
   });
   on('other', 'submit', async function (ev) {
     ev.preventDefault();
     try {
       await finish('/signin/codes',
-        Object.assign({ name: value('name'), return: ret }, secondFactors()));
+        Object.assign({ name: value('name'), return: ret, acr: acr }, secondFactors()));
     } catch (e) { failed(e); }
   });
 }

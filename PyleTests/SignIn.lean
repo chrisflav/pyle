@@ -11,7 +11,8 @@ would and the authenticator data and signature an authenticator would, with
 
 The negative cases are the point: a password alone, a TOTP code alone, a
 recovery code alone and a security key without user verification alone get
-no session; a replayed challenge, a wrong origin, a counter that went
+no session; each level is reached by the factors that justify it and by no
+others; a replayed challenge, a wrong origin, a counter that went
 backwards and an open-redirect `return` are refused; five wrong TOTP codes
 lock TOTP; and the rate limiter answers `429`.
 
@@ -136,7 +137,7 @@ def enrol (ctx : Ctx) (user : Store.User) (k : SoftKey) (name : String := "test 
     { id := k.id, user := user.id, algorithm := k.alg.toInt, publicKey := k.publicKey,
       signCount := 0, backupEligible := k.backupEligible, backupState := k.backupEligible,
       aaguid := ByteArray.mk (Array.replicate 16 0), transports := [], name,
-      created := ← ctx.clock, lastUsed := none }
+      created := ← ctx.clock, lastUsed := none, userVerified := k.uv }
 
 /-! ## Requests -/
 
@@ -219,20 +220,20 @@ def sessionFor (ctx : Ctx) (user : Store.User) : IO (String × SoftKey) := do
     | throw (.userError s!"sessionFor: the sign-in failed: {r.bodyText}")
   return (id, k)
 
-/-- A `StrongAuthentication` for a soft key, through `Policy.checkAssertion`
+/-- An `Authentication` for a soft key alone, through `Policy.checkAssertion`
 and a challenge issued the way the endpoints issue one. -/
-def strongFor (ctx : Ctx) (k : SoftKey) : IO Policy.StrongAuthentication := do
+def authFor (ctx : Ctx) (k : SoftKey) : IO Policy.Authentication := do
   let ch ← match ← SignIn.newChallenge ctx (Req.mk' .post "/") .authenticate none with
     | .ok ch => pure ch
-    | .error _ => throw (.userError "strongFor: no challenge")
+    | .error _ => throw (.userError "authFor: no challenge")
   let cred ← k.assert (SignIn.requestOptions ctx ch [] "required")
   let resp ← IO.ofExcept (SignIn.parseAssertion cred)
   match ← Policy.checkAssertion ctx .authenticate resp with
-  | .error e => throw (.userError s!"strongFor: {e.reason}")
+  | .error e => throw (.userError s!"authFor: {e.reason}")
   | .ok ca =>
-    match Policy.StrongAuthentication.ofFactors [ca.factor] with
+    match Policy.Authentication.ofFactors [ca.factor] with
     | some sa => return sa
-    | none => throw (.userError "strongFor: the key does not verify the user")
+    | none => throw (.userError "authFor: no authentication")
 
 /-- Give a user a TOTP secret straight in the store; the secret. -/
 def giveTotp (ctx : Ctx) (u : Store.User) : IO ByteArray := do
@@ -286,7 +287,7 @@ def passkeyTests : IO Unit := withCtx fun ctx clock => do
   checkEq "and goes to the account by default" (jstr body "redirect") "/account"
   checkEq "amr: a device-bound key with user verification"
     ((body.getObjValAs? (List String) "amr").toOption) (some ["hwk", "user"])
-  checkEq "acr: phishing-resistant" (jstr body "acr") "phr"
+  checkEq "acr: phishing-resistant, from a device-bound key" (jstr body "acr") "phrh"
   let some id := sessionCookieOf r | check "a session cookie is set" false
   let s ← Session.current ctx (withCookie id)
   checkEq "the cookie is alice's session" (s.map (·.user)) (some alice.id)
@@ -404,7 +405,18 @@ def secondFactorTests : IO Unit := withCtx fun ctx clock => do
   checkEq "amr: the key, otp and mfa"
     ((replyJson withCode).getObjValAs? (List String) "amr").toOption
     (some ["hwk", "otp", "mfa"])
-  checkEq "acr: mfa, not phishing-resistant" (jstr (replyJson withCode) "acr") "mfa"
+  checkEq "acr: mfa, not phishing-resistant" (jstr (replyJson withCode) "acr")
+    "https://refeds.org/profile/mfa"
+  let b2' ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
+  let notPhr ← postJson ctx "/signin/webauthn/finish"
+    (Json.mkObj [("credential", ← k.assert (replyJson b2') (withHandle := false)),
+      ("totp", totpAt secret (← clock.get)), ("acr", "phr")])
+  checkEq "asked for phr, it is refused before the code is checked"
+    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
+  let unknownAcr ← postJson ctx "/signin/webauthn/finish"
+    (Json.mkObj [("credential", ← k.assert (replyJson b2') (withHandle := false)),
+      ("acr", "https://refeds.org/profile/sfa")])
+  checkEq "REFEDS SFA is not a level pyle knows" unknownAcr.status.toCode 400
   -- The same code again, in the next sign-in.
   let b3 ← postJson ctx "/signin/webauthn/begin" (Json.mkObj [("name", "carol")])
   let reused ← postJson ctx "/signin/webauthn/finish"
@@ -469,6 +481,12 @@ def codeTests : IO Unit :=
   checkEq "a password and a TOTP code sign in" ok.status.toCode 200
   checkEq "amr: pwd, otp, mfa" ((replyJson ok).getObjValAs? (List String) "amr").toOption
     (some ["pwd", "otp", "mfa"])
+  let log ← Audit.entries ctx.store
+  check "the level reached is audited"
+    (log.any fun e => e.event == "sign-in" && e.detail == "acr https://refeds.org/profile/mfa")
+  let notPhr ← signIn [("password", pw), ("totp", "123456"), ("acr", "phr")]
+  checkEq "codes are never phr"
+    (notPhr.status.toCode, errorOf notPhr) (401, "stronger_authentication_required")
   let unknown ← postJson ctx "/signin/codes"
     (Json.mkObj [("name", "nobody"), ("password", pw), ("totp", "123456")])
     (client := "198.51.100.8")
@@ -626,17 +644,27 @@ def establishTests : IO Unit := withCtx fun ctx _ => do
   let jo ← ctx.store.addUser "jo" [] 1
   let k ← SoftKey.new
   enrol ctx jo k
-  let sa ← strongFor ctx k
-  checkEq "a passkey assertion is a strong authentication" sa.amr ["hwk", "user"]
-  checkEq "phishing-resistant" sa.phishingResistant true
+  let sa ← authFor ctx k
+  checkEq "a passkey assertion is an authentication" sa.amr ["hwk", "user"]
+  check "at phrh" (sa.level == .phrh)
   let (s, _) ← Policy.establish ctx (Req.mk' .post "/") sa
   checkEq "establish starts jo's session" s.user jo.id
-  checkEq "acr of hwk+user" (Policy.acr ["hwk", "user"]) "phr"
-  checkEq "acr of swk+user+mfa" (Policy.acr ["swk", "user", "mfa"]) "phr"
-  checkEq "acr of hwk alone" (Policy.acr ["hwk", "otp", "mfa"]) "mfa"
-  checkEq "acr of pwd and otp" (Policy.acr ["pwd", "otp", "mfa"]) "mfa"
+  check "which records the level" (s.level == .phrh)
+  for (amr, level) in [(["hwk", "user"], Acr.phrh), (["swk", "user"], .phr),
+      (["swk", "user", "otp", "mfa"], .phr), (["hwk", "otp", "mfa"], .mfa),
+      (["pwd", "otp", "mfa"], .mfa)] do
+    check s!"the level of {amr}" (Acr.ofAmr amr == some level)
+  for amr in [["pwd"], ["hwk"], ["swk"], ["otp"], ["rec"], ["user"], ["pwd", "otp"], []] do
+    check s!"{amr} is no level" (Acr.ofAmr amr).isNone
+  let synced ← SoftKey.new (backupEligible := true)
+  enrol ctx jo synced
+  check "a synced passkey is phr" ((← authFor ctx synced).level == .phr)
+  let touch ← SoftKey.new (uv := false)
+  enrol ctx jo touch
+  check "a security key touched alone is no authentication"
+    (← (do discard <| authFor ctx touch; pure false) <|> pure true)
   let kim ← ctx.store.addUser "kim" [] 1
-  let (ks, _) ← Policy.establish ctx (Req.mk' .post "/") (← strongFor ctx (← do
+  let (ks, _) ← Policy.establish ctx (Req.mk' .post "/") (← authFor ctx (← do
     let kk ← SoftKey.new
     enrol ctx kim kk
     pure kk))

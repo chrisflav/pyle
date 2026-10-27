@@ -53,17 +53,17 @@ def Req.pathAndQuery (r : Req) : String :=
 
 /-- The URL of the sign-in page that comes back to `returnTo`, a path and query
 on this issuer, once the session has authenticated within `maxAge` seconds (if
-given) and with a phishing-resistant authenticator (if `phr`). -/
-def signinUrl (returnTo : String) (maxAge : Option Nat := none) (phr : Bool := false) :
+given) and at level `acr` or better (if given). -/
+def signinUrl (returnTo : String) (maxAge : Option Nat := none) (acr : Option Acr := none) :
     String :=
   "/signin?" ++ queryString ([("return", returnTo)] ++
     (maxAge.map fun a => [("max_age", toString a)]).getD [] ++
-    (if phr then [("acr", "phr")] else []))
+    (acr.map fun a => [("acr", a.shortName)]).getD [])
 
 /-- Send the browser to sign in, and back to `returnTo` afterwards. -/
-def signinRedirect (returnTo : String) (maxAge : Option Nat := none) (phr : Bool := false) :
+def signinRedirect (returnTo : String) (maxAge : Option Nat := none) (acr : Option Acr := none) :
     Reply :=
-  Reply.redirect (signinUrl returnTo maxAge phr)
+  Reply.redirect (signinUrl returnTo maxAge acr)
 
 /-- The `sub` pyle gives a user: the base64url of the account's random user
 handle, stable for the account's life and saying nothing about its name. -/

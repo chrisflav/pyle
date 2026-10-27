@@ -7,19 +7,24 @@ import Pyle.Web.Assets
 
 Three pages, rendered here and driven by `/assets/pyle.js`:
 
-* `GET /signin?return=…&max_age=…&acr=phr` — the sign-in page of the seam
-  with the protocol endpoints.  A request whose session already satisfies
-  `max_age` and `acr` is sent straight back to `return` (`303`); one with a
-  session that does not is shown the page in step-up mode, which
-  re-authenticates that session; one without a session is shown the sign-in
-  page.  With `acr=phr` only a passkey (WebAuthn with user verification) is
-  offered, since nothing else makes the session phishing-resistant.  A
-  `return` that is not a path on this origin is refused with `400` rather than
-  replaced, so a link that tried to misuse it fails visibly.
-* `GET /account` — the account: authenticators, the authenticator app,
-  recovery codes, the password if the deployment allows them, and the
-  sessions.  It nags until two authenticators are registered (§1).  Without
-  a session it sends the browser to sign in first.
+* `GET /signin?return=…&max_age=…&acr=…` — the sign-in page of the seam
+  with the protocol endpoints.  `acr` is the level the sign-in must reach, as
+  a short name or an identifier (`Acr.ofIdentifier?`); without it, any.  A request
+  whose session already satisfies `max_age` and `acr` is sent straight back to
+  `return` (`303`); one with a session that does not is shown the page in
+  step-up mode, which re-authenticates that session; one without a session is
+  shown the sign-in page.  The page offers only what can reach the level: at
+  `phr` and `phrh` a passkey alone, since nothing else is phishing-resistant;
+  at `mfa` a passkey, a security key with a code or a password, or two codes.
+  It passes the level on to the endpoints, which refuse what falls short.  A
+  step-up for an account that has nothing that could reach the level says so,
+  and points to the account page.  A `return` that is not a path on this origin is refused with `400`
+  rather than replaced, so a link that tried to misuse it fails visibly.
+* `GET /account` — the account: how well it is protected (`safety`), its
+  authenticators, the authenticator app, recovery codes, the password if the
+  deployment allows them, and the sessions.  It nags until two authenticators
+  are registered (§1), and until it has a passkey.  Without a session it sends
+  the browser to sign in first.
 * `GET /invite/<token>` — register the first passkey of an invited account.
 
 Every value that reaches a page goes through `escape`.
@@ -62,9 +67,10 @@ def otherWays (passwords : Bool) (name : Option String) : String :=
   "</form>\n</section>"
 
 /-- The sign-in page, for signing in (`stepUpName = none`) or for confirming
-the session of the named user. -/
-def signInPage (passwords wantPhr : Bool) (ret : String) (stepUpName : Option String) :
-    String :=
+the session of the named user, at level `want` or better.  `reachable` is
+false for a step-up of an account that has nothing that could reach `want`. -/
+def signInPage (passwords : Bool) (want : Acr) (ret : String) (stepUpName : Option String)
+    (reachable : Bool := true) : String :=
   let (title, mode, intro, button) := match stepUpName with
     | some n => ("Confirm it is you", "stepup",
         s!"You are signed in as <strong>{escape n}</strong>. To continue, confirm it is you.",
@@ -73,11 +79,19 @@ def signInPage (passwords wantPhr : Bool) (ret : String) (stepUpName : Option St
         "Sign in with the passkey on this device, or with a security key that asks for your \
           PIN or fingerprint.",
         "Sign in with a passkey")
-  let phrNote := if wantPhr then
+  let wantPhr := Acr.phr ≤ want
+  let levelNote :=
+    if want == .phrh then
+      "\n<p class=\"hint\">This needs a passkey or security key that verifies you and keeps \
+        its key on the device: a synced passkey will not do.</p>"
+    else if wantPhr then
       "\n<p class=\"hint\">This needs a passkey or a security key that verifies you.</p>"
     else ""
-  page "signin" title [("mode", mode), ("return", ret)] <|
-    s!"<section>\n<p>{intro}</p>{phrNote}\n" ++
+  let unreachable := if reachable then "" else
+    "\n<p class=\"notice\">Your account has nothing that can sign in this strongly yet. \
+      <a href=\"/account\">Add a passkey on your account page</a>, then try again.</p>"
+  page "signin" title [("mode", mode), ("return", ret), ("acr", want.shortName)] <|
+    s!"<section>\n<p>{intro}</p>{levelNote}{unreachable}\n" ++
     s!"<button type=\"button\" id=\"passkey\">{button}</button>\n</section>\n" ++
     (if wantPhr then "" else otherWays passwords stepUpName)
 
@@ -93,15 +107,42 @@ def signIn : Handler := fun ctx r => do
     | some s => match s.toNat? with
       | some n => pure (some n)
       | none => return messagePage "Sign in" "max_age must be a number of seconds." .badRequest
-  let wantPhr := lookupOnce ps "acr" == some "phr"
+  let want ← match lookupOnce ps "acr" with
+    | none => pure Acr.mfa
+    | some a => match Acr.ofIdentifier? a with
+      | some l => pure l
+      | none => return messagePage "Sign in" "acr is not a level pyle knows." .badRequest
   match ← Session.current ctx r with
   | some s =>
-    if Policy.satisfies s (← ctx.clock) maxAge wantPhr then return Reply.redirect ret
+    if Policy.satisfies s (← ctx.clock) maxAge want then return Reply.redirect ret
     let name := (← ctx.store.findUser s.user).map (·.name)
-    return htmlReply (signInPage ctx.config.allowPasswords wantPhr ret (some (name.getD "")))
-  | none => return htmlReply (signInPage ctx.config.allowPasswords wantPhr ret none)
+    let reachable := (← Policy.accountLevel ctx s.user).any (·.satisfies want)
+    return htmlReply (signInPage ctx.config.allowPasswords want ret (some (name.getD ""))
+      reachable)
+  | none => return htmlReply (signInPage ctx.config.allowPasswords want ret none)
 
 /-! ## The account -/
+
+/-- How well an account with these factors is protected, in plain words, and
+whether to urge a passkey: below `phr`, it does. -/
+def safety (c : Acr.Capabilities) : String × Bool :=
+  match c.level with
+  | some .phrh =>
+    ("This account can sign in with a security key that verifies you and keeps its key on \
+      the device: the strongest protection there is.", false)
+  | some .phr => ("This account can sign in with a passkey, which cannot be phished.", false)
+  | some .mfa =>
+    ("This account signs in with two factors, but has no passkey, which would also stop \
+      phishing. Add a passkey for stronger protection.", true)
+  | none =>
+    ("This account has no passkey and only one kind of factor left: it cannot sign in \
+      again. Add a passkey.", true)
+
+/-- The paragraph of the account page that says how well the account is
+protected. -/
+def safetyParagraph (c : Acr.Capabilities) : String :=
+  let (text, nudge) := safety c
+  s!"<p id=\"safety\"{if nudge then " class=\"notice\"" else ""}>{escape text}</p>\n"
 
 /-- How an authenticator's key is held: synced or bound to one device. -/
 def keyKind (c : Credential) : String :=
@@ -110,10 +151,11 @@ def keyKind (c : Credential) : String :=
 /-- One authenticator in the list. -/
 def credentialItem (c : Credential) : String :=
   let id := escape (b64 c.id)
+  let verifies := if c.userVerified then "verifies you" else "touch only"
   let used := match c.lastUsed with
     | some t => s!"last used {formatTime t}"
     | none => "not used yet"
-  s!"<li><strong>{escape c.name}</strong> <span class=\"meta\">{keyKind c}, added \
+  s!"<li><strong>{escape c.name}</strong> <span class=\"meta\">{keyKind c}, {verifies}, added \
     {formatTime c.created}, {used}</span><br>\
     <button type=\"button\" data-action=\"rename\" data-id=\"{id}\">Rename</button> \
     <button type=\"button\" data-action=\"remove\" data-id=\"{id}\">Remove</button></li>"
@@ -136,6 +178,7 @@ def accountContent (ctx : Ctx) (s : Session) (u : User) : IO String := do
   let recovery ← ctx.store.unspentRecoveryCodes u.id
   let hasPassword := (← ctx.store.findPassword u.id).isSome
   let sessions ← Session.list ctx u.id
+  let caps ← Policy.capabilities ctx u.id
   let nag := if count < 2 then
       s!"<p class=\"notice\">You have {count} authenticator{if count == 1 then "" else "s"}. \
         Add a second, so that losing one does not lock you out.</p>\n"
@@ -173,7 +216,7 @@ def accountContent (ctx : Ctx) (s : Session) (u : User) : IO String := do
       "<button type=\"button\" data-action=\"password-remove\">Remove the password</button>\n"
       else "")
   let sessionList := String.intercalate "\n" (sessions.toList.map (sessionItem s))
-  return nag ++ recoveryNag ++
+  return safetyParagraph caps ++ nag ++ recoveryNag ++
     s!"<p>Signed in as <strong>{escape u.name}</strong>.{groups}</p>\n" ++
     "<section>\n<h2>Passkeys and security keys</h2>\n" ++
     s!"<ul class=\"items\">\n{credList}\n</ul>\n" ++

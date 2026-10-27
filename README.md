@@ -79,23 +79,52 @@ them; have the reverse proxy add the headers if that matters.
 Accounts are created by invitation: `pyle invite <name>` prints
 `<issuer>/invite/<token>` (valid for seven days unless `--ttl` says otherwise;
 only the token's hash is stored).  Whoever opens it creates the account's
-first passkey, is told the account is ready, and signs in with it from there.  From `/account` they can then add
-more passkeys and security keys, an authenticator app (TOTP), recovery codes,
-and — if `allowPasswords` is set — a password, and see and end their sessions.
-The account page nags until two authenticators are registered, and the last
-two cannot be removed.
+first passkey, is told the account is ready, and signs in with it from there.
+From `/account` they can then add more passkeys and security keys, an
+authenticator app (TOTP), recovery codes, and — if `allowPasswords` is set — a
+password, and see and end their sessions.  The account page says in plain
+words how well the account is protected and asks for a passkey until it has
+one; it nags until two authenticators are registered, and the last two cannot
+be removed.
 
 A session needs a passkey (WebAuthn with user verification) or two distinct
 factors: a security key without user verification, a TOTP code, a recovery
-code, a password.  A password or a code alone never signs anyone in.  Adding
-or removing a way in needs a fresh authentication within the last five
-minutes.
+code, a password.  A password, a security key without user verification or a
+code alone never signs anyone in.  Adding or removing a way in needs a fresh
+authentication within the last five minutes.
+
+### Assurance levels
+
+Every session records the level its sign-in reached.  Lowest first:
+
+| level | `acr` | reached by |
+| --- | --- | --- |
+| mfa | `https://refeds.org/profile/mfa` ([REFEDS MFA](https://refeds.org/profile/mfa)) | two distinct factors: a security key, a TOTP code, a recovery code, a password |
+| phr | `phr` ([OpenID Connect EAP ACR Values 1.0](https://openid.net/specs/openid-connect-eap-acr-values-1_0.html)) | a passkey: WebAuthn with user verification |
+| phrh | `phrh` (the same) | a passkey or security key that verifies the user and is not backup-eligible, so its key never leaves the device |
+
+Each level satisfies the ones below it, and `mfa` is the floor: there is no
+single-factor level, and REFEDS SFA (`https://refeds.org/profile/sfa`) is a
+value pyle does not know.  A service can ask for more — registered for it
+(`--min-acr`, or `minAcr` for a forward-auth host), or per request — never
+for less.
+When the session falls short, pyle sends the browser to sign in again at the
+level needed, without ending the session.
+
+Two caveats.  `phrh` rests on the authenticator's own backup-eligible flag:
+without `attestationRoots` and an `aaguidAllowList`, nothing proves that the
+key really is held in hardware, only that the authenticator says it will not
+be synced.  And turning `allowPasswords` off takes the password away as a
+factor: an account that signed in with a password and one code, and has no
+passkey or security key, can no longer sign in, and needs a new invitation.
+Check `pyle user list` (accounts with no authenticators) before switching
+passwords off.
 
 Pages, served with no third-party code under a strict CSP:
 
 | | |
 | --- | --- |
-| `GET /signin?return=<path>[&max_age=<s>][&acr=phr]` | sign in, or step up the current session; then `303` to `return`, which must be a path on this origin |
+| `GET /signin?return=<path>[&max_age=<s>][&acr=<level>]` | sign in, or step up the current session, at `level` (`mfa`, `phr`, `phrh`, or an identifier) or better; then `303` to `return`, which must be a path on this origin |
 | `GET /account` | the account |
 | `GET /invite/<token>` | register an invited account's first passkey |
 | `GET /assets/pyle.js`, `GET /assets/pyle.css` | the pages' script and stylesheet |
@@ -106,9 +135,9 @@ base64url):
 | | body | answer |
 | --- | --- | --- |
 | `/signin/webauthn/begin` | `{}` (passkey) or `{"name"}` (security key) | WebAuthn request options |
-| `/signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?}` | `{"redirect", "amr", "acr"}` and the session cookie |
+| `/signin/webauthn/finish` | `{"credential", "totp"?, "recovery"?, "password"?, "return"?, "acr"?}` (second factors are ignored with a passkey that verified the user) | `{"redirect", "amr", "acr"}` and the session cookie |
 | `/signin/stepup/begin`, `/signin/stepup/finish` | as above, for the current session | as above |
-| `/signin/codes` | `{"name"}` and two of `"password"`, `"totp"`, `"recovery"`; `"return"`? | as above |
+| `/signin/codes` | `{"name"}` and two of `"password"`, `"totp"`, `"recovery"`; `"return"`?, `"acr"`? | as above |
 | `/invite/<token>/begin`, `/invite/<token>/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"name"}` |
 | `/account/authenticators/register/begin`, `…/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"id"}` |
 | `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` for the last two) |
@@ -119,10 +148,13 @@ base64url):
 | `/logout` | | `204` |
 
 Errors are `{"error", "error_description"}`: `401 authentication_failed` (which
-factor was wrong is not said), `401 second_factor_required`, `401
-sign_in_required`, `403 step_up_required`, `429 rate_limited` with
-`Retry-After`.  Every endpoint that checks a factor is rate limited per client
-address and per account, and every attempt is in the audit log.  A client
+factor was wrong is not said), `401 second_factor_required` and `401
+stronger_authentication_required` (the factors cannot reach the `acr` asked
+for; nothing is signed in), `401 sign_in_required`, `403 step_up_required`,
+`429 rate_limited` with `Retry-After`.  A sign-in's `acr` is the level it
+must reach; without one, `mfa`.  Every endpoint that checks a factor is rate limited per client
+address and per account, and every attempt is in the audit log, a successful one with the level it
+reached.  A client
 address (an IPv6 client's /64) may have at most twenty WebAuthn ceremonies
 begun and not finished at once (`429`), and the server ten thousand (`503`).
 
@@ -148,7 +180,8 @@ run it, let clients and services fetch the new key, then run it again.
 
 ```sh
 pyle client add taxis --redirect https://taxis.example.org/callback \
-  --name Taxis --post-logout https://taxis.example.org/ [--scope openid --scope groups] [--rs256]
+  --name Taxis --post-logout https://taxis.example.org/ [--scope openid --scope groups] [--rs256] \
+  [--min-acr mfa|phr|phrh]
 pyle client add taxis-cli --public --redirect http://127.0.0.1/callback
 pyle client list
 pyle client remove taxis
@@ -158,15 +191,17 @@ pyle client remove taxis
 hash.  Scopes default to `openid profile groups`; `profile` releases the
 `name` claim and `groups` the `groups` claim; `offline_access` keeps refresh
 tokens alive after the user signs out of pyle; `kleis` lets a client's tokens
-obtain kleis attestations.
+obtain kleis attestations.  `--min-acr` is the lowest level a session must
+reach to sign in to the client (a short name or an identifier); it defaults
+to `mfa`, and `client list` shows it.
 
 | Endpoint | |
 | --- | --- |
 | `GET /.well-known/openid-configuration` | discovery |
 | `GET /jwks` | the ID-token keys: next, current, previous |
-| `GET /authorize` (`POST` is redirected to `GET`) | `response_type=code`, `client_id`, `redirect_uri` (exact match), `scope` (with `openid`), `state`, `nonce`, `code_challenge` + `code_challenge_method=S256` (required), `prompt` (`none`, `login`), `max_age`, `acr_values` (`phr`) |
+| `GET /authorize` (`POST` is redirected to `GET`) | `response_type=code`, `client_id`, `redirect_uri` (exact match), `scope` (with `openid`), `state`, `nonce`, `code_challenge` + `code_challenge_method=S256` (required), `prompt` (`none`, `login`), `max_age`, `acr_values`, `claims` (its `id_token.acr`) |
 | `POST /token` | `authorization_code` (`code`, `redirect_uri`, `code_verifier`), `refresh_token` (`refresh_token`, optional narrower `scope`), `urn:ietf:params:oauth:grant-type:device_code` (`device_code`); client authentication `client_secret_basic`, `client_secret_post` or `none` |
-| `GET`/`POST /userinfo` | `Authorization: Bearer <access token>`; `sub`, and `name` / `groups` as the scope allows |
+| `GET`/`POST /userinfo` | `Authorization: Bearer <access token>`; `sub`, `pyle_account_acr`, and `name` / `groups` as the scope allows |
 | `GET`/`POST /end_session` | RP-initiated logout: `id_token_hint`, `client_id`, `post_logout_redirect_uri` (registered with `--post-logout`), `state`; asks before signing out (`POST /end_session/confirm`), then shows a link back to the registered address |
 
 The authorization response carries `code`, `state` and `iss` (RFC 9207).
@@ -176,16 +211,46 @@ access token already issued, which are self-contained and short-lived.  Refresh
 tokens rotate on every use; presenting one twice revokes its family.  A family
 expires `refreshTokenSeconds` after it began, however often it rotates, and —
 unless the grant included `offline_access` — when the pyle session it came
-from ends.  ID tokens carry `iss sub aud exp iat auth_time nonce amr acr`, plus
-`name` with the `profile` scope and `groups` with the `groups` scope; `sub` is
-the account's random handle in base64url and `acr` is `phr` for a passkey or
-security key with user verification, `mfa` otherwise.
+from ends.  ID tokens carry `iss sub aud exp iat auth_time nonce amr acr
+pyle_account_acr`, plus `name` with the `profile` scope and `groups` with the
+`groups` scope; `sub` is the account's random handle in base64url, `amr` the
+RFC 8176 methods (`hwk`/`swk`, `user`, `otp`, `pwd`, `mfa`, and `rec` for a
+recovery code), `acr` the session's level, and `pyle_account_acr` the
+strongest level the account could sign in at with what it has registered
+(absent if it could not sign in again) — so a service can tell an account
+that has no passkey from one that chose not to use it.
+
+**Asking for a level.**  The session must reach the client's `--min-acr`
+(`mfa` by default), and a request may ask for more:
+
+- `acr_values`: a space-separated list in order of preference.  pyle reads
+  the three identifiers, the bare `mfa` (an alias kept from earlier versions)
+  and REFEDS MFA 2.0's `https://refeds.org/profile/mfa/phr` (as `phr`), and
+  ignores anything else, REFEDS SFA included; any listed level will do, so the session must reach
+  the weakest of them.  `acr_values=phr` asks for a passkey.
+- `claims`, with `{"id_token": {"acr": {"essential": true, "values": […]}}}`
+  (OpenID Connect Core §5.5): read the same way, and since the claim is
+  essential the ID token's `acr` is then the first listed value the session
+  meets — `https://refeds.org/profile/mfa` for a passkey session asked for
+  `["https://refeds.org/profile/mfa"]`, as the REFEDS MFA Profile requires — and
+  a request none of whose values pyle knows is refused with
+  `unmet_authentication_requirements`.  When `claims` asks about `acr`,
+  `acr_values` is not read.
+
+Otherwise the ID token's `acr` is the session's own level, which may be more
+than was asked.  `/token` checks the client's minimum again, as it is at the
+time: a code or refresh token whose sign-in is below it gets `invalid_grant`,
+and a refresh token's whole family is revoked.  Discovery lists the three
+identifiers in `acr_values_supported`.
 
 A request that needs a signed-in user sends the browser to
-`/signin?return=<path>` (with `max_age=` and `acr=phr` when it needs a recent
-or phishing-resistant sign-in).  `max_age=0` is `prompt=login`; when the
-authentication is too old, the way back carries `pyle_auth_after=<time>`
-instead of `prompt` and `max_age`, so it cannot loop.
+`/signin?return=<path>`, with `max_age=` when it needs a recent sign-in and
+`acr=<level>` for the level it needs; the sign-in page offers only the ways in
+that reach it.  Under `prompt=none` the client gets `login_required` instead
+(no session, or one too old) or `interaction_required` (a level too low).
+`max_age=0` is `prompt=login`; when the authentication is too old, the way back
+carries `pyle_auth_after=<time>` instead of `prompt` and `max_age`, so it
+cannot loop.
 
 ## Access tokens
 
@@ -195,6 +260,8 @@ block is
 ```
 user("alice");
 amr("hwk"); amr("user");
+acr("phrh");
+account_acr("phrh");
 auth_time(2026-10-25T10:00:00Z);
 group("admin");
 client("taxis");
@@ -210,12 +277,13 @@ as it is:
 
 ```lean
 match Pyle.Token.verify roots "taxis" now token "allow if group(\"admin\");" with
-| .ok identity => -- identity.user, .amr, .groups, .client, .authTime
+| .ok identity => -- identity.user, .amr, .acr, .accountAcr, .groups, .client, .authTime
 | .error why => -- refuse
 ```
 
-Holders may attenuate it (append a block of checks); the identity is read from
-the authority block only.
+`acr` is the level of the sign-in and `account_acr` the account's strongest,
+as identifiers, when the token was issued.  Holders may attenuate it (append a
+block of checks); the identity is read from the authority block only.
 
 ## Device grant (RFC 8628)
 
@@ -223,7 +291,10 @@ the authority block only.
 authenticate as at `/token`) answers `device_code`, `user_code` (`XXXX-XXXX`),
 `verification_uri` (`<issuer>/device`), `verification_uri_complete`,
 `expires_in` and `interval`.  The user approves or denies at `/device`, which
-needs a session signed in with a passkey or security key.  The client polls
+needs a session at `phr` or better — signed in with a passkey or a security key
+that verifies the user — or at the client's `--min-acr` if that is higher, and
+the poll checks the approving session's level against it once more.  The tokens state the approving session's `amr` and
+level.  The client polls
 `/token` with the device-code grant and gets `authorization_pending`,
 `slow_down` (which adds five seconds to the interval), `access_denied`,
 `expired_token`, or its tokens once; another client's poll changes nothing.
@@ -237,8 +308,12 @@ granted the scope `kleis`, which a client must be registered for
 `POST /kleis/attest/session` from a signed-in browser, takes a form with
 `request`, a kleis biscuit's third-party block request in base64url, and
 answers `{"block": <third-party block contents, base64url>, "public_key":
-"ed25519/<hex>", "expires": <unix time>}`.  The block states `user`, `amr` and
-`group` facts and expires after `attestationSeconds` (five minutes).  Append
+"ed25519/<hex>", "expires": <unix time>}`.  The block states `user`, `amr`,
+`acr` and `group` facts and expires after `attestationSeconds` (five minutes).
+pyle attests only a sign-in at `kleisMinAcr` or better (`mfa` by default; a
+token from before levels counts as `mfa`), and answers `403 insufficient_acr`
+otherwise, so a grant that trusts pyle's `user` is never met by a password
+alone.  Append
 it to the kleis token, and a kleis grant can name the user:
 
 ```
@@ -257,7 +332,8 @@ For Caddy's `forward_auth` or Traefik's `forwardAuth`:
 "forwardAuthSecret": "<32 random characters>",
 "forwardAuthHosts": {
   "grafana.example.org": "allow if group(\"ops\");",
-  "wiki.example.org": "deny if path($p), $p.starts_with(\"/admin\");\nallow if user($u);"
+  "wiki.example.org": "deny if path($p), $p.starts_with(\"/admin\");\nallow if user($u);",
+  "vault.example.org": {"policy": "allow if group(\"ops\");", "minAcr": "phr"}
 }
 ```
 
@@ -284,8 +360,15 @@ public virtual host as well (see [Deployment](#deployment)): pyle answers it,
 and `/forward-auth/grant`, only at exactly that path, so a proxy rule on the
 path cannot be dodged by spelling it `//forward-auth` or `/forward-auth/`.
 
-Each policy is datalog over `user($u)`, `group($g)`, `host($h)`, `path($p)` and
-`method($m)`; a host not listed, or no matching `allow`, is refused.  `path` is
+Each policy is datalog over `user($u)`, `group($g)`, `host($h)`, `path($p)`,
+`method($m)`, and how the session signed in: `acr($a)` (its level, as an
+identifier), `amr($m)` (one per RFC 8176 value) and `account_acr($a)` (the
+account's strongest level); a host not listed, or no matching `allow`, is
+refused.  A host is a policy, or `{"policy", "minAcr"}` with the lowest level a
+session must reach (`mfa`, `phr`, `phrh`); a plain policy has the `mfa`
+floor.  A session below a host's minimum is sent round the grant to sign in
+again at that level (a non-`GET` request gets `401`), before the policy is
+asked.  `acr` facts are exact: say "at least" with `minAcr`.  `path` is
 the normalised path, without the query: escapes of unreserved characters
 decoded, `//` collapsed, `.` and `..` segments removed — so `//admin`,
 `/./admin`, `/x/../admin` and `/%61dmin` are all `/admin`.  A path with a
@@ -307,7 +390,8 @@ out ends it.
 
 Optional, with their defaults: `accessTokenSeconds` (3600), `idTokenSeconds`
 (600), `refreshTokenSeconds` (thirty days), `deviceCodeSeconds` (600),
-`devicePollSeconds` (5), `attestationSeconds` (300), `forwardAuthHosts` (none),
+`devicePollSeconds` (5), `attestationSeconds` (300), `kleisMinAcr` (`mfa`),
+`forwardAuthHosts` (none),
 `forwardAuthCookieSeconds` (eight hours) and `forwardAuthSecret` (none; at
 least 16 characters, and required when `forwardAuthHosts` is set).
 

@@ -1,5 +1,6 @@
 import Pyle.Http.Router
 import LeanBiscuit.Util.Base64
+import Pyle.Session.Acr
 
 /-!
 # Sessions
@@ -15,8 +16,9 @@ A session is a row on the server and an opaque random identifier in a cookie
 * the identifier is rotated whenever the session's authentication changes
   (`rotate`, and `Policy.stepUp`), so an identifier planted in a browser
   before sign-in is worthless after it;
-* it records the user, the `amr` values, `auth_time` and the authenticators
-  used, and a user can list theirs and end any of them.
+* it records the user, the `amr` values — from which its assurance level is
+  read back (`level`) — `auth_time` and the authenticators used, and a user can
+  list theirs and end any of them.
 
 The cookie is looked up by its hash, not compared: finding a row by the
 SHA-256 of a 256-bit random value leaks nothing a timing attacker could build
@@ -25,7 +27,7 @@ nothing about any identifier.
 
 **Creating a session** is not here.  It happens in exactly one function,
 `Policy.establish`, and recording a fresh authentication on a session in
-exactly one other, `Policy.stepUp`; both take a `StrongAuthentication`, whose
+exactly one other, `Policy.stepUp`; both take a `Policy.Authentication`, whose
 constructor is private to `Pyle.Session.Policy` (§9.3), and the SQL that
 inserts or re-authenticates a session row is private to that file too.  This
 module reads, rotates and ends sessions, none of which can raise what a
@@ -45,6 +47,10 @@ structure Session where
   /-- The authentication method references (RFC 8176): `hwk`, `swk`, `user`,
   `otp`, `pwd`, `mfa`. -/
   amr : List String
+  /-- The level the session reached (DESIGN §1): read back from the `amr`
+  (`ofRow`), which gives exactly the level of the authentication that wrote it
+  (`Policy.Authentication.level_eq_ofAmr`). -/
+  level : Acr
   /-- The authenticators used, for the session list. -/
   factors : List String
   /-- When the user last authenticated. -/
@@ -79,25 +85,29 @@ def decodeId (s : String) : Option ByteArray := do
 its hash.  It identifies the session and cannot be used as one. -/
 def handle (s : Session) : String := encodeId s.idHash.bytes
 
-/-- A session from its row. -/
-def ofRow (r : Store.SessionRow) : Session :=
-  { idHash := r.idHash, user := r.user, amr := r.amr, factors := r.factors,
-    authTime := r.authTime, created := r.created, lastSeen := r.lastSeen,
-    clientAddress := r.clientAddress, userAgent := r.userAgent }
+/-- A session from its row, if its `amr` reads as a level (`Acr.ofAmr`).  A
+row whose `amr` does not — which `Policy` never writes — is no session: it
+fails closed rather than counting as some level. -/
+def ofRow (r : Store.SessionRow) : Option Session := do
+  let level ← Acr.ofAmr r.amr
+  return { idHash := r.idHash, user := r.user, amr := r.amr, level, factors := r.factors,
+           authTime := r.authTime, created := r.created, lastSeen := r.lastSeen,
+           clientAddress := r.clientAddress, userAgent := r.userAgent }
 
 /-- How long the cookie should live: until the absolute timeout. -/
 def cookieMaxAge (ctx : Ctx) (s : Session) (now : Nat) : Nat :=
   s.created + ctx.config.sessionAbsoluteSeconds - now
 
 /-- The session a request's cookie names, if it is live; marks it used.  A
-cookie that is malformed, unknown or past a timeout is no session. -/
+cookie that is malformed, unknown or past a timeout is no session, nor is a row
+whose `amr` reads as no level (`ofRow`). -/
 def current (ctx : Ctx) (r : Req) : IO (Option Session) := do
   let some raw := r.cookie sessionCookieName | return none
   let some id := decodeId raw | return none
   let now ← ctx.clock
   let row ← ctx.store.touchSession (.of id) now ctx.config.sessionIdleSeconds
     ctx.config.sessionAbsoluteSeconds
-  return row.map ofRow
+  return row.bind ofRow
 
 /-- Give a session a new identifier.  The new identifier, to be set as the
 cookie, or `none` if the session had already been rotated or ended. -/
@@ -111,7 +121,7 @@ def rotate (ctx : Ctx) (s : Session) : IO (Option (Session × String)) := do
 
 /-- A user's sessions, most recently used first. -/
 def list (ctx : Ctx) (user : Store.UserId) : IO (Array Session) :=
-  return (← ctx.store.listSessions user).map ofRow
+  return (← ctx.store.listSessions user).filterMap ofRow
 
 /-- End one of a user's sessions by its `handle`.  Whether there was one. -/
 def terminate (ctx : Ctx) (user : Store.UserId) (handle : String) : IO Bool := do

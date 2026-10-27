@@ -413,6 +413,7 @@ body {
   background: var(--bg);
 }
 main { max-width: 40rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+a { color: var(--accent); }
 h1 { font-size: 1.6rem; margin: 0 0 1.5rem; }
 h2 { font-size: 1.15rem; margin: 2rem 0 0.75rem; border-top: 1px solid var(--line); padding-top: 1.25rem; }
 label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }

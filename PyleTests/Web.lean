@@ -33,9 +33,11 @@ def routed (method : Std.Http.Method) (path : String) : Bool :=
 def escapeTests : IO Unit := do
   group "web: escaping and dates"
   checkEq "the five characters" (Web.escape "<a href=\"x\">&'") "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
-  checkEq "the epoch" (Web.formatTime 0) "1970-01-01 00:00 UTC"
-  checkEq "a leap day" (Web.formatTime 951782400) "2000-02-29 00:00 UTC"
-  checkEq "the test clock" (Web.formatTime 1700000000) "2023-11-14 22:13 UTC"
+  checkEq "the epoch" (Web.formatTime 0) "1 Jan 1970, 00:00 UTC"
+  checkEq "a leap day" (Web.formatTime 951782400) "29 Feb 2000, 00:00 UTC"
+  checkEq "the test clock" (Web.formatTime 1700000000) "14 Nov 2023, 22:13 UTC"
+  checkEq "a date, as the prototype writes it" (Web.formatDate 1793000000) "26 Oct 2026"
+  checkEq "December" (Web.formatDate 1703980800) "31 Dec 2023"
   for (s, n) in [("7d", some 604800), ("12h", some 43200), ("30m", some 1800), ("90s", some 90),
       ("d", none), ("7", none), ("0d", none), ("-1d", none), ("7w", none)] do
     checkEq s!"lifetime {s}" (SignIn.parseDuration s) n

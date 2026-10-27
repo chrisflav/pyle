@@ -5,6 +5,7 @@ import Pyle.WebAuthn.Registration
 import Pyle.Factor.Totp
 import Pyle.Factor.RecoveryCode
 import Pyle.Factor.Password
+import Pyle.Audit
 
 /-!
 # The assurance policy
@@ -567,21 +568,37 @@ checks it is still later and that the account is not locked.  The lock of §7
 is the account's: it is checked once before any app is tried, and a wrong
 code counts once towards it however many apps it was checked against, five
 failures locking TOTP for fifteen minutes.  The factor's label names the
-app, `totp:<id>`. -/
-def checkTotp (ctx : Ctx) (user : UserId) (code : String) : IO (Except TotpRefusal Factor) := do
+app, `totp:<id>`.
+
+An app whose secret does not open under the root key is left out of the
+check and audited (from `clientAddress`), so that one damaged row does not
+take TOTP away from the account's other apps.  An app still sealed with the
+associated data of before migration 6 is re-sealed for its row once a code
+from it is accepted. -/
+def checkTotp (ctx : Ctx) (user : UserId) (code : String) (clientAddress : String := "") :
+    IO (Except TotpRefusal Factor) := do
   let now ← ctx.clock
   let apps ← ctx.store.listTotpApps user
   if apps.isEmpty then return .error .notEnrolled
   let lock ← ctx.store.totpLock user
   if now < lock.lockedUntil then return .error (.locked lock.lockedUntil)
-  let opened ← apps.toList.mapM fun app => do
-    let secret ← IO.ofExcept (SignIn.Secrets.openTotpApp ctx.rootKey user app.id app.sealedSecret
-      |>.mapError fun _ => s!"the secret of authenticator app {app.id} does not open under \
-        the root key")
-    return (app.id, secret, app.lastStep)
+  let mut opened := []
+  for app in apps do
+    match SignIn.Secrets.openTotpApp ctx.rootKey user app.id app.sealedSecret app.legacyAd with
+    | .ok secret => opened := opened ++ [(app.id, secret, app.lastStep)]
+    | .error _ =>
+      discard <| Audit.append ctx.store now
+        { event := .totpSecretUnreadable, outcome := .failure,
+          userName := (← ctx.store.findUser user).map (·.name), factor := some s!"totp:{app.id}",
+          clientAddress, detail := "the app's secret does not open under the root key" }
   match Factor.Totp.verifyAny opened now (normaliseCode code) with
   | some (app, step) =>
     if ← ctx.store.acceptTotpStep user app step now then
+      if let some a := apps.find? (·.id == app) then
+        if a.legacyAd then
+          if let some (_, secret, _) := opened.find? (·.1 == app) then
+            discard <| ctx.store.resealTotpApp user app
+              (← SignIn.Secrets.sealTotpApp ctx.rootKey user app secret)
       return .ok ⟨user, .totp, false, false, s!"totp:{app}"⟩
     return .error (.wrong (← ctx.store.recordTotpFailure user now))
   | none => return .error (.wrong (← ctx.store.recordTotpFailure user now))
@@ -700,14 +717,11 @@ def satisfies (s : Session) (now : Nat) (maxAge : Option Nat) (want : Acr) : Boo
 
 /-- The kinds of factor an account has registered (DESIGN §1): its
 credentials, whether they verify the user and are device-bound, any
-authenticator app, a password where passwords are allowed, and unspent recovery codes. -/
-def capabilities (ctx : Ctx) (user : UserId) : IO Acr.Capabilities := do
-  let creds ← ctx.store.listCredentials user
-  let password := ctx.config.allowPasswords && (← ctx.store.findPassword user).isSome
-  return { verifyingDeviceBound := creds.any fun c => c.userVerified && !c.backupEligible,
-           verifying := creds.any (·.userVerified), webauthn := !creds.isEmpty,
-           totp := !(← ctx.store.listTotpApps user).isEmpty, password,
-           recovery := (← ctx.store.unspentRecoveryCodes user) > 0 }
+authenticator app, a password where passwords are allowed, and unspent
+recovery codes, as the store reads them (`Store.capabilitiesIn`) — the same
+function a removal checks what it leaves with. -/
+def capabilities (ctx : Ctx) (user : UserId) : IO Acr.Capabilities :=
+  ctx.store.capabilities user ctx.config.allowPasswords
 
 /-- The strongest level an account could sign in at, if any
 (`Acr.Capabilities.level`): what services receive as `pyle_account_acr`. -/

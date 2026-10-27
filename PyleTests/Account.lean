@@ -237,7 +237,7 @@ def totpTests : IO Unit := withCtx fun ctx clock => do
   checkEq "under the name confirm gave" ((← ctx.store.listTotpApps u.id).toList.map (·.name))
     ["phone", "tablet"]
   check "with its own secret" (secret2 != secret)
-  checkEq "every app counts" (← ctx.store.authenticatorCount u.id) 4
+  checkEq "the apps count once" (← ctx.store.authenticatorCount u.id) 3
   let a2 := jint (replyJson ok2) "id"
   -- Renaming, by id.
   let rn ← postJson ctx "/account/totp/rename"
@@ -348,12 +348,13 @@ def severalAppsTests : IO Unit := withCtx fun ctx clock => do
     (401, 401)
   check "and uses up no step"
     ((← lastSteps ctx olga.id).all (·.all (· < Factor.Totp.stepOf t2)))
-  -- Counting: olga has a key and three apps.
-  checkEq "a key and three apps are four authenticators" (← ctx.store.authenticatorCount olga.id) 4
-  check "two apps may go" ((← ctx.store.removeTotpApp olga.id appC.id) &&
-    (← ctx.store.removeTotpApp olga.id appB.id))
-  check "the last two may not" (!(← ctx.store.removeTotpApp olga.id appA.id) &&
-    !(← ctx.store.removeCredential olga.id sk.id))
+  -- Counting: olga has a key and three apps, which count once.
+  checkEq "a key and three apps are two authenticators"
+    (← ctx.store.authenticatorCount olga.id) 2
+  check "two apps may go" ((← ctx.store.removeTotpApp olga.id appC.id) == .removed &&
+    (← ctx.store.removeTotpApp olga.id appB.id) == .removed)
+  check "the last two may not" ((← ctx.store.removeTotpApp olga.id appA.id) == .wouldLockOut &&
+    (← ctx.store.removeCredential olga.id sk.id) == .wouldLockOut)
   check "capabilities see the app" (← Policy.capabilities ctx olga.id).totp
 
 /-- Migration 6 turns an account's one TOTP secret into its first app. -/
@@ -373,7 +374,7 @@ def totpMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
       discard <| Store.exec c
         "INSERT INTO schema_version (version, description, applied) VALUES (?, ?, ?)"
         #[m.version, m.description, (1 : Nat)]
-    for (n, h) in [("ann", 1), ("ben", 2), ("cy", 3)] do
+    for (n, h) in [("ann", 1), ("ben", 2), ("cy", 3), ("dee", 4)] do
       discard <| Store.exec c "INSERT INTO users (handle, name, created) VALUES (?, ?, 1)"
         #[.blob (ByteArray.mk #[UInt8.ofNat h]), .text n]
   let sealed ← Crypto.«seal» (SignIn.Secrets.totpKey rootKey)
@@ -389,18 +390,20 @@ def totpMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
         VALUES (2, ?, ?, 0, ?, ?)" #[sealedBen, step, (created + 5000 : Nat), created]
   checkEq "the database is at version 5" (← s.version) 5
   s.migrate 2
-  checkEq "and is brought to 6" (← s.version) 6
+  checkEq "and is brought forward" (← s.version) Store.schemaVersion
   let ann ← s.listTotpApps ⟨1⟩
   checkEq "the old secret is the account's one app" (ann.toList.map (·.name))
     ["Authenticator app"]
   let some a := ann[0]? | check "ann's app" false
-  checkEq "with the user's id as its own" a.id 1
+  checkEq "with the user's id as its own, and the old associated data flagged"
+    (a.id, a.legacyAd) (1, true)
   checkEq "the same sealed secret, created time and last step"
     (a.sealedSecret == sealed, a.created, a.lastStep) (true, created, some usedStep)
   checkEq "a step long after it was stored was a use" a.lastUsed (some (usedStep * 30))
   checkEq "the failures carry over to the account" (← s.totpLock ⟨1⟩).failures 3
   check "it still opens"
-    ((SignIn.Secrets.openTotpApp rootKey ⟨1⟩ a.id a.sealedSecret).toOption == some secret)
+    ((SignIn.Secrets.openTotpApp rootKey ⟨1⟩ a.id a.sealedSecret a.legacyAd).toOption ==
+      some secret)
   let ben ← s.listTotpApps ⟨2⟩
   checkEq "a step the confirming code used is no use"
     (ben.toList.map fun b => (b.id, b.lastUsed)) [(2, none)]
@@ -409,22 +412,48 @@ def totpMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
   checkEq "the old table is gone"
     (← s.run fun c => Store.query c
       "SELECT COUNT(*) FROM sqlite_master WHERE name = 'totp'" #[] (Store.colNat · 0)) #[0]
-  -- The old associated data opens only the row migration 6 made.
-  let moved ← s.addTotpApp ⟨1⟩ "copy" none 9 fun _ => pure sealed
+  -- The old associated data opens only the rows migration 6 made.
+  let some moved ← s.addTotpApp ⟨1⟩ "copy" none 9 fun _ => pure sealed
+    | check "a copy" false
   check "the old sealed secret moved into another of the user's apps does not open"
-    ((SignIn.Secrets.openTotpApp rootKey ⟨1⟩ moved.id sealed).toOption.isNone)
+    ((SignIn.Secrets.openTotpApp rootKey ⟨1⟩ moved.id sealed moved.legacyAd).toOption.isNone &&
+      !moved.legacyAd)
   check "nor as another user's"
     ((SignIn.Secrets.openTotpApp rootKey ⟨3⟩ 3 sealed).toOption.isNone)
   check "new ids come after the migrated ones" (moved.id > 2)
-  discard <| s.run fun c => Store.exec c "DELETE FROM totp_apps WHERE id = ?" #[.int moved.id]
+  -- A new app may get the id of its own user; the old associated data does
+  -- not open it all the same.
+  let deeSecret ← Factor.Totp.generateSecret
+  let deeOld ← Crypto.«seal» (SignIn.Secrets.totpKey rootKey) (SignIn.Secrets.userAd ⟨4⟩)
+    deeSecret
+  let some dee ← s.addTotpApp ⟨4⟩ "dee's" none 9 fun _ => pure deeOld | check "dee's app" false
+  checkEq "a new app can have its user's id" dee.id 4
+  check "and refuses a secret sealed with the old associated data"
+    ((SignIn.Secrets.openTotpApp rootKey ⟨4⟩ dee.id deeOld dee.legacyAd).toOption.isNone)
   -- And it signs in.
   let clock ← IO.mkRef (usedStep * 30 + 60)
   let ctx : Ctx := { config := testConfig dir, store := s, limiter := ← RateLimiter.new,
                      rootKey, clock := clock.get }
-  match ← Policy.checkTotp ctx ⟨1⟩ (totpAt secret (← clock.get)) with
-  | .ok f => checkEq "a code from the migrated app checks out" f.label "totp:1"
-  | .error _ => check "a code from the migrated app checks out" false
+  let first := match ← Policy.checkTotp ctx ⟨1⟩ (totpAt secret (← clock.get)) with
+    | .ok f => f.label
+    | .error _ => ""
+  checkEq "a code from the migrated app checks out, beside an app that does not open" first
+    "totp:1"
   checkEq "and clears the failures" (← s.totpLock ⟨1⟩).failures 0
+  check "the app that does not open is audited"
+    ((← Audit.entries s).any fun e => e.event == "totp-secret-unreadable" &&
+      e.factor == some s!"totp:{moved.id}")
+  let some a' ← s.findTotpApp ⟨1⟩ 1 | check "ann's app" false
+  check "the migrated app is re-sealed for its row, and its flag cleared"
+    (!a'.legacyAd && a'.sealedSecret != sealed &&
+      (SignIn.Secrets.openTotpApp rootKey ⟨1⟩ 1 a'.sealedSecret).toOption == some secret)
+  clock.modify (· + 30)
+  check "and goes on signing in"
+    (match ← Policy.checkTotp ctx ⟨1⟩ (totpAt secret (← clock.get)) with
+     | .ok _ => true
+     | .error _ => false)
+  check "dee's app is skipped, not an error"
+    ((← Policy.checkTotp ctx ⟨4⟩ (totpAt deeSecret (← clock.get))) matches .error (.wrong _))
 
 /-- Recovery codes. -/
 def recoveryTests : IO Unit := withCtx fun ctx clock => do
@@ -585,7 +614,9 @@ def addPageTests : IO Unit := withCtx fun ctx clock => do
         containsStr page s!"<th colspan=\"4\" scope=\"colgroup\">{g}")
   check "no password group when passwords are off" (!containsStr page ">Password</th>")
   check "the passkeys say how they keep their key"
-    (containsStr page "Synced passkey" && containsStr page "Stays on the key" &&
+    (containsStr page "Passkey · synced between your devices" &&
+      containsStr page "Security key · stays on the key" &&
+      containsStr page "a touch only, so one step of two" &&
       !containsStr page "device-bound")
   check "the app is listed by name" (containsStr page "<strong>phone</strong>")
   check "one button adds" (containsStr page "id=\"add-method\" href=\"/account/add\">\
@@ -646,6 +677,99 @@ def addPageTests : IO Unit := withCtx fun ctx clock => do
   check "with codes, it asks first" (containsStr rec1 "data-replace=\"true\"" &&
     containsStr rec1 "New codes replace them")
 
+/-- What the review of the account pages asked for: removals that keep a way
+in, the cap on apps, the kind a registration began with, and the pages. -/
+def reviewFixTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := true })
+    fun ctx clock => do
+  group "account: removals keep a way in, at most five apps"
+  -- A passkey and two apps: the passkey cannot go.
+  let (u, id, k) ← signedInUser ctx "quin"
+  discard <| giveTotp ctx u "phone"
+  discard <| giveTotp ctx u "tablet"
+  let r ← postJson ctx "/account/authenticators/remove" (Json.mkObj [("id", b64u k.id)])
+    (some id)
+  checkEq "removing the passkey beside two apps is refused" (r.status.toCode, errorOf r)
+    (409, "last_authenticators")
+  check "and the passkey stays" ((← ctx.store.findCredential k.id).isSome)
+  checkEq "a passkey and two apps are two authenticators, by the same count"
+    (← ctx.store.authenticatorCount u.id) 2
+  check "so the page does not ask for a second"
+    (!containsStr (← getPage ctx "/account" id).bodyText "Add a second")
+  -- Two touch-only keys alone cannot sign in.
+  let (v, vid, vk) ← signedInUser ctx "rae"
+  let t1 ← SoftKey.new (uv := false)
+  let t2 ← SoftKey.new (uv := false)
+  enrol ctx v t1 "t1"
+  enrol ctx v t2 "t2"
+  let rv ← postJson ctx "/account/authenticators/remove" (Json.mkObj [("id", b64u vk.id)])
+    (some vid)
+  checkEq "removing the only key that verifies, leaving two touch-only keys, is refused"
+    rv.status.toCode 409
+  let rt ← postJson ctx "/account/authenticators/remove" (Json.mkObj [("id", b64u t1.id)])
+    (some vid)
+  checkEq "a touch-only key can go" rt.status.toCode 204
+  -- A password that is all a touch-only key has beside it.
+  let (w, _, _) ← signedInUser ctx "sol"
+  let wk ← SoftKey.new (uv := false)
+  enrol ctx w wk "key"
+  ctx.store.setPassword w.id (← Factor.Password.hash "a long enough password") 1
+  let pk := (← ctx.store.listCredentials w.id).toList.filter (·.userVerified)
+  for c in pk do
+    discard <| ctx.store.run fun db =>
+      Store.exec db "DELETE FROM webauthn_credentials WHERE id = ?" #[.blob c.id]
+  let some wid := sessionCookieOf (← signInVia ctx wk (beginBody := Json.mkObj [("name", "sol")])
+      (extra := [("password", "a long enough password")]) (client := "192.0.2.90"))
+    | check "sol signs in" false
+  let rp ← postJson ctx "/account/password/remove" emptyObj (some wid)
+  checkEq "removing the password a touch-only key needs is refused" (rp.status.toCode, errorOf rp)
+    (409, "last_way_in")
+  check "and it stays" ((← ctx.store.findPassword w.id).isSome)
+  check "the page asks before removing the password"
+    (containsStr Web.script "if (!window.confirm('Remove the password?')) return;")
+  -- At most five apps.
+  for i in [0:3] do discard <| giveTotp ctx u s!"more {i}"
+  let b ← postJson ctx "/account/totp/begin" emptyObj (some id)
+  let (full, _) ← confirmApp ctx id b (← clock.get)
+  checkEq "a sixth app is refused" (full.status.toCode, errorOf full) (409, "too_many_apps")
+  checkEq "five stay" (← ctx.store.listTotpApps u.id).size 5
+  let add := (← getPage ctx "/account/add" id).bodyText
+  check "the add page then offers no app, and says why"
+    (!containsStr add "href=\"/account/add/app\"" && containsStr add "id=\"apps-full\"")
+  let appPage := (← getPage ctx "/account/add/app" id).bodyText
+  check "the app page says so, with nothing to scan"
+    (containsStr appPage "id=\"apps-full\"" && !containsStr appPage "data-pending" &&
+      !containsStr appPage "totp-qr")
+  -- The kind is the one begin was asked for.
+  let weak ← SoftKey.new (uv := false)
+  let bp ← postJson ctx "/account/authenticators/register/begin"
+    (Json.mkObj [("kind", "passkey")]) (some id)
+  let fp ← postJson ctx "/account/authenticators/register/finish"
+    (Json.mkObj [("credential", ← weak.create (replyJson bp)), ("kind", "security-key")])
+    (some id)
+  checkEq "a passkey registration that did not verify is refused, whatever finish says"
+    fp.status.toCode 400
+  let bs ← postJson ctx "/account/authenticators/register/begin"
+    (Json.mkObj [("kind", "security-key")]) (some id)
+  let fs ← postJson ctx "/account/authenticators/register/finish"
+    (Json.mkObj [("credential", ← weak.create (replyJson bs)), ("kind", "passkey")])
+    (some id)
+  checkEq "a security-key registration is one, whatever finish says" fs.status.toCode 201
+  checkEq "and named so" ((← ctx.store.findCredential weak.id).map (·.name))
+    (some "Security key 2")
+  -- The pages.
+  let page := (← getPage ctx "/account" id).bodyText
+  check "\"Signed in as\" is beside the heading"
+    (containsStr page "<div class=\"page-head\">\n<h1>Your account</h1>\n\
+      <p class=\"signed-in\">Signed in as <strong>quin</strong>")
+  check "dates are written as the prototype does"
+    (containsStr page s!"added {Web.formatDate 1700000000}" &&
+      containsStr page "added 14 Nov 2023")
+  let b2 ← getPage ctx "/account/add/app" (some vid)
+  check "the app page can say to scan the new key after a sign-in elsewhere"
+    (containsStr b2.bodyText "<p id=\"rescan\" class=\"notice\" hidden>" &&
+      containsStr Web.script "sessionStorage.setItem('pyle-rescan'" &&
+      containsStr Web.script "sessionStorage.getItem('pyle-rescan')")
+
 /-- The account tests. -/
 def accountTests : IO Unit := do
   registerTests
@@ -658,5 +782,6 @@ def accountTests : IO Unit := do
   passwordTests
   sessionListTests
   addPageTests
+  reviewFixTests
 
 end PyleTests

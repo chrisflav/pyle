@@ -91,12 +91,16 @@ remove buttons, and then the sessions, each of which can be ended.  "Add a
 sign-in method" leads to `/account/add`, which offers a passkey (recommended),
 a security key, an authenticator app, a password and new recovery codes; a
 passkey or a security key is registered right there, the others have a page
-each.  The last two authenticators cannot be removed.
+each.  A removal that would leave the account unable to sign in is refused:
+what is left must still reach a level, and must be two authenticators, the
+apps counting once — so neither the passkey beside two apps nor the one key
+that verifies beside touch-only keys can go, and the password cannot go when
+it is what makes the sign-in two factors.
 
 An account can have several authenticator apps (TOTP), each with its own
-secret and name, added, renamed and removed one by one.  Every app counts as
-an authenticator towards the two an account keeps, but all of them together
-are one kind of factor: two codes from two apps do not sign anyone in.  A code
+secret and name, added, renamed and removed one by one, up to five.  All of
+them together are one authenticator towards the two an account keeps, and one
+kind of factor: two codes from two apps do not sign anyone in.  A code
 counts for the app it came from, and is good once for that app; the lock after
 five wrong codes is the account's, so more apps do not mean more guesses.
 
@@ -156,12 +160,12 @@ base64url):
 | `/signin/stepup/begin`, `/signin/stepup/finish` | as above, for the current session | as above |
 | `/signin/codes` | `{"name"}` and two of `"password"`, `"totp"`, `"recovery"`; `"return"`?, `"acr"`? | as above |
 | `/invite/<token>/begin`, `/invite/<token>/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"name"}` |
-| `/account/authenticators/register/begin`, `…/finish` | `{"kind"?}`; `{"credential", "name"?, "kind"?}` (`kind` is `passkey`: discoverable, user verification required; or `security-key`: neither required) | creation options; `201 {"id"}` |
-| `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` for the last two) |
-| `/account/totp/begin`, `…/confirm` | `{"name"?}`; `{"pending", "code", "name"?}` | `{"secret", "uri", "qr", "pending", "name"}`; `201 {"id", "name"}`, a new app beside any others |
-| `/account/totp/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` for the last two) |
+| `/account/authenticators/register/begin`, `…/finish` | `{"kind"?}` (`passkey`: discoverable, user verification required; or `security-key`: neither required), which `finish` is held to; `{"credential", "name"?}` | creation options; `201 {"id"}` |
+| `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` when it would leave no way in) |
+| `/account/totp/begin`, `…/confirm` | `{"name"?}`; `{"pending", "code", "name"?}` | `{"secret", "uri", "qr", "pending", "name"}`; `201 {"id", "name"}`, a new app beside any others (`409` past five) |
+| `/account/totp/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` when it would leave no way in) |
 | `/account/recovery-codes` | `{}` | `{"codes"}`, shown once |
-| `/account/password`, `/account/password/remove` | `{"password"}`; `{}` | `204` |
+| `/account/password`, `/account/password/remove` | `{"password"}`; `{}` | `204` (`409` when the account could not sign in without it) |
 | `/account/sessions/end` | `{"handle"}` | `204` |
 | `/logout` | | `204` |
 
@@ -536,7 +540,8 @@ pyle migrates its database when it opens it, and refuses one written by a
 newer pyle.  Migration 6 makes room for several authenticator apps per
 account: an account's one TOTP secret becomes its app named "Authenticator
 app", which goes on working with the same codes, and its failed-code count
-and lock carry over to the account.  Its last use is shown when the step it
+and lock carry over to the account.  The first code it accepts re-seals its
+secret for its row.  Its last use is shown when the step it
 last accepted came more than a minute after it was set up, and as not used
 otherwise.  There is no way back to an older pyle after it, short of a backup.
 

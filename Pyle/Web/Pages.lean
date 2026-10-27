@@ -182,14 +182,18 @@ def protectionSummary (c : Acr.Capabilities) (count recovery : Nat) : String :=
     <div class=\"protection-text\">\n\
     <p class=\"protection-title\">Account protection: {protectionWord c.level}</p>\n" ++
   safetyParagraph c ++ nagText ++ "</div>\n" ++
-  (if nudge then "<a class=\"button\" href=\"/account/add\">Add one</a>\n" else "") ++
+  (if nudge then "<a class=\"nudge-link\" href=\"/account/add\">Add one</a>\n" else "") ++
   "</div>\n"
 
-/-- How an authenticator's key is held, in plain words: synced between
-devices, or kept on the key, from the backup-eligible flag; and whether it
+/-- What an authenticator is and how its key is held, in plain words: a
+passkey synced between devices, from the backup-eligible flag; a passkey that
+stays on this device, for one that is not and that the browser reached as
+`internal`; a security key that keeps its key, otherwise.  Then whether it
 verifies the user, which decides whether it is enough on its own. -/
 def keyKind (c : Credential) : String :=
-  (if c.backupEligible then "Synced passkey" else "Stays on the key") ++
+  (if c.backupEligible then "Passkey · synced between your devices"
+    else if c.transports.contains "internal" then "Passkey · stays on this device"
+    else "Security key · stays on the key") ++
   (if c.userVerified then " · asks for your PIN, fingerprint or face"
     else " · a touch only, so one step of two")
 
@@ -295,13 +299,10 @@ def accountContent (ctx : Ctx) (s : Session) (u : User) (added : Option String) 
   let addedNote := match added.bind addedMessage with
     | some m => s!"<p id=\"added\" class=\"notice\">{escape m}</p>\n"
     | none => ""
-  let groups := if u.groups.isEmpty then "" else
-    s!" <span class=\"meta\">groups: {escape (", ".intercalate u.groups)}</span>"
   let passwordGroup := if !ctx.config.allowPasswords then "" else
     methodGroup "Password" "" [passwordRow passwordAt] ""
   let sessionList := String.intercalate "\n" (sessions.toList.map (sessionItem s))
   return addedNote ++
-    s!"<p class=\"signed-in\">Signed in as <strong>{escape u.name}</strong>.{groups}</p>\n" ++
     protectionSummary caps count recovery ++
     "<div class=\"section-head\">\n<h2 id=\"methods-title\">How you sign in</h2>\n\
      <a class=\"button\" id=\"add-method\" href=\"/account/add\">Add a sign-in method</a>\n\
@@ -336,7 +337,11 @@ def withAccount (ctx : Ctx) (r : Req) (path : String) (act : Session → User �
 /-- `GET /account?added=…`. -/
 def account : Handler := fun ctx r => withAccount ctx r "/account" fun s u => do
   let added := r.queryParams.toOption.bind (lookupOnce · "added")
-  return htmlReply (page "account" "Your account" [] (← accountContent ctx s u added))
+  let groups := if u.groups.isEmpty then "" else
+    s!" <span class=\"meta\">· groups: {escape (", ".intercalate u.groups)}</span>"
+  return htmlReply (page "account" "Your account" [] (← accountContent ctx s u added)
+    (aside := s!"<p class=\"signed-in\">Signed in as <strong>{escape u.name}</strong>\
+      {groups}</p>"))
 
 /-! ## Adding a way to sign in -/
 
@@ -363,6 +368,15 @@ under pyle's rules.  A passkey and a security key are registered from here
 by the script; the rest have pages of their own. -/
 def add : Handler := fun ctx r => withAccount ctx r "/account/add" fun _ u => do
   let hasPassword := (← ctx.store.findPassword u.id).isSome
+  let apps := (← ctx.store.listTotpApps u.id).size
+  let app := if apps ≥ maxTotpApps then
+      s!"<p class=\"hint\" id=\"apps-full\">You have {maxTotpApps} authenticator apps, the \
+        most an account can have. Remove one to add another.</p>\n"
+    else
+      choice "Authenticator app" ""
+        "An app that shows a 6-digit code, such as Aegis, 2FAS or Google Authenticator. Used \
+          as a second step, together with another kind of method: two apps are still one step."
+        "Add" (.inr "/account/add/app") ++ "\n"
   let password := if !ctx.config.allowPasswords then "" else
     choice "Password" ""
       "At least 12 characters. Never enough on its own: always used together with another \
@@ -370,8 +384,9 @@ def add : Handler := fun ctx r => withAccount ctx r "/account/add" fun _ u => do
         else "Set") (.inr "/account/add/password") ++ "\n"
   return htmlReply <| page "add" "Add a sign-in method" [] (back := some ("/account",
       "Back to your account")) <|
-    "<p class=\"lead\">Pick what you want to add. You can have as many passkeys, security keys \
-     and authenticator apps as you like.</p>\n<div class=\"choices\">\n" ++
+    s!"<p class=\"lead\">Pick what you want to add. You can have as many passkeys and \
+      security keys as you like, and up to {maxTotpApps} authenticator apps.</p>\n\
+      <div class=\"choices\">\n" ++
     choice "Passkey" "Recommended"
       "Sign in with your fingerprint, face or screen lock, on this device or your phone. \
         Enough on its own, and it can't be phished." "Add" (.inl ("add-passkey", "passkey")) ++
@@ -380,11 +395,7 @@ def add : Handler := fun ctx r => withAccount ctx r "/account/add" fun _ u => do
       "A USB or NFC key such as a YubiKey. With a PIN it is enough on its own and can't be \
         phished; with just a touch it is one step, used together with another method." "Add"
       (.inl ("add-security-key", "security-key")) ++ "\n" ++
-    choice "Authenticator app" ""
-      "An app that shows a 6-digit code, such as Aegis, 2FAS or Google Authenticator. Used as \
-        a second step, together with another kind of method: two apps are still one step."
-      "Add" (.inr "/account/add/app") ++ "\n" ++
-    password ++
+    app ++ password ++
     choice "Recovery codes" ""
       "Ten one-time codes to write down. Each works once, together with another method, for \
         when you lose a device. Making new ones replaces the old ones." "Make"
@@ -407,11 +418,17 @@ the secret itself, as `POST /account/totp/begin` does and under the same
 step-up rule: a session that has not signed in within the step-up window is
 sent to confirm it is the user first.  The secret travels to the browser
 sealed (`data-pending`), and only `POST /account/totp/confirm` with a code
-from it stores anything. -/
+from it stores anything.  An account with `maxTotpApps` apps is told so,
+and offered nothing to scan. -/
 def addApp : Handler := fun ctx r => withAccount ctx r "/account/add/app" fun s u => do
   unless Session.authenticatedWithin s (← ctx.clock) SignIn.stepUpSeconds do
     return Reply.redirect (stepUpUrl "/account/add/app")
   let n := (← ctx.store.listTotpApps u.id).size
+  if n ≥ maxTotpApps then
+    return htmlReply <| page "add-app" "Add an authenticator app" [] (back := backToChoices) <|
+      s!"<p class=\"notice\" id=\"apps-full\">You have {n} authenticator apps, the most an \
+        account can have. Remove one on <a href=\"/account\">your account page</a> to add \
+        another.</p>"
   let a ← Account.newApp ctx u (Account.defaultAppName n)
   let lead := if n == 0 then
       "Each app gets its own key, so you can add more later and remove one without touching \
@@ -425,6 +442,9 @@ def addApp : Handler := fun ctx r => withAccount ctx r "/account/add/app" fun s 
   return htmlReply <| page "add-app" "Add an authenticator app" [("pending", a.pending)]
       (back := backToChoices) <|
     s!"<p class=\"lead\">{escape lead}</p>\n" ++
+    "<p id=\"rescan\" class=\"notice\" hidden>You confirmed it is you on the sign-in page, \
+     so this page has a new key. If you scanned the one before, remove it from your app and \
+     scan this one instead.</p>\n" ++
     "<h2>1. Name it</h2>\n\
      <label for=\"app-name\">A name you'll recognise in the list</label>\n" ++
     s!"<input id=\"app-name\" value=\"{escape a.name}\" maxlength=\"{SignIn.maxCredentialName}\" \

@@ -140,12 +140,15 @@ structure Challenge where
   user : Option UserId
   /-- When it stops being accepted. -/
   expires : Nat
+  /-- For a registration, the kind of authenticator asked for: `passkey`,
+  `security-key`, or empty for either. -/
+  kind : String := ""
 
 /-- Record a new challenge. -/
 def Store.addChallenge (s : Store) (ch : Challenge) : IO Unit := s.run fun c => do
   discard <| exec c
-    "INSERT INTO challenges (challenge, purpose, user_id, expires) VALUES (?, ?, ?, ?)"
-    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires]
+    "INSERT INTO challenges (challenge, purpose, user_id, expires, kind) VALUES (?, ?, ?, ?, ?)"
+    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, ch.kind]
 
 /-- A challenge row as `consumeChallenge` deletes it: the stored purpose, the
 user it was issued to, and its expiry. -/
@@ -156,6 +159,8 @@ structure ChallengeRow where
   user : Option Int
   /-- The `expires` column. -/
   expires : Nat
+  /-- The `kind` column. -/
+  kind : String := ""
 
 /-- Whether a deleted challenge row may be used: the challenge `value`, if
 the row was there, was issued for `purpose`, and had not expired at `now`.
@@ -165,7 +170,7 @@ def challengeDecision (value : ByteArray) (purpose : ChallengePurpose) (now : Na
     Option ChallengeRow → Option Challenge
   | some r =>
     if r.purpose == purpose.toString && now < r.expires then
-      some { value, purpose, user := r.user.map (⟨·⟩), expires := r.expires }
+      some { value, purpose, user := r.user.map (⟨·⟩), expires := r.expires, kind := r.kind }
     else none
   | none => none
 
@@ -185,10 +190,10 @@ a challenge uses it up, whatever happens next.  The test is
 def Store.consumeChallenge (s : Store) (value : ByteArray) (purpose : ChallengePurpose)
     (now : Nat) : IO (Option Challenge) := s.run fun c => do
   let row ← queryOne c
-    "DELETE FROM challenges WHERE challenge = ? RETURNING purpose, user_id, expires"
+    "DELETE FROM challenges WHERE challenge = ? RETURNING purpose, user_id, expires, kind"
     #[value] fun st => do
       return { purpose := ← colText st 0, user := ← colOpt colInt st 1,
-               expires := ← colNat st 2 : ChallengeRow }
+               expires := ← colNat st 2, kind := ← colText st 3 : ChallengeRow }
   return challengeDecision value purpose now row
 
 /-- Remove every expired challenge; how many. -/

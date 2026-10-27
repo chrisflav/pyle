@@ -236,7 +236,11 @@ async function act(url, body) {
       await stepUpHere();
     } catch (e) {
       // No authenticator at hand that verifies the user: the sign-in page
-      // offers the other ways, and comes back here.
+      // offers the other ways, and comes back here.  The authenticator-app
+      // page then has a new key; remember to say so, and the name typed.
+      if (document.body.dataset.page === 'add-app') {
+        try { window.sessionStorage.setItem('pyle-rescan', value('app-name')); } catch (s) { }
+      }
       window.location.assign('/signin?return=' + encodeURIComponent(here()) + '&max_age=0');
       throw new Error('Confirm it is you on the sign-in page.');
     }
@@ -264,6 +268,7 @@ async function accountAction(button) {
       if (!window.confirm('Remove this authenticator app? Its codes stop working.')) return;
       await act('/account/totp/remove', { id: Number(button.dataset.id) });
     } else if (action === 'password-remove') {
+      if (!window.confirm('Remove the password?')) return;
       await act('/account/password/remove', {});
     } else if (action === 'end-session') {
       await act('/account/sessions/end', { handle: button.dataset.handle });
@@ -305,6 +310,17 @@ function setupAdd() {
 // Adding an authenticator app: the page carries the new secret, sealed, and
 // the first code from the app stores it under the name given.
 function setupAddApp(body) {
+  let rescan = null;
+  try {
+    rescan = window.sessionStorage.getItem('pyle-rescan');
+    window.sessionStorage.removeItem('pyle-rescan');
+  } catch (e) { rescan = null; }
+  const notice = document.getElementById('rescan');
+  const name = document.getElementById('app-name');
+  if (rescan !== null && notice && name) {
+    notice.hidden = false;
+    if (rescan) name.value = rescan;
+  }
   on('totp-confirm', 'click', async function () {
     try {
       await act('/account/totp/confirm', { pending: body.dataset.pending,
@@ -490,8 +506,19 @@ code, ol.codes { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; 
 /* The account pages: wider, for the table of sign-in methods. */
 body[data-page="account"] main, body[data-page^="add"] main { max-width: 46rem; }
 a.back { display: inline-block; margin-bottom: 0.75rem; }
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+.page-head h1 { margin: 0; }
+.page-head .signed-in { margin: 0; }
+a.nudge-link { font-weight: 600; }
 .lead { color: var(--muted); margin: 0 0 1.5rem; }
-.signed-in { color: var(--muted); margin: -1rem 0 1.5rem; }
+.signed-in { color: var(--muted); }
 .protection {
   display: flex;
   flex-wrap: wrap;

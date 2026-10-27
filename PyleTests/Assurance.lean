@@ -175,7 +175,7 @@ def accountSafetyTests : IO Unit := withCtx fun ctx _ => do
       containsStr page.bodyText "Account protection: fair" &&
       containsStr page.bodyText "<p id=\"safety\">This account signs in \
       with two factors, but has no passkey" &&
-      containsStr page.bodyText "<a class=\"button\" href=\"/account/add\">Add one</a>")
+      containsStr page.bodyText "<a class=\"nudge-link\" href=\"/account/add\">Add one</a>")
 
 /-- The device grant still needs `phr`, and its tokens state the level. -/
 def deviceAssuranceTests : IO Unit := withCtx fun ctx clock => do

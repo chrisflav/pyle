@@ -307,9 +307,11 @@ def migration5 : Migration where
 * `totp_lock` holds the failure count and the lock of §7, once per account
   rather than per app, so that adding apps does not add guesses;
 * the one secret an account had in `totp` becomes its app named
-  "Authenticator app", with the user's own id as the app's id: its secret was
-  sealed with the user id as associated data, and `Secrets.openTotpApp`
-  accepts that only for the row whose id is the user's.  Its last use is the
+  "Authenticator app", with the user's own id as the app's id and
+  `legacy_ad` set: its secret was sealed with the user id as associated data,
+  and `Secrets.openTotpApp` accepts that only for a row with `legacy_ad` set,
+  which only this migration sets.  The first code it accepts afterwards
+  re-seals it for its row and clears the flag.  Its last use is the
   time of its last accepted step, when that step came more than a minute
   after the secret was stored, and so was not the code that confirmed it;
   otherwise it is not known.  Its failures and lock carry over to the
@@ -325,7 +327,8 @@ def migration6 : Migration where
        secret BLOB NOT NULL,
        last_step INTEGER,
        created INTEGER NOT NULL,
-       last_used INTEGER
+       last_used INTEGER,
+       legacy_ad INTEGER NOT NULL DEFAULT 0
      ) STRICT",
     "CREATE INDEX totp_apps_user ON totp_apps(user_id)",
     "CREATE TABLE totp_lock (
@@ -333,9 +336,9 @@ def migration6 : Migration where
        failures INTEGER NOT NULL DEFAULT 0,
        locked_until INTEGER NOT NULL DEFAULT 0
      ) STRICT",
-    "INSERT INTO totp_apps (id, user_id, name, secret, last_step, created, last_used)
+    "INSERT INTO totp_apps (id, user_id, name, secret, last_step, created, last_used, legacy_ad)
        SELECT user_id, user_id, 'Authenticator app', secret, last_step, created,
-         CASE WHEN last_step * 30 > created + 60 THEN last_step * 30 END
+         CASE WHEN last_step * 30 > created + 60 THEN last_step * 30 END, 1
        FROM totp",
     "INSERT INTO totp_lock (user_id, failures, locked_until)
        SELECT user_id, failures, locked_until FROM totp
@@ -343,9 +346,20 @@ def migration6 : Migration where
     "DROP TABLE totp"
   ]
 
+/-- What kind of authenticator a registration challenge was issued for
+(`passkey`, `security-key`, or empty for either), so that finishing the
+registration holds it to what beginning it asked the browser for, whatever
+the finishing request says. -/
+def migration7 : Migration where
+  version := 7
+  description := "registration kinds"
+  statements := [
+    "ALTER TABLE challenges ADD COLUMN kind TEXT NOT NULL DEFAULT ''"
+  ]
+
 /-- Every migration, in order.  Append only. -/
 def migrations : List Migration :=
-  [migration1, migration2, migration3, migration4, migration5, migration6]
+  [migration1, migration2, migration3, migration4, migration5, migration6, migration7]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

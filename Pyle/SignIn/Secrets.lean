@@ -22,9 +22,11 @@ The associated data of a sealed TOTP secret names its row: `totp `, the
 user's row id and the app's row id, in decimal (`appAd`).  A sealed secret
 copied into another user's row, or into another of the same user's apps, no
 longer opens.  The one secret an account had before it could have several
-was sealed with the user's row id alone (`userAd`); migration 6 made it the
-app whose id is the user's, and `openTotpApp` accepts that associated data
-for that row and no other.
+was sealed with the user's row id alone (`userAd`); migration 6 made it an
+app with the `legacy_ad` flag set, and `openTotpApp` accepts that associated
+data only for a row with the flag — which nothing but that migration sets —
+and only for its own user.  The first code such an app accepts re-seals it
+with `appAd` and clears the flag.
 
 A secret in the middle of being enrolled, handed to the browser and back, is
 sealed with `pending ` in front of the user id and, inside, the time it was
@@ -70,14 +72,14 @@ def sealTotpApp (rootKey : ByteArray) (user : Store.UserId) (app : Int) (secret 
   Crypto.«seal» (totpKey rootKey) (appAd user app) secret
 
 /-- Open the sealed secret of app `app` of `user`.  It opens with the
-associated data of its own row, or — for the row migration 6 made of the
-account's one secret, whose id is the user's — with the user id alone. -/
+associated data of its own row, or — for a row migration 6 made of the
+account's one secret, `legacy` — with the user id alone. -/
 def openTotpApp (rootKey : ByteArray) (user : Store.UserId) (app : Int)
-    (sealedSecret : ByteArray) : Except String ByteArray :=
+    (sealedSecret : ByteArray) (legacy : Bool := false) : Except String ByteArray :=
   match Crypto.«open» (totpKey rootKey) (appAd user app) sealedSecret with
   | .ok secret => .ok secret
   | .error e =>
-    if app == user.val then Crypto.«open» (totpKey rootKey) (userAd user) sealedSecret
+    if legacy then Crypto.«open» (totpKey rootKey) (userAd user) sealedSecret
     else .error e
 
 /-- The associated data of a secret being enrolled. -/

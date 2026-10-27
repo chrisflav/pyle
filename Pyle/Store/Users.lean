@@ -1,5 +1,6 @@
 import Pyle.Store.Schema
 import Pyle.Crypto.Ffi
+import Pyle.Session.Acr
 
 /-!
 # Users and their authenticators
@@ -218,35 +219,90 @@ def Store.renameCredential (s : Store) (user : UserId) (id : ByteArray) (name : 
   return (← exec c "UPDATE webauthn_credentials SET name = ? WHERE id = ? AND user_id = ?"
     #[name, id, user]) > 0
 
-/-- How many authenticators a user has: WebAuthn credentials, plus one for
-each authenticator app.  The two-authenticator rule of §1 counts these. -/
+/-! ## A way in
+
+An account must always be able to sign in again (§1), so a removal is checked
+against what it leaves, inside the transaction that makes it: the factors
+left must reach a level (`Acr.Capabilities.level`, at least `mfa`), and there
+must still be two authenticators — WebAuthn credentials, and the account's
+authenticator apps counted once, since they are one kind of factor and often
+on one phone.  A removal that fails either is rolled back. -/
+
+/-- The kinds of factor an account has, read on one connection: its
+credentials, whether any verifies the user and whether that one is
+device-bound, any authenticator app, a password if `passwords` (the
+deployment allows them), and unspent recovery codes.  `Policy.capabilities`
+is this. -/
+def capabilitiesIn (c : SQLite) (user : UserId) (passwords : Bool) : IO Acr.Capabilities := do
+  let creds ← query c
+    "SELECT user_verified, backup_eligible FROM webauthn_credentials WHERE user_id = ?" #[user]
+    fun st => return ((← colInt st 0) != 0, (← colInt st 1) != 0)
+  let count (sql : String) : IO Nat := return (← queryOne c sql #[user] (colNat · 0)).getD 0
+  let apps ← count "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?"
+  let password ← if passwords then count "SELECT COUNT(*) FROM passwords WHERE user_id = ?"
+    else pure 0
+  let recovery ← count
+    "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND spent_at IS NULL"
+  return { verifyingDeviceBound := creds.any fun (uv, be) => uv && !be,
+           verifying := creds.any (·.1), webauthn := !creds.isEmpty, totp := apps > 0,
+           password := password > 0, recovery := recovery > 0 }
+
+/-- How many authenticators a user has for the two-authenticator rule of §1:
+WebAuthn credentials, plus one if they have any authenticator apps. -/
 def countAuthenticators (c : SQLite) (user : UserId) : IO Nat := do
   let creds ← queryOne c "SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?"
     #[user] (colNat · 0)
-  let totp ← queryOne c "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?" #[user]
+  let apps ← queryOne c "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?" #[user]
     (colNat · 0)
-  return creds.getD 0 + totp.getD 0
+  return creds.getD 0 + min (apps.getD 0) 1
 
 /-- How many authenticators a user has (see `countAuthenticators`). -/
 def Store.authenticatorCount (s : Store) (user : UserId) : IO Nat :=
   s.run (countAuthenticators · user)
 
-/-- Run `delete` (which removes one authenticator of `user` and returns how
-many rows it removed) only if `user` has more than `keep` authenticators.  The
-caller runs this inside `Store.atomically`, so the count and the delete are one
-transaction and two concurrent removals cannot both pass the count.  Whether
-something was removed. -/
-def removeAuthenticatorKeeping (c : SQLite) (user : UserId) (keep : Nat) (delete : IO Nat) :
-    IO Bool := do
-  if (← countAuthenticators c user) ≤ keep then return false
-  return (← delete) > 0
+/-- What an account has, as `capabilitiesIn` reads it. -/
+def Store.capabilities (s : Store) (user : UserId) (passwords : Bool) :
+    IO Acr.Capabilities :=
+  s.run (capabilitiesIn · user passwords)
 
-/-- Remove a credential, unless it would leave the user with fewer than
-`keep` authenticators (§1: a user cannot remove their second-to-last).
-Whether it was removed. -/
-def Store.removeCredential (s : Store) (user : UserId) (id : ByteArray) (keep : Nat := 2) :
-    IO Bool := s.atomically fun c =>
-  removeAuthenticatorKeeping c user keep <|
+/-- Whether what an account has left is still a way in: its factors reach a
+level, and, if `requireTwo`, it has two authenticators. -/
+def keepsWayIn (caps : Acr.Capabilities) (authenticators : Nat) (requireTwo : Bool) : Bool :=
+  caps.level.isSome && (!requireTwo || authenticators ≥ 2)
+
+/-- What a removal came to. -/
+inductive Removal where
+  /-- It was removed. -/
+  | removed
+  /-- There was nothing of that user's to remove. -/
+  | notFound
+  /-- Removing it would have left no way in, and it was kept. -/
+  | wouldLockOut
+  deriving DecidableEq, Repr
+
+instance : ToString Removal := ⟨fun r => reprStr r⟩
+
+/-- Run `delete` (which removes one factor of `user` and returns how many
+rows it removed) under a savepoint, and keep the removal only if what is left
+`keepsWayIn`; otherwise roll it back.  The caller runs this inside
+`Store.atomically`, so two concurrent removals cannot both pass the check. -/
+def removeKeepingWayIn (c : SQLite) (user : UserId) (passwords requireTwo : Bool)
+    (delete : IO Nat) : IO Removal := do
+  discard <| exec c "SAVEPOINT removal"
+  let n ← delete
+  let outcome ← if n == 0 then pure Removal.notFound else do
+    let caps ← capabilitiesIn c user passwords
+    if keepsWayIn caps (← countAuthenticators c user) requireTwo then pure Removal.removed
+    else pure Removal.wouldLockOut
+  if outcome == .wouldLockOut then discard <| exec c "ROLLBACK TO removal"
+  discard <| exec c "RELEASE removal"
+  return outcome
+
+/-- Remove a credential, unless that would leave no way in (§1).  `passwords`
+is whether the deployment allows them, so whether a password counts. -/
+def Store.removeCredential (s : Store) (user : UserId) (id : ByteArray)
+    (passwords : Bool := false) : IO Removal := s.atomically fun c =>
+  removeKeepingWayIn c user passwords true <|
     exec c "DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?" #[id, user]
 
 /-! ## TOTP
@@ -274,15 +330,21 @@ structure TotpApp where
   created : Nat
   /-- When a code from it last signed in, if one has and that is known. -/
   lastUsed : Option Nat
+  /-- Whether its secret is still sealed with the associated data of the one
+  secret an account had before migration 6 (the user id alone); only that
+  migration sets it. -/
+  legacyAd : Bool := false
 
 /-- The columns of `totp_apps`, in the order `readTotpApp` reads them. -/
-def totpAppColumns : String := "id, user_id, name, secret, last_step, created, last_used"
+def totpAppColumns : String :=
+  "id, user_id, name, secret, last_step, created, last_used, legacy_ad"
 
 /-- Read a `totp_apps` row selected with `totpAppColumns`. -/
 def readTotpApp (st : SQLite.Stmt) : IO TotpApp := do
   return { id := ← colInt st 0, user := ⟨← colInt st 1⟩, name := ← colText st 2,
            sealedSecret := ← colBlob st 3, lastStep := ← colOpt colNat st 4,
-           created := ← colNat st 5, lastUsed := ← colOpt colNat st 6 }
+           created := ← colNat st 5, lastUsed := ← colOpt colNat st 6,
+           legacyAd := (← colInt st 7) != 0 }
 
 /-- An account's TOTP lock (§7): consecutive failed codes, whichever app they
 were meant for, and until when TOTP is locked. -/
@@ -293,12 +355,19 @@ structure TotpLock where
   lockedUntil : Nat := 0
   deriving Repr, BEq, Inhabited
 
-/-- Add an authenticator app.  The secret is sealed by `sealFor`, which is given
-the new row's id, so that the sealed secret can be bound to its row; the row
-and its secret are written in one transaction.  `lastStep` is the step of the
+/-- The most authenticator apps an account may have.  Every app is a secret a
+code is checked against, so this bounds the work one sign-in does. -/
+def maxTotpApps : Nat := 5
+
+/-- Add an authenticator app, unless the user has `maxTotpApps` already;
+`none` then.  The secret is sealed by `sealFor`, which is given the new row's
+id, so that the sealed secret can be bound to its row; the count, the row and
+its secret are written in one transaction.  `lastStep` is the step of the
 code that confirmed it, which is then used up. -/
 def Store.addTotpApp (s : Store) (user : UserId) (name : String) (lastStep : Option Nat)
-    (now : Nat) (sealFor : Int → IO ByteArray) : IO TotpApp := s.atomically fun c => do
+    (now : Nat) (sealFor : Int → IO ByteArray) : IO (Option TotpApp) := s.atomically fun c => do
+  let n ← queryOne c "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?" #[user] (colNat · 0)
+  if n.getD 0 ≥ maxTotpApps then return none
   let some id ← queryOne c
       "INSERT INTO totp_apps (user_id, name, secret, last_step, created) \
         VALUES (?, ?, X'', ?, ?) RETURNING id"
@@ -306,7 +375,7 @@ def Store.addTotpApp (s : Store) (user : UserId) (name : String) (lastStep : Opt
     | throw (.userError "store: the new authenticator app was not returned")
   let sealedSecret ← sealFor id
   discard <| exec c "UPDATE totp_apps SET secret = ? WHERE id = ?" #[sealedSecret, id]
-  return { id, user, name, sealedSecret, lastStep, created := now, lastUsed := none }
+  return some { id, user, name, sealedSecret, lastStep, created := now, lastUsed := none }
 
 /-- A user's authenticator apps, oldest first. -/
 def Store.listTotpApps (s : Store) (user : UserId) : IO (Array TotpApp) := s.run fun c =>
@@ -325,12 +394,18 @@ def Store.renameTotpApp (s : Store) (user : UserId) (id : Int) (name : String) :
     #[name, id, user]) > 0
 
 /-- Remove one of a user's authenticator apps, under the same rule as
-`removeCredential`: not if it would leave fewer than `keep` authenticators.
-Whether it was removed. -/
-def Store.removeTotpApp (s : Store) (user : UserId) (id : Int) (keep : Nat := 2) : IO Bool :=
-  s.atomically fun c =>
-    removeAuthenticatorKeeping c user keep <|
-      exec c "DELETE FROM totp_apps WHERE id = ? AND user_id = ?" #[id, user]
+`removeCredential`: not if it would leave no way in. -/
+def Store.removeTotpApp (s : Store) (user : UserId) (id : Int) (passwords : Bool := false) :
+    IO Removal := s.atomically fun c =>
+  removeKeepingWayIn c user passwords true <|
+    exec c "DELETE FROM totp_apps WHERE id = ? AND user_id = ?" #[id, user]
+
+/-- Replace the secret of an app still sealed with the old associated data by
+one sealed for its row, and clear its `legacyAd` flag.  Whether it applied. -/
+def Store.resealTotpApp (s : Store) (user : UserId) (id : Int) (sealedSecret : ByteArray) :
+    IO Bool := s.run fun c => return (← exec c
+      "UPDATE totp_apps SET secret = ?, legacy_ad = 0 \
+        WHERE id = ? AND user_id = ? AND legacy_ad = 1" #[sealedSecret, id, user]) > 0
 
 /-- An account's TOTP lock; an account that has never failed has none
 recorded, which is no failures and no lock. -/

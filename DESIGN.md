@@ -83,7 +83,7 @@ comes from an agent acting for Christian, on this one pull request".
 | --- | --- | --- |
 | Passkey (discoverable WebAuthn credential, user verification) | primary, alone `phr` | Phishing-resistant: bound to the origin by the browser. |
 | Security key (WebAuthn, possibly non-discoverable) | primary with UV (`phr`), or second factor | Same ceremony, different flags. |
-| TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports.  Several apps per account, each its own authenticator, all one kind of factor. |
+| TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports.  Up to five apps per account, together one authenticator and one kind of factor. |
 | Recovery codes | last resort, second factor only | Ten single-use codes, stored hashed, shown once. |
 | Password | optional first factor, never alone | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
 
@@ -151,8 +151,12 @@ verification preferred) itself, and sends an authenticator app, a password
 and new recovery codes to a page each.
 
 **At least two.**  A user cannot remove their second-to-last authenticator, and
-is nagged until they have registered two.  Each WebAuthn credential and each
-authenticator app counts as one.  Losing a single key should never be
+is nagged until they have registered two.  Each WebAuthn credential counts
+as one, and an account's authenticator apps count as one together.  A
+removal is checked against what it leaves, in the transaction that makes it,
+and rolled back if the factors left reach no level (two touch-only keys, say,
+or apps alone) or are fewer than two authenticators; removing the password,
+which is not counted, is checked only for the level.  Losing a single key should never be
 an administrator's problem.
 
 ## 2. WebAuthn ceremonies
@@ -227,7 +231,10 @@ for an app is never accepted for it again — which is what an observer of the
 code could exploit.  Failed codes and the lock of §7 are counted per account,
 once per attempt, so more apps do not mean more guesses.  Two codes from two
 apps are two factors of one kind and make no authentication: an account's
-apps are often on the same phone.
+apps are often on the same phone.  An account has at most five apps,
+which bounds the secrets one code is checked against; an app whose secret
+does not open under the root key is left out of the check and audited, so
+that one damaged row does not take TOTP away from the others.
 
 **Recovery codes.**  Ten codes of 10 base32 characters, stored as
 HMAC-SHA256 under a server key so a database leak is not a list of working
@@ -436,9 +443,11 @@ ChaCha20-Poly1305, with the row id as associated data so a secret cannot be
 moved to another row.  A TOTP secret's associated data names both the user
 and the app (`totp <user> <app>`), so it cannot be moved to another user or
 to another of the same user's apps.  The single secret an account had before
-migration 6 was sealed with the user id alone; the migration gave its app the
-user's id, and that associated data is accepted for that one row.  Signing keys rotate: the JWKS publishes the current key
-and the previous one, and a biscuit root key rotation is announced to services
+migration 6 was sealed with the user id alone; that associated data is
+accepted only for a row flagged `legacy_ad`, which only the migration sets,
+and the first code such an app accepts re-seals it with the new associated
+data and clears the flag.  Signing keys rotate: the JWKS publishes the
+current key and the previous one, and a biscuit root key rotation is announced to services
 before it takes effect.
 
 ## 7. Abuse resistance
@@ -468,11 +477,11 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 | --- | --- |
 | `users` | id, handle (random 32 bytes, the WebAuthn user handle), name, groups |
 | `webauthn_credentials` | credential id, user, COSE public key, sign count, flags (and whether it has verified the user), AAGUID, transports, name, created/last used |
-| `totp_apps` | id (never reused), user, name, encrypted secret, last accepted step, created/last used |
+| `totp_apps` | id (never reused), user, name, encrypted secret, last accepted step, created/last used, whether the secret still has the old associated data |
 | `totp_lock` | user, failed codes, locked until |
 | `recovery_codes` | user, HMAC, spent-at |
 | `sessions` | id hash, user, amr, auth_time, created, last seen, client hints |
-| `challenges` | challenge, purpose, user, expiry — deleted on first use |
+| `challenges` | challenge, purpose, user, expiry, for a registration the kind asked for — deleted on first use |
 | `clients` | OIDC clients: id, secret hash, redirect URIs, allowed scopes, minimum level |
 | `codes`, `refresh_tokens` | hashes only, with the binding fields of §5.1 |
 | `keys` | encrypted signing keys, state (next/current/previous) |
@@ -484,8 +493,10 @@ the database does not give anyone a session.
 The schema changes only by appended, numbered migrations (`Store/Schema`).
 Migration 6 replaced the one-per-user `totp` table with `totp_apps` and
 `totp_lock`: each account's secret became its first app, named
-"Authenticator app", with the user's id as the app's id (§6.3), its last
-accepted step kept, and its failures and lock moved to the account.
+"Authenticator app", flagged as sealed with the old associated data (§6.3),
+its last accepted step kept, and its failures and lock moved to the account.
+Migration 7 records with a registration challenge the kind of authenticator
+it was asked for.
 
 ## 9. Properties worth verifying
 

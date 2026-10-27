@@ -240,8 +240,9 @@ secret. -/
 def giveTotpApp (ctx : Ctx) (u : Store.User) (name : String := "Authenticator app") :
     IO (Store.TotpApp × ByteArray) := do
   let secret ← Factor.Totp.generateSecret
-  let app ← ctx.store.addTotpApp u.id name none (← ctx.clock)
-    (SignIn.Secrets.sealTotpApp ctx.rootKey u.id · secret)
+  let some app ← ctx.store.addTotpApp u.id name none (← ctx.clock)
+      (SignIn.Secrets.sealTotpApp ctx.rootKey u.id · secret)
+    | throw (.userError "giveTotpApp: the app was refused")
   return (app, secret)
 
 /-- Give a user an authenticator app straight in the store; its secret. -/

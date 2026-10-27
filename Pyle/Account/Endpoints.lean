@@ -15,27 +15,33 @@ stopped from.
 | | body | answer |
 | --- | --- | --- |
 | `POST /account/authenticators/register/begin` | `{"kind"?}` | creation options |
-| `POST /account/authenticators/register/finish` | `{"credential", "name"?, "kind"?}` | `201 {"id"}` |
+| `POST /account/authenticators/register/finish` | `{"credential", "name"?}` | `201 {"id"}` |
 | `POST /account/authenticators/rename` | `{"id", "name"}` | `204` |
 | `POST /account/authenticators/remove` | `{"id"}` | `204`, or `409` |
 | `POST /account/totp/begin` | `{"name"?}` | `{"secret", "uri", "qr", "pending", "name"}` |
-| `POST /account/totp/confirm` | `{"pending", "code", "name"?}` | `201 {"id", "name"}` |
+| `POST /account/totp/confirm` | `{"pending", "code", "name"?}` | `201 {"id", "name"}`, or `409` |
 | `POST /account/totp/rename` | `{"id", "name"}` | `204` |
 | `POST /account/totp/remove` | `{"id"}` | `204`, or `409` |
 | `POST /account/recovery-codes` | `{}` | `{"codes"}` |
 | `POST /account/password` | `{"password"}` | `204` |
-| `POST /account/password/remove` | `{}` | `204` |
+| `POST /account/password/remove` | `{}` | `204`, or `409` |
 | `POST /account/sessions/end` | `{"handle"}` | `204` |
 
 **Kinds.**  `kind` is `passkey` (a discoverable credential that verifies the
 user: `residentKey` and `userVerification` required, and a registration that
 did not verify the user is refused) or `security-key` (`residentKey`
 discouraged, `userVerification` preferred); without it, both are preferred.
-It also picks the default name, "Passkey 2" or "Security key 3".
+It also picks the default name, "Passkey 2" or "Security key 3".  The
+challenge records the kind `begin` was asked for, and `finish` holds the
+registration to it.
 
-**At least two.**  Removing a credential or an authenticator app is refused
-with `409` when it would leave fewer than two authenticators (§1), every app
-counting as one; the store makes the count and the delete one transaction.
+**A way in.**  Removing a credential or an authenticator app is refused with
+`409` when what is left could not sign in (its factors reach no level) or is
+fewer than two authenticators (§1), an account's apps counting as one
+together; removing the password is refused when what is left reaches no
+level.  The store deletes, checks what is left and rolls back in one
+transaction (`Store.removeKeepingWayIn`).  An account has at most
+`maxTotpApps` authenticator apps; confirming one more is refused with `409`.
 
 **Authenticator apps.**  An account may have several, each with its own
 secret and name, renamed and removed by the id `confirm` answers with.
@@ -94,13 +100,21 @@ inductive Kind where
   | any
   deriving DecidableEq, Repr
 
-/-- The kind a body asks for, as `"kind"`: `passkey`, `security-key`, or
-anything else for either. -/
-def kindOf (j : Json) : Kind :=
-  match strField j "kind" with
-  | some "passkey" => .passkey
-  | some "security-key" => .securityKey
+/-- A kind by its name: `passkey`, `security-key`, or anything else for
+either. -/
+def Kind.ofString : String → Kind
+  | "passkey" => .passkey
+  | "security-key" => .securityKey
   | _ => .any
+
+/-- The name of a kind, as a body gives it and the challenge records it. -/
+def Kind.toString : Kind → String
+  | .passkey => "passkey"
+  | .securityKey => "security-key"
+  | .any => ""
+
+/-- The kind a body asks for, as `"kind"` (`Kind.ofString`). -/
+def kindOf (j : Json) : Kind := Kind.ofString ((strField j "kind").getD "")
 
 /-- The `residentKey` and `userVerification` of the creation options for a
 kind. -/
@@ -117,18 +131,21 @@ def Kind.defaultName (k : Kind) (n : Nat) : String :=
   | .any => s!"authenticator {n}"
 
 /-- `POST /account/authenticators/register/begin`: creation options for the
-kind the body asks for (`kindOf`). -/
+kind the body asks for (`kindOf`), which the challenge records. -/
 def registerBegin : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let u ← userOf ctx s
   let creds ← ctx.store.listCredentials u.id
-  let ch ← match ← newChallenge ctx r .register (some u.id) with
+  let kind := kindOf j
+  let ch ← match ← newChallenge ctx r .register (some u.id) (kind := kind.toString) with
     | .ok ch => pure ch
     | .error rep => return rep
-  let (residentKey, userVerification) := (kindOf j).selection
+  let (residentKey, userVerification) := kind.selection
   return .json (creationOptions ctx ch u.handle u.name
     (creds.toList.map fun c => descriptor c.id c.transports) residentKey userVerification)
 
-/-- `POST /account/authenticators/register/finish`. -/
+/-- `POST /account/authenticators/register/finish`.  The kind is the one
+`begin` was asked for, as its challenge recorded it: a passkey must have
+verified the user. -/
 def registerFinish : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let some credJ := (j.getObjVal? "credential").toOption | return badRequest "'credential' is missing"
   let reg ← match parseRegistration credJ with
@@ -141,7 +158,7 @@ def registerFinish : Handler := fun ctx r => withStepUp ctx r fun s j => do
   let some (challenge, ch) ← consumeRegistrationChallenge ctx reg
     | refuse "unknown or expired challenge"
   if ch.user != some u.id then return ← refuse "challenge issued to someone else"
-  let kind := kindOf j
+  let kind := Kind.ofString ch.kind
   match ← verifyNewCredential ctx challenge reg
       (requireUserVerification := kind == .passkey) with
   | .error why => refuse why
@@ -170,10 +187,15 @@ def rename : Handler := fun ctx r => withStepUp ctx r fun s j => do
     return .noContent
   return Reply.error .notFound "not_found" "no such authenticator"
 
-/-- `409`, for a removal that would leave fewer than two authenticators. -/
+/-- `409`, for a removal that would leave no way in: fewer than two
+authenticators, or nothing that reaches a level. -/
 def lastTwo : Reply :=
   Reply.error .conflict "last_authenticators"
-    "an account keeps at least two authenticators; add another before removing this one"
+    "an account keeps two authenticators that can sign in; add another before removing this one"
+
+/-- What the audit log says of a removal that was refused. -/
+def lockOutDetail : String :=
+  "would leave fewer than two authenticators, or none that can sign in"
 
 /-- `POST /account/authenticators/remove`. -/
 def remove : Handler := fun ctx r => withStepUp ctx r fun s j => do
@@ -185,12 +207,15 @@ def remove : Handler := fun ctx r => withStepUp ctx r fun s j => do
   match ← ctx.store.findCredential id with
   | some c =>
     if c.user != s.user then return Reply.error .notFound "not_found" "no such authenticator"
-    if ← ctx.store.removeCredential s.user id then
+    match ← ctx.store.removeCredential s.user id ctx.config.allowPasswords with
+    | .removed =>
       Audit.log ctx r .removeAuthenticator .success (userName := name) (factor := factor)
       return .noContent
-    Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := factor)
-      (detail := "would leave fewer than two authenticators")
-    return lastTwo
+    | .notFound => return Reply.error .notFound "not_found" "no such authenticator"
+    | .wouldLockOut =>
+      Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := factor)
+        (detail := lockOutDetail)
+      return lastTwo
   | none => return Reply.error .notFound "not_found" "no such authenticator"
 
 /-- How long a TOTP secret being enrolled may wait for its first code. -/
@@ -256,6 +281,11 @@ def totpBegin : Handler := fun ctx r => withStepUp ctx r fun s j => do
 /-- The audit log's name for an authenticator app. -/
 def appFactor (id : Int) : Option String := some s!"totp:{id}"
 
+/-- `409`, for an account that has as many authenticator apps as it may. -/
+def tooManyApps : Reply :=
+  Reply.error .conflict "too_many_apps"
+    s!"an account has at most {maxTotpApps} authenticator apps; remove one first"
+
 /-- `POST /account/totp/confirm`: store the secret as a new app once a code
 from it verifies.  The app is named by `name` in the body if there is one,
 else by the name given to `begin`.  Counted against the rate limiter, since it
@@ -280,8 +310,11 @@ def totpConfirm : Handler := fun ctx r => withStepUp ctx r fun s j => do
     let n := (← ctx.store.listTotpApps u.id).size
     let name := appName ((strField j "name").filter (!·.trimAscii.isEmpty) <|>
       (if p.name.isEmpty then none else some p.name)) n
-    let app ← ctx.store.addTotpApp u.id name (some step) now
-      (Secrets.sealTotpApp ctx.rootKey u.id · p.secret)
+    let some app ← ctx.store.addTotpApp u.id name (some step) now
+        (Secrets.sealTotpApp ctx.rootKey u.id · p.secret)
+      | Audit.log ctx r .register .refused (userName := some u.name) (factor := some "totp")
+          (detail := s!"already {maxTotpApps} authenticator apps")
+        return tooManyApps
     Audit.log ctx r .register .success (userName := some u.name) (factor := appFactor app.id)
       (detail := s!"authenticator app '{name}' added")
     return .json (Json.mkObj [("id", toJson app.id), ("name", name)]) .created
@@ -320,13 +353,16 @@ def totpRemove : Handler := fun ctx r => withStepUp ctx r fun s j => do
     | .error rep => return rep
   let name ← userName ctx s.user
   let some app ← ctx.store.findTotpApp s.user id | return noSuchApp
-  if ← ctx.store.removeTotpApp s.user id then
+  match ← ctx.store.removeTotpApp s.user id ctx.config.allowPasswords with
+  | .removed =>
     Audit.log ctx r .removeAuthenticator .success (userName := name) (factor := appFactor id)
       (detail := s!"authenticator app '{app.name}' removed")
     return .noContent
-  Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := appFactor id)
-    (detail := s!"authenticator app '{app.name}': would leave fewer than two authenticators")
-  return lastTwo
+  | .notFound => return noSuchApp
+  | .wouldLockOut =>
+    Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := appFactor id)
+      (detail := s!"authenticator app '{app.name}': {lockOutDetail}")
+    return lastTwo
 
 /-- `POST /account/recovery-codes`: ten new codes, replacing the old ones. -/
 def recoveryCodes : Handler := fun ctx r => withStepUp ctx r fun s _ => do
@@ -362,13 +398,20 @@ def setPassword : Handler := fun ctx r => withStepUp ctx r fun s j => do
     (factor := some "password")
   return .noContent
 
-/-- `POST /account/password/remove`. -/
+/-- `POST /account/password/remove`: refused with `409` if what is left
+would reach no level. -/
 def removePassword : Handler := fun ctx r => withStepUp ctx r fun s _ => do
-  if ← ctx.store.removePassword s.user then
-    Audit.log ctx r .removeAuthenticator .success (userName := ← userName ctx s.user)
-      (factor := some "password")
+  let name ← userName ctx s.user
+  match ← ctx.store.removePassword s.user ctx.config.allowPasswords with
+  | .removed =>
+    Audit.log ctx r .removeAuthenticator .success (userName := name) (factor := some "password")
     return .noContent
-  return Reply.error .notFound "not_found" "there is no password"
+  | .notFound => return Reply.error .notFound "not_found" "there is no password"
+  | .wouldLockOut =>
+    Audit.log ctx r .removeAuthenticator .refused (userName := name) (factor := some "password")
+      (detail := "would leave nothing that can sign in")
+    return Reply.error .conflict "last_way_in"
+      "without the password this account could not sign in; add another way first"
 
 /-- `POST /account/sessions/end`: end one of the user's sessions by its
 handle.  Ending the request's own session also clears its cookie. -/

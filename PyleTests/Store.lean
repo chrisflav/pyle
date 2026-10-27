@@ -144,32 +144,64 @@ def credentialTests : IO Unit := withCtx fun ctx _ => do
   check "another user cannot remove it" (!(← s.removeCredential bob.id id1))
   check "with three, one may go" (← s.removeCredential alice.id id1)
   checkEq "two remain" (← s.authenticatorCount alice.id) 2
-  s.setTotp alice.id "sealed".toUTF8 5
-  checkEq "a TOTP secret counts" (← s.authenticatorCount alice.id) 3
+  discard <| s.addTotpApp alice.id "phone" none 5 fun _ => pure "sealed".toUTF8
+  checkEq "an authenticator app counts" (← s.authenticatorCount alice.id) 3
+  discard <| s.addTotpApp alice.id "tablet" none 5 fun _ => pure "sealed".toUTF8
+  checkEq "and every app counts on its own" (← s.authenticatorCount alice.id) 4
 
 /-- TOTP replay and lockout, and recovery codes. -/
 def storedFactorTests : IO Unit := withCtx fun ctx _ => do
   group "store: totp and recovery codes"
   let s := ctx.store
   let u ← s.addUser "alice" [] 1
-  s.setTotp u.id "sealed".toUTF8 1
-  check "a first step is accepted" (← s.acceptTotpStep u.id 100 3000)
-  check "the same step is refused" (!(← s.acceptTotpStep u.id 100 3000))
-  check "an earlier step is refused" (!(← s.acceptTotpStep u.id 99 3000))
-  check "a later step is accepted" (← s.acceptTotpStep u.id 101 3030)
-  checkEq "two racing for one step: one wins" (← raceCount 8 (s.acceptTotpStep u.id 200 6000)) 1
+  let a ← s.addTotpApp u.id "phone" none 1 fun id => pure s!"sealed {id}".toUTF8
+  checkEq "the sealer is given the new row's id"
+    ((← s.findTotpApp u.id a.id).map (·.sealedSecret)) (some s!"sealed {a.id}".toUTF8)
+  check "a first step is accepted" (← s.acceptTotpStep u.id a.id 100 3000)
+  check "the same step is refused" (!(← s.acceptTotpStep u.id a.id 100 3000))
+  check "an earlier step is refused" (!(← s.acceptTotpStep u.id a.id 99 3000))
+  check "a later step is accepted" (← s.acceptTotpStep u.id a.id 101 3030)
+  checkEq "and its time recorded as the last use"
+    ((← s.findTotpApp u.id a.id).bind (·.lastUsed)) (some 3030)
+  checkEq "two racing for one step: one wins"
+    (← raceCount 8 (s.acceptTotpStep u.id a.id 200 6000)) 1
+  -- A second app keeps its own last step.
+  let b ← s.addTotpApp u.id "tablet" (some 150) 2 fun _ => pure "other".toUTF8
+  check "the second app's step is its own: one before the first app's last is accepted"
+    (← s.acceptTotpStep u.id b.id 199 6000)
+  check "and the same step for it is then refused" (!(← s.acceptTotpStep u.id b.id 199 6000))
+  checkEq "the first app's last step is untouched"
+    ((← s.findTotpApp u.id a.id).bind (·.lastStep)) (some 200)
+  let bob ← s.addUser "bob" [] 1
+  check "another user's app takes no step" (!(← s.acceptTotpStep bob.id a.id 500 6000))
+  check "nor is found for them" ((← s.findTotpApp bob.id a.id).isNone)
+  -- The lock is the account's.
   for _ in [0:4] do
     checkEq "a failure below the limit locks nothing" (← s.recordTotpFailure u.id 7000) none
   checkEq "the fifth failure locks for fifteen minutes" (← s.recordTotpFailure u.id 7000)
     (some 7900)
-  check "a good code is refused while locked" (!(← s.acceptTotpStep u.id 300 7100))
-  check "and accepted after" (← s.acceptTotpStep u.id 300 7900)
-  checkEq "the secret reads back" ((← s.findTotp u.id).map (·.sealedSecret)) (some "sealed".toUTF8)
+  check "a good code is refused while locked, for either app"
+    (!(← s.acceptTotpStep u.id a.id 300 7100) && !(← s.acceptTotpStep u.id b.id 300 7100))
+  check "and accepted after" (← s.acceptTotpStep u.id a.id 300 7900)
+  checkEq "which clears the failures" (← s.totpLock u.id).failures 0
+  discard <| s.recordTotpFailure u.id 8000
+  discard <| s.acceptTotpStep u.id b.id 301 8000
+  checkEq "an accepted code for either app clears them" (← s.totpLock u.id).failures 0
+  checkEq "bob has no lock" (← s.totpLock bob.id).lockedUntil 0
+  check "renaming" ((← s.renameTotpApp u.id a.id "old phone") &&
+    ((← s.findTotpApp u.id a.id).map (·.name)) == some "old phone")
+  check "not someone else's" (!(← s.renameTotpApp bob.id a.id "mine"))
+  checkEq "two apps are two authenticators" (← s.authenticatorCount u.id) 2
+  check "an app as one of two authenticators cannot be removed" (!(← s.removeTotpApp u.id a.id))
   s.addCredential (sampleCredential u.id "c1".toUTF8)
-  check "TOTP as one of two authenticators cannot be removed" (!(← s.removeTotp u.id))
-  s.addCredential (sampleCredential u.id "c2".toUTF8)
-  check "as one of three it can" (← s.removeTotp u.id)
-  check "and then it is gone" ((← s.findTotp u.id).isNone)
+  s.addCredential (sampleCredential bob.id "b1".toUTF8)
+  check "nor by someone else" (!(← s.removeTotpApp bob.id a.id 0))
+  check "as one of three it can" (← s.removeTotpApp u.id a.id)
+  check "and then it is gone" ((← s.findTotpApp u.id a.id).isNone)
+  checkEq "leaving the other" ((← s.listTotpApps u.id).toList.map (·.name)) ["tablet"]
+  check "the other cannot go now" (!(← s.removeTotpApp u.id b.id))
+  let c ← s.addTotpApp u.id "new" none 9 fun _ => pure .empty
+  check "ids are not reused" (c.id > b.id)
   let codes := ["a", "b", "c"].map (·.toUTF8)
   s.setRecoveryCodes u.id codes
   checkEq "three unspent" (← s.unspentRecoveryCodes u.id) 3

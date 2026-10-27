@@ -13,10 +13,12 @@ lines that turn base64url into `ArrayBuffer`s and back, call
 
 What the script relies on, and the Lean side provides:
 
-* `body[data-page]` is `signin`, `account`, `invite` or `message`; the sign-in
-  page adds `data-mode` (`signin` or `stepup`), `data-return`, a return
-  address `SignIn.safeReturn` has already accepted, and `data-acr`, the level
-  the sign-in must reach, which the script passes on to the endpoints; the
+* `body[data-page]` is `signin`, `account`, `add`, `add-app`,
+  `add-password`, `add-recovery`, `invite` or `message`; the sign-in page adds
+  `data-mode` (`signin` or `stepup`), `data-return`, a return address
+  `SignIn.safeReturn` has already accepted, and `data-acr`, the level the
+  sign-in must reach, which the script passes on to the endpoints; the
+  authenticator-app page adds `data-pending`, the sealed new secret; the
   invitation page adds `data-token`.
 * The element ids each page's script looks up are the ones the page writes
   (`Pyle.Web.Pages`), and the JSON members it reads and sends are the ones
@@ -214,11 +216,15 @@ function setupSignIn(body) {
   });
 }
 
-// The account page.  A change that needs a recent sign-in answers 403
+// The account pages.  A change that needs a recent sign-in answers 403
 // step_up_required; then confirm with an authenticator and try once more.
+function here() {
+  return window.location.pathname;
+}
+
 async function stepUpHere() {
   const credential = await getAssertion('/signin/stepup/begin', {});
-  const res = await post('/signin/stepup/finish', { credential: credential, return: '/account' });
+  const res = await post('/signin/stepup/finish', { credential: credential, return: here() });
   if (!res.ok) throw new Error(describe(res));
 }
 
@@ -230,8 +236,8 @@ async function act(url, body) {
       await stepUpHere();
     } catch (e) {
       // No authenticator at hand that verifies the user: the sign-in page
-      // offers the other ways.
-      window.location.assign('/signin?return=%2Faccount&max_age=0');
+      // offers the other ways, and comes back here.
+      window.location.assign('/signin?return=' + encodeURIComponent(here()) + '&max_age=0');
       throw new Error('Confirm it is you on the sign-in page.');
     }
     res = await post(url, body);
@@ -244,15 +250,19 @@ async function accountAction(button) {
   const action = button.dataset.action;
   try {
     if (action === 'rename') {
-      const name = window.prompt('A new name for this authenticator');
+      const name = window.prompt('A new name for this passkey or security key');
       if (!name) return;
       await act('/account/authenticators/rename', { id: button.dataset.id, name: name });
     } else if (action === 'remove') {
-      if (!window.confirm('Remove this authenticator?')) return;
+      if (!window.confirm('Remove this passkey or security key?')) return;
       await act('/account/authenticators/remove', { id: button.dataset.id });
+    } else if (action === 'totp-rename') {
+      const name = window.prompt('A new name for this authenticator app');
+      if (!name) return;
+      await act('/account/totp/rename', { id: Number(button.dataset.id), name: name });
     } else if (action === 'totp-remove') {
-      if (!window.confirm('Remove the authenticator app?')) return;
-      await act('/account/totp/remove', {});
+      if (!window.confirm('Remove this authenticator app? Its codes stop working.')) return;
+      await act('/account/totp/remove', { id: Number(button.dataset.id) });
     } else if (action === 'password-remove') {
       await act('/account/password/remove', {});
     } else if (action === 'end-session') {
@@ -261,50 +271,64 @@ async function accountAction(button) {
     } else {
       return;
     }
-    window.location.reload();
+    window.location.assign('/account');
   } catch (e) { failed(e); }
 }
 
 function setupAccount() {
-  let pending = null;
   document.querySelectorAll('button[data-action]').forEach(function (b) {
     b.addEventListener('click', function () { accountAction(b); });
   });
-  on('add-authenticator', 'click', async function () {
-    try {
-      const options = await act('/account/authenticators/register/begin', {});
-      const credential = await createCredential(options);
-      await act('/account/authenticators/register/finish',
-        { credential: credential, name: value('new-name') });
-      window.location.reload();
-    } catch (e) { failed(e); }
+  on('sign-out', 'click', async function () {
+    await post('/logout', {});
+    window.location.assign('/signin');
   });
-  on('totp-begin', 'click', async function () {
-    try {
-      const data = await act('/account/totp/begin', {});
-      pending = data.pending;
-      const qr = document.getElementById('totp-qr');
-      if (data.qr) {
-        qr.src = data.qr;
-        qr.hidden = false;
-      } else {
-        qr.hidden = true;
-      }
-      document.getElementById('totp-uri').setAttribute('href', data.uri);
-      document.getElementById('totp-secret').textContent = data.secret;
-      document.getElementById('totp-setup').hidden = false;
-      say('Add the account to your app, then enter the code it shows.');
-    } catch (e) { failed(e); }
+}
+
+// The choice of what to add: a passkey or a security key is registered
+// right here, with the options for its kind.
+function setupAdd() {
+  document.querySelectorAll('button[data-kind]').forEach(function (b) {
+    b.addEventListener('click', async function () {
+      const kind = b.dataset.kind;
+      try {
+        const options = await act('/account/authenticators/register/begin', { kind: kind });
+        const credential = await createCredential(options);
+        await act('/account/authenticators/register/finish',
+          { credential: credential, kind: kind });
+        window.location.assign('/account?added=' + encodeURIComponent(kind));
+      } catch (e) { failed(e); }
+    });
   });
+}
+
+// Adding an authenticator app: the page carries the new secret, sealed, and
+// the first code from the app stores it under the name given.
+function setupAddApp(body) {
   on('totp-confirm', 'click', async function () {
-    if (!pending) return;
     try {
-      await act('/account/totp/confirm', { pending: pending, code: value('totp-code') });
-      window.location.reload();
+      await act('/account/totp/confirm', { pending: body.dataset.pending,
+        code: value('totp-code'), name: value('app-name') });
+      window.location.assign('/account?added=app');
     } catch (e) { failed(e); }
   });
+}
+
+function setupAddPassword() {
+  on('password-set', 'click', async function () {
+    try {
+      await act('/account/password', { password: rawValue('new-password') });
+      window.location.assign('/account?added=password');
+    } catch (e) { failed(e); }
+  });
+}
+
+// New recovery codes, shown once.  Replacing codes asks first.
+function setupAddRecovery() {
   on('recovery-generate', 'click', async function () {
-    if (!window.confirm('New codes replace the old ones. Continue?')) return;
+    const button = document.getElementById('recovery-generate');
+    if (button.dataset.replace === 'true' &&
+        !window.confirm('New codes replace the old ones. Continue?')) return;
     try {
       const data = await act('/account/recovery-codes', {});
       const list = document.getElementById('recovery-list');
@@ -315,18 +339,10 @@ function setupAccount() {
         list.appendChild(li);
       });
       list.hidden = false;
+      button.hidden = true;
+      document.getElementById('recovery-done').hidden = false;
       say('Write these codes down now: they are not shown again.');
     } catch (e) { failed(e); }
-  });
-  on('password-set', 'click', async function () {
-    try {
-      await act('/account/password', { password: rawValue('new-password') });
-      window.location.reload();
-    } catch (e) { failed(e); }
-  });
-  on('sign-out', 'click', async function () {
-    await post('/logout', {});
-    window.location.assign('/signin');
   });
 }
 
@@ -360,6 +376,10 @@ document.addEventListener('DOMContentLoaded', function () {
   }
   if (body.dataset.page === 'signin') setupSignIn(body);
   else if (body.dataset.page === 'account') setupAccount();
+  else if (body.dataset.page === 'add') setupAdd();
+  else if (body.dataset.page === 'add-app') setupAddApp(body);
+  else if (body.dataset.page === 'add-password') setupAddPassword();
+  else if (body.dataset.page === 'add-recovery') setupAddRecovery();
   else if (body.dataset.page === 'invite') setupInvite(body);
 });"##
 
@@ -422,15 +442,136 @@ button.secondary, li button {
   padding: 0.25rem 0.6rem;
   margin-top: 0.25rem;
 }
+/* A link that does what a button does. */
+a.button {
+  display: inline-block;
+  padding: 0.55rem 1rem;
+  color: var(--bg);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 0.35rem;
+  text-decoration: none;
+  font-weight: 600;
+}
+a.button.secondary { color: var(--accent); background: transparent; font-weight: 400; }
+button.small, a.button.small {
+  margin: 0;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.9rem;
+  font-weight: 400;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+}
 :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-ul.items { list-style: none; padding: 0; }
-ul.items li { padding: 0.6rem 0; border-bottom: 1px solid var(--line); }
+ul.items { list-style: none; padding: 0; margin: 0; }
+ul.items li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--line);
+}
 .meta, .hint { color: var(--muted); font-size: 0.9rem; }
 .notice { background: var(--notice); padding: 0.75rem 1rem; border-radius: 0.35rem; }
-code, #recovery-list { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; word-break: break-all; }
+code, ol.codes { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; word-break: break-all; }
 #status { min-height: 1.5rem; font-weight: 600; }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+/* The account pages: wider, for the table of sign-in methods. */
+body[data-page="account"] main, body[data-page^="add"] main { max-width: 46rem; }
+a.back { display: inline-block; margin-bottom: 0.75rem; }
+.lead { color: var(--muted); margin: 0 0 1.5rem; }
+.signed-in { color: var(--muted); margin: -1rem 0 1.5rem; }
+.protection {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+}
+.protection.notice { border-color: transparent; }
+.protection-text { flex: 1 1 22rem; }
+.protection p { margin: 0 0 0.35rem; }
+.protection p:last-child { margin-bottom: 0; }
+.protection-title { font-weight: 600; }
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 2rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1.25rem;
+}
+.section-head h2 { margin: 0; border: 0; padding: 0; }
+/* On a narrow screen the table scrolls sideways in its box, not the page. */
+.table-scroll { overflow-x: auto; margin-top: 1rem; }
+table.methods { width: 100%; min-width: 34rem; border-collapse: collapse; font-size: 0.95rem; }
+table.methods th, table.methods td { text-align: left; vertical-align: top; padding: 0.6rem 0.5rem; }
+table.methods th:first-child, table.methods td:first-child { padding-left: 0; }
+table.methods thead th { padding-top: 0.4rem; padding-bottom: 0.4rem; }
+table.methods tbody tr { border-bottom: 1px solid var(--line); }
+table.methods th[scope="colgroup"] { padding: 1.25rem 0 0.35rem; font-size: 1rem; }
+table.methods th[scope="colgroup"] .meta { font-weight: 400; font-size: 0.85rem; }
+table.methods td .meta { font-size: 0.85rem; }
+table.methods td.actions { text-align: right; white-space: nowrap; padding-right: 0; }
+/* The choices of what to add, each a card. */
+.choices { display: flex; flex-direction: column; gap: 0.75rem; }
+.choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin: 0;
+  padding: 1rem 1.1rem;
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+.choice.recommended { border: 2px solid var(--accent); }
+.choice-text { flex: 1 1 22rem; }
+.choice-title { display: block; font-weight: 600; font-size: 1.05rem; }
+.choice-desc { display: block; color: var(--muted); font-size: 0.95rem; }
+.choice-go { font-weight: 600; color: var(--accent); }
+.badge {
+  margin-left: 0.35rem;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  vertical-align: middle;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 1rem;
+}
+.enrol { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start; }
+.enrol-key { flex: 1 1 16rem; }
+.enrol-key p { margin: 0 0 0.5rem; }
+.key-label { font-weight: 600; }
+input.code { width: 10rem; letter-spacing: 0.15em; }
+.buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 1rem; }
+.buttons button { margin: 0; }
 /* White in either scheme: a phone camera reads dark modules on light. */
-img.qr { display: block; width: 100%; max-width: 16rem; height: auto; background: #fff; padding: 0.5rem; border-radius: 0.35rem; }"##
+img.qr { display: block; width: 100%; max-width: 14rem; height: auto; background: #fff; padding: 0.5rem; border-radius: 0.35rem; }"##
 
 /-- A reply with an asset. -/
 def asset (body contentType : String) : Reply :=

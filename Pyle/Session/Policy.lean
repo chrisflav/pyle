@@ -5,6 +5,7 @@ import Pyle.WebAuthn.Registration
 import Pyle.Factor.Totp
 import Pyle.Factor.RecoveryCode
 import Pyle.Factor.Password
+import Pyle.Audit
 
 /-!
 # The assurance policy
@@ -49,7 +50,7 @@ that this gives exactly the level the factors reach, so the level recorded is
 the level justified.  The theorems at the end say what the policy rules out
 and what each level needs: one factor that is not phishing-resistant, or two
 of the same kind, or two users', is no authentication (`password_alone`,
-`key_alone`, `totp_alone`, `recovery_alone`, `ofFactors_*`); every
+`key_alone`, `totp_alone`, `recovery_alone`, `two_totp`, `ofFactors_*`); every
 authentication is phishing-resistant or has two kinds of factor (`strong`);
 `phr` needs WebAuthn with user verification (`level_phr`), and `phrh` the
 same from a device-bound credential (`level_phrh`).
@@ -66,7 +67,10 @@ proof-of-possession key whose storage is unknown; pyle always knows which of
 **One factor of each kind.**  An authentication uses each kind of factor at
 most once: two passwords, or the same security key twice, are one factor, and
 two WebAuthn assertions in one sign-in are not something any endpoint asks
-for.  This is what lets the level be read back from the `amr`.
+for.  Codes from two authenticator apps are two factors of one kind, so they
+are no authentication either (`two_totp`): an account's apps are copies of
+one kind of thing, often on the same phone.  This is what lets the level be
+read back from the `amr`.
 -/
 
 namespace Pyle
@@ -108,7 +112,7 @@ structure Factor where private mk ::
   `hwk`). -/
   backupEligible : Bool
   /-- The authenticator used, for the session list: `webauthn:<credential id
-  in base64url>`, `totp`, `recovery` or `password`. -/
+  in base64url>`, `totp:<app id>`, `recovery` or `password`. -/
   label : String
 
 /-- A WebAuthn assertion with user verification: phishing-resistant. -/
@@ -259,6 +263,12 @@ theorem ofFactors_same_kind {f g : Factor} (hk : f.kind = g.kind) :
   rw [dif_neg]
   rintro ⟨⟨-, hn⟩, -⟩
   simp [hk] at hn
+
+/-- **Codes from two authenticator apps are no authentication**: several
+apps are one kind of factor, so two codes do not make `mfa`. -/
+theorem two_totp {f g : Factor} (hf : f.kind = .totp) (hg : g.kind = .totp) :
+    Authentication.ofFactors [f, g] = none :=
+  ofFactors_same_kind (hf.trans hg.symm)
 
 /-- Factors of two different users are no authentication, whatever they
 are. -/
@@ -538,7 +548,7 @@ def checkAssertion (ctx : Ctx) (purpose : ChallengePurpose) (r : WebAuthn.Assert
 
 /-- Why a TOTP code was refused. -/
 inductive TotpRefusal where
-  /-- The user has no TOTP secret. -/
+  /-- The user has no authenticator app. -/
   | notEnrolled
   /-- TOTP is locked for this account until the given time (§7). -/
   | locked (lockedUntil : Nat)
@@ -550,21 +560,46 @@ inductive TotpRefusal where
 /-- A code as typed: spaces removed. -/
 def normaliseCode (code : String) : String := String.ofList (code.toList.filter (!·.isWhitespace))
 
-/-- Check a TOTP code for a user (§3).  Accepted only for a step later than
-the last accepted one, and recorded in the same conditional `UPDATE` that
-checks that; a wrong code counts towards the lock of §7, five failures
-locking TOTP for fifteen minutes. -/
-def checkTotp (ctx : Ctx) (user : UserId) (code : String) : IO (Except TotpRefusal Factor) := do
+/-- Check a TOTP code for a user (§3), against each of their authenticator
+apps (`Factor.Totp.verifyAny`).  The code counts for the first app it
+verifies for, and only for a step later than the last one that app accepted;
+that step is recorded for that app, in the same conditional `UPDATE` that
+checks it is still later and that the account is not locked.  The lock of §7
+is the account's: it is checked once before any app is tried, and a wrong
+code counts once towards it however many apps it was checked against, five
+failures locking TOTP for fifteen minutes.  The factor's label names the
+app, `totp:<id>`.
+
+An app whose secret does not open under the root key is left out of the
+check and audited (from `clientAddress`), so that one damaged row does not
+take TOTP away from the account's other apps.  An app still sealed with the
+associated data of before migration 6 is re-sealed for its row once a code
+from it is accepted. -/
+def checkTotp (ctx : Ctx) (user : UserId) (code : String) (clientAddress : String := "") :
+    IO (Except TotpRefusal Factor) := do
   let now ← ctx.clock
-  let some rec ← ctx.store.findTotp user | return .error .notEnrolled
-  if now < rec.lockedUntil then return .error (.locked rec.lockedUntil)
-  let secret ← IO.ofExcept (SignIn.Secrets.openTotp ctx.rootKey user rec.sealedSecret
-    |>.mapError fun _ => "the stored TOTP secret does not open under the root key")
-  let code := normaliseCode code
-  match Factor.Totp.verify secret now code rec.lastStep with
-  | some step =>
-    if ← ctx.store.acceptTotpStep user step now then
-      return .ok ⟨user, .totp, false, false, "totp"⟩
+  let apps ← ctx.store.listTotpApps user
+  if apps.isEmpty then return .error .notEnrolled
+  let lock ← ctx.store.totpLock user
+  if now < lock.lockedUntil then return .error (.locked lock.lockedUntil)
+  let mut opened := []
+  for app in apps do
+    match SignIn.Secrets.openTotpApp ctx.rootKey user app.id app.sealedSecret app.legacyAd with
+    | .ok secret => opened := opened ++ [(app.id, secret, app.lastStep)]
+    | .error _ =>
+      discard <| Audit.append ctx.store now
+        { event := .totpSecretUnreadable, outcome := .failure,
+          userName := (← ctx.store.findUser user).map (·.name), factor := some s!"totp:{app.id}",
+          clientAddress, detail := "the app's secret does not open under the root key" }
+  match Factor.Totp.verifyAny opened now (normaliseCode code) with
+  | some (app, step) =>
+    if ← ctx.store.acceptTotpStep user app step now then
+      if let some a := apps.find? (·.id == app) then
+        if a.legacyAd then
+          if let some (_, secret, _) := opened.find? (·.1 == app) then
+            discard <| ctx.store.resealTotpApp user app
+              (← SignIn.Secrets.sealTotpApp ctx.rootKey user app secret)
+      return .ok ⟨user, .totp, false, false, s!"totp:{app}"⟩
     return .error (.wrong (← ctx.store.recordTotpFailure user now))
   | none => return .error (.wrong (← ctx.store.recordTotpFailure user now))
 
@@ -681,15 +716,12 @@ def satisfies (s : Session) (now : Nat) (maxAge : Option Nat) (want : Acr) : Boo
 /-! ## What an account could reach -/
 
 /-- The kinds of factor an account has registered (DESIGN §1): its
-credentials, whether they verify the user and are device-bound, a TOTP
-secret, a password where passwords are allowed, and unspent recovery codes. -/
-def capabilities (ctx : Ctx) (user : UserId) : IO Acr.Capabilities := do
-  let creds ← ctx.store.listCredentials user
-  let password := ctx.config.allowPasswords && (← ctx.store.findPassword user).isSome
-  return { verifyingDeviceBound := creds.any fun c => c.userVerified && !c.backupEligible,
-           verifying := creds.any (·.userVerified), webauthn := !creds.isEmpty,
-           totp := (← ctx.store.findTotp user).isSome, password,
-           recovery := (← ctx.store.unspentRecoveryCodes user) > 0 }
+credentials, whether they verify the user and are device-bound, any
+authenticator app, a password where passwords are allowed, and unspent
+recovery codes, as the store reads them (`Store.capabilitiesIn`) — the same
+function a removal checks what it leaves with. -/
+def capabilities (ctx : Ctx) (user : UserId) : IO Acr.Capabilities :=
+  ctx.store.capabilities user ctx.config.allowPasswords
 
 /-- The strongest level an account could sign in at, if any
 (`Acr.Capabilities.level`): what services receive as `pyle_account_acr`. -/

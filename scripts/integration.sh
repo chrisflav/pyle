@@ -157,8 +157,9 @@ fi
 echo
 echo "== afterwards"
 USERS="$("$PYLE" user list 2>&1)"
-grep -q "^alice	groups: admin	authenticators: 1" <<< "$USERS"
-check $? "pyle user list shows alice and her passkey" "$USERS"
+# Her passkey, and the one of her two authenticator apps the run left.
+grep -q "^alice	groups: admin	authenticators: 2" <<< "$USERS"
+check $? "pyle user list shows alice, her passkey and her authenticator app" "$USERS"
 kill -0 "$PYLE_PID" 2>/dev/null
 check $? "the server is still running"
 # Only the oversized body above may have failed a connection.

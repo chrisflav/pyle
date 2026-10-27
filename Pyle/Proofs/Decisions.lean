@@ -6,7 +6,9 @@ import Pyle.Oidc.Token
 The token endpoint, the device grant and the WebAuthn ceremonies each hand
 the row the store deleted or read to a pure function that decides what
 happens: `Oidc.codeDecision`, `Store.refreshDecision`, `Store.deviceDecision`
-and `Store.challengeDecision`, together with `Store.Challenge.admits`.  These
+and `Store.challengeDecision`, together with `Store.Challenge.admits`; and
+`Policy.checkTotp` hands an account's authenticator apps to
+`Factor.Totp.verifyAny`.  These
 functions are the code path — the store and the handlers do nothing but read
 the row, call them, and carry out what they return — so what is proved here
 of them is what the server does with a row (DESIGN.md §9.2, §9.4).
@@ -214,6 +216,82 @@ theorem challengeDecision_none (value : ByteArray) (purpose : ChallengePurpose) 
 theorem Challenge.admits_user {ch : Challenge} {u v : UserId} (hu : ch.user = some u)
     (h : ch.admits v = true) : u = v := by
   simpa [Challenge.admits, hu] using h
+
+/-! ## TOTP codes across several apps (§9 property 5)
+
+`Policy.checkTotp` hands the account's apps — id, opened secret and last
+accepted step — to `Factor.Totp.verifyAny`, and stores only what it returns:
+the step, for that app, by `Store.acceptTotpStep`, which applies only if the
+step is later than the one the app has stored.  The account's lock is checked
+first and a failure counts once, whatever the number of apps. -/
+
+/-- A code is accepted only for one of the apps it was checked against, for a
+step that code verifies for with that app's secret and last step. -/
+theorem verifyAny_mem {α : Type} {apps : List (α × ByteArray × Option Nat)} {t : Nat}
+    {c : String} {a : α} {n : Nat} (h : Factor.Totp.verifyAny apps t c = some (a, n)) :
+    ∃ secret lastStep, (a, secret, lastStep) ∈ apps ∧
+      Factor.Totp.verify secret t c lastStep = some n := by
+  unfold Factor.Totp.verifyAny at h
+  obtain ⟨⟨id, secret, lastStep⟩, hm, hv⟩ := List.exists_of_findSome?_eq_some h
+  simp only [Option.map_eq_some_iff, Prod.mk.injEq] at hv
+  obtain ⟨m, hm', rfl, rfl⟩ := hv
+  exact ⟨secret, lastStep, hm, hm'⟩
+
+/-- **Replay, per app**: a code accepted for an app is for a step later than
+the last one that app accepted.  Once the store records that step, the same
+code — or any code for that step or an earlier one — is never accepted for
+that app again. -/
+theorem verifyAny_increasing {α : Type} {apps : List (α × ByteArray × Option Nat)} {t : Nat}
+    {c : String} {a : α} {n : Nat} (h : Factor.Totp.verifyAny apps t c = some (a, n)) :
+    ∃ secret lastStep, (a, secret, lastStep) ∈ apps ∧ ∀ l, lastStep = some l → l < n := by
+  obtain ⟨secret, lastStep, hm, hv⟩ := verifyAny_mem h
+  refine ⟨secret, lastStep, hm, fun l hl => ?_⟩
+  subst hl
+  exact Factor.Totp.verify_increasing hv
+
+/-- The apps after the store recorded step `n` for app `a`, as
+`Store.acceptTotpStep` does: that app's last step becomes `n`, and no other
+app changes. -/
+def acceptStep {α : Type} [DecidableEq α] (apps : List (α × ByteArray × Option Nat)) (a : α)
+    (n : Nat) : List (α × ByteArray × Option Nat) :=
+  apps.map fun (id, secret, lastStep) =>
+    if id = a then (id, secret, some n) else (id, secret, lastStep)
+
+/-- **A code is good once per app**: once step `n` is recorded for app `a`,
+every code later accepted for `a` is for a step after `n` — the code that was
+just accepted, sent again, is not, whatever the other apps hold. -/
+theorem verifyAny_acceptStep {α : Type} [DecidableEq α] {apps : List (α × ByteArray × Option Nat)}
+    {a : α} {n t : Nat} {c : String} {m : Nat}
+    (h : Factor.Totp.verifyAny (acceptStep apps a n) t c = some (a, m)) : n < m := by
+  obtain ⟨secret, lastStep, hm, hv⟩ := verifyAny_mem h
+  unfold acceptStep at hm
+  obtain ⟨⟨id, s, l⟩, -, he⟩ := List.mem_map.mp hm
+  by_cases hid : id = a
+  · simp only [hid, if_true, Prod.mk.injEq] at he
+    obtain ⟨-, -, rfl⟩ := he
+    exact Factor.Totp.verify_increasing hv
+  · simp only [hid, if_false, Prod.mk.injEq] at he
+    exact he.1.elim
+
+/-- Recording a step for one app leaves what every other app accepts as it
+was. -/
+theorem acceptStep_other {α : Type} [DecidableEq α] {apps : List (α × ByteArray × Option Nat)}
+    {a b : α} {n : Nat} {secret : ByteArray} {lastStep : Option Nat} (hb : b ≠ a)
+    (h : (b, secret, lastStep) ∈ apps) : (b, secret, lastStep) ∈ acceptStep apps a n := by
+  unfold acceptStep
+  exact List.mem_map.mpr ⟨(b, secret, lastStep), h, by simp [hb]⟩
+
+/-- The step a code is accepted for is within one step of the current time,
+whichever app accepted it. -/
+theorem verifyAny_near {α : Type} {apps : List (α × ByteArray × Option Nat)} {t : Nat}
+    {c : String} {a : α} {n : Nat} (h : Factor.Totp.verifyAny apps t c = some (a, n)) :
+    n = Factor.Totp.stepOf t - 1 ∨ n = Factor.Totp.stepOf t ∨ n = Factor.Totp.stepOf t + 1 := by
+  obtain ⟨_, _, _, hv⟩ := verifyAny_mem h
+  exact Factor.Totp.verify_near hv
+
+/-- No apps, no code accepted. -/
+theorem verifyAny_nil {α : Type} (t : Nat) (c : String) :
+    Factor.Totp.verifyAny ([] : List (α × ByteArray × Option Nat)) t c = none := rfl
 
 end Proofs
 end Pyle

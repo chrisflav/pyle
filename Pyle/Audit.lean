@@ -59,6 +59,9 @@ inductive Event where
   | recoveryCode
   /-- TOTP locked after repeated failures. -/
   | totpLocked
+  /-- An authenticator app's stored secret did not open under the root key,
+  and the app was left out of a code check. -/
+  | totpSecretUnreadable
   /-- An account created. -/
   | userAdded
   /-- An account disabled or re-enabled. -/
@@ -82,6 +85,7 @@ def Event.toString : Event → String
   | .removeAuthenticator => "remove-authenticator"
   | .recoveryCode => "recovery-code"
   | .totpLocked => "totp-locked"
+  | .totpSecretUnreadable => "totp-secret-unreadable"
   | .userAdded => "user-added"
   | .userChanged => "user-changed"
   | .tokenIssued => "token-issued"

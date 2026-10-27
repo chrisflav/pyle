@@ -97,7 +97,7 @@ def checkExtras (ctx : Ctx) (r : Req) (user : User) (e : Extras) :
     unless ← recoveryCodeValid ctx user.id code do
       return .error ("recovery", "wrong or spent recovery code")
   if let some code := e.totp then
-    match ← checkTotp ctx user.id code with
+    match ← checkTotp ctx user.id code r.clientAddress with
     | .ok f => factors := factors ++ [f]
     | .error .notEnrolled => return .error ("totp", "no TOTP secret")
     | .error (.locked _) => return .error ("totp", "TOTP is locked")

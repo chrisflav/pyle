@@ -140,14 +140,16 @@ def maxPendingChallenges : Nat := 10000
 
 /-- Issue a challenge for a ceremony asked for by the request `r`, or the
 reply refusing it: `429` when the client has `maxPendingPerClient` pending,
-`503` when the table is at `maxPendingChallenges`.  A challenge that is
+`503` when the table is at `maxPendingChallenges`.  `kind` is recorded with
+it, for a registration (`Challenge.kind`).  A challenge that is
 finished is deleted, so only begins without finishes count. -/
 def newChallenge (ctx : Ctx) (r : Req) (purpose : ChallengePurpose) (user : Option UserId)
-    (perClient : Nat := maxPendingPerClient) (total : Nat := maxPendingChallenges) :
-    IO (Except Reply ByteArray) := do
+    (perClient : Nat := maxPendingPerClient) (total : Nat := maxPendingChallenges)
+    (kind : String := "") : IO (Except Reply ByteArray) := do
   let value ← Crypto.randomBytes 32
   let now ← ctx.clock
-  match ← ctx.store.addChallengeCapped { value, purpose, user, expires := now + challengeSeconds }
+  match ← ctx.store.addChallengeCapped
+      { value, purpose, user, expires := now + challengeSeconds, kind }
       (addressPrefix r.clientAddress) perClient total now with
   | .added => return .ok value
   | .clientFull => return .error (rateLimited challengeSeconds)

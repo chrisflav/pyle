@@ -37,16 +37,23 @@ def htmlReply (body : String) (status : Std.Http.Status := .ok) : Reply :=
 
 /-- A complete page: `page` names it for the script, `attrs` are further
 `data-` attributes (without the prefix), and `content` is the inside of
-`main`, already HTML. -/
-def page (pageName title : String) (attrs : List (String × String)) (content : String) :
-    String :=
+`main`, already HTML.  `back`, if given, is a link above the heading: its
+address and its text.  `aside`, if not empty, is HTML set beside the heading,
+on the right. -/
+def page (pageName title : String) (attrs : List (String × String)) (content : String)
+    (back : Option (String × String) := none) (aside : String := "") : String :=
+  let heading := if aside.isEmpty then s!"<h1>{escape title}</h1>\n" else
+    s!"<div class=\"page-head\">\n<h1>{escape title}</h1>\n{aside}\n</div>\n"
   let data := attrs.foldl (init := "") fun acc (k, v) => acc ++ s!" data-{k}=\"{escape v}\""
+  let backLink := match back with
+    | some (href, text) => s!"<a class=\"back\" href=\"{escape href}\">← {escape text}</a>\n"
+    | none => ""
   "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n" ++
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" ++
   s!"<title>{escape title} · pyle</title>\n" ++
   "<link rel=\"stylesheet\" href=\"/assets/pyle.css\">\n" ++
   "<script src=\"/assets/pyle.js\" defer></script>\n</head>\n" ++
-  s!"<body data-page=\"{escape pageName}\"{data}>\n<main>\n<h1>{escape title}</h1>\n" ++
+  s!"<body data-page=\"{escape pageName}\"{data}>\n<main>\n{backLink}{heading}" ++
   content ++
   "\n<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n</main>\n</body>\n</html>"
 
@@ -71,11 +78,20 @@ def civilFromDays (days : Nat) : Nat × Nat × Nat :=
 /-- Two digits. -/
 def pad2 (n : Nat) : String := if n < 10 then s!"0{n}" else toString n
 
-/-- A Unix time as `YYYY-MM-DD HH:MM UTC`. -/
-def formatTime (t : Nat) : String :=
+/-- The English abbreviation of a month, 1 to 12. -/
+def monthName (m : Nat) : String :=
+  ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].getD
+    (m - 1) "?"
+
+/-- The day of a Unix time, as `26 Oct 2026`. -/
+def formatDate (t : Nat) : String :=
   let (y, m, d) := civilFromDays (t / 86400)
+  s!"{d} {monthName m} {y}"
+
+/-- A Unix time, as `26 Oct 2026, 20:41 UTC`. -/
+def formatTime (t : Nat) : String :=
   let s := t % 86400
-  s!"{y}-{pad2 m}-{pad2 d} {pad2 (s / 3600)}:{pad2 (s % 3600 / 60)} UTC"
+  s!"{formatDate t}, {pad2 (s / 3600)}:{pad2 (s % 3600 / 60)} UTC"
 
 end Web
 end Pyle

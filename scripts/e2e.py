@@ -16,9 +16,11 @@ tally is written to the file named by `--counts` for the script to add up.
 import argparse
 import base64
 import hashlib
+import hmac
 import http.client
 import json
 import os
+import struct
 import sys
 import time
 import urllib.parse
@@ -377,6 +379,21 @@ def jwt_parts(token):
     return json.loads(unb64u(h)), json.loads(unb64u(p)), (h + "." + p).encode(), unb64u(s)
 
 
+# ---------------------------------------------------------------- TOTP
+
+def totp(secret, t):
+    """The six-digit RFC 6238 code of a secret at Unix time `t`."""
+    mac = hmac.new(secret, struct.pack(">Q", int(t) // 30), hashlib.sha1).digest()
+    off = mac[19] & 15
+    n = struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF
+    return f"{n % 1000000:06d}"
+
+
+def base32_secret(text):
+    text = text.replace(" ", "")
+    return base64.b32decode(text + "=" * (-len(text) % 8))
+
+
 # ---------------------------------------------------------------- the run
 
 def run(a):
@@ -452,6 +469,59 @@ def run(a):
     check(r.status == 200 and a.user in r.text, "the account page answers with the session",
           repr(r))
     check("e2e passkey" in r.text, "and lists the passkey by its name")
+
+    # ------------------------------------------------------------ apps
+    section("the account: several authenticator apps")
+    for path in ("/account/add", "/account/add/app", "/account/add/recovery-codes"):
+        r = browser.get(path)
+        check(r.status == 200, f"{path} answers with the session", repr(r))
+        r = mallory.get(path)
+        check(r.status in (302, 303) and r.location.startswith("/signin?return="),
+              f"and {path} sends a stranger to sign in", repr(r))
+    apps = {}
+    for name in ("phone", "tablet"):
+        r = browser.post_json("/account/totp/begin", {"name": name})
+        begun = r.json()
+        check(r.status == 200 and begun.get("name") == name and
+              begun.get("uri", "").startswith("otpauth://totp/"),
+              f"setting up '{name}' begins", repr(r))
+        secret = base32_secret(begun.get("secret", ""))
+        r = browser.post_json("/account/totp/confirm",
+                              {"pending": begun.get("pending"), "code": totp(secret, time.time())})
+        check(r.status == 201 and r.json().get("name") == name,
+              "and its first code adds it", repr(r))
+        apps[name] = (r.json().get("id"), secret)
+    r = browser.get("/account")
+    check("<strong>phone</strong>" in r.text and "<strong>tablet</strong>" in r.text,
+          "both apps are listed on the account page")
+    r = browser.post_json("/account/recovery-codes", {})
+    codes = r.json().get("codes", [])
+    check(r.status == 200 and len(codes) == 10, "recovery codes are made", repr(r))
+    # The codes that confirmed the apps used up the current step; the next
+    # one, which pyle accepts too, signs in.
+    phone = Client("127.0.0.1", a.port, origin, "198.51.100.3")
+    tablet_code = totp(apps["tablet"][1], time.time() + 30)
+    r = phone.post_json("/signin/codes", {"name": a.user, "totp": tablet_code,
+                                          "recovery": codes[0], "return": "/account"})
+    check(r.status == 200 and r.json().get("amr") == ["otp", "rec", "mfa"],
+          "a code from the second app and a recovery code sign in", repr(r))
+    replay = Client("127.0.0.1", a.port, origin, "192.0.2.14")
+    r = replay.post_json("/signin/codes", {"name": a.user, "totp": tablet_code,
+                                           "recovery": codes[1]})
+    check(r.status == 401, "the same code is good once for that app", repr(r))
+    r = phone.post_json("/signin/codes",
+                        {"name": a.user, "totp": totp(apps["phone"][1], time.time() + 30),
+                         "recovery": codes[2]})
+    check(r.status == 200, "while the first app's code for that step still signs in", repr(r))
+    r = browser.post_json("/account/totp/rename", {"id": apps["tablet"][0], "name": "work tablet"})
+    check(r.status == 204, "an app is renamed by id", repr(r))
+    r = browser.post_json("/account/totp/remove", {"id": apps["phone"][0]})
+    check(r.status == 204, "an app is removed by id", repr(r))
+    r = browser.post_json("/account/totp/remove", {"id": apps["tablet"][0]})
+    check(r.status == 409, "but not the last of two authenticators", repr(r))
+    r = browser.get("/account")
+    check("work tablet" in r.text and "<strong>phone</strong>" not in r.text,
+          "and the account page shows what is left")
 
     # ------------------------------------------------------------ OIDC
     section("OpenID Connect: authorization code with PKCE")

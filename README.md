@@ -80,12 +80,29 @@ Accounts are created by invitation: `pyle invite <name>` prints
 `<issuer>/invite/<token>` (valid for seven days unless `--ttl` says otherwise;
 only the token's hash is stored).  Whoever opens it creates the account's
 first passkey, is told the account is ready, and signs in with it from there.
-From `/account` they can then add more passkeys and security keys, an
-authenticator app (TOTP), recovery codes, and — if `allowPasswords` is set — a
-password, and see and end their sessions.  The account page says in plain
-words how well the account is protected and asks for a passkey until it has
-one; it nags until two authenticators are registered, and the last two cannot
-be removed.
+
+`/account` sums up in plain words how well the account is protected, and asks
+for a passkey until it has one, for a second authenticator until it has two,
+and for recovery codes when none are left.  Below that, one table lists every
+way the account signs in, grouped by kind — passkeys and security keys (synced,
+or kept on the key), authenticator apps, the password where `allowPasswords`
+is set, and how many recovery codes are left — each with its rename and
+remove buttons, and then the sessions, each of which can be ended.  "Add a
+sign-in method" leads to `/account/add`, which offers a passkey (recommended),
+a security key, an authenticator app, a password and new recovery codes; a
+passkey or a security key is registered right there, the others have a page
+each.  A removal that would leave the account unable to sign in is refused:
+what is left must still reach a level, and must be two authenticators, the
+apps counting once — so neither the passkey beside two apps nor the one key
+that verifies beside touch-only keys can go, and the password cannot go when
+it is what makes the sign-in two factors.
+
+An account can have several authenticator apps (TOTP), each with its own
+secret and name, added, renamed and removed one by one, up to five.  All of
+them together are one authenticator towards the two an account keeps, and one
+kind of factor: two codes from two apps do not sign anyone in.  A code
+counts for the app it came from, and is good once for that app; the lock after
+five wrong codes is the account's, so more apps do not mean more guesses.
 
 A session needs a passkey (WebAuthn with user verification) or two distinct
 factors: a security key without user verification, a TOTP code, a recovery
@@ -125,7 +142,11 @@ Pages, served with no third-party code under a strict CSP:
 | | |
 | --- | --- |
 | `GET /signin?return=<path>[&max_age=<s>][&acr=<level>]` | sign in, or step up the current session, at `level` (`mfa`, `phr`, `phrh`, or an identifier) or better; then `303` to `return`, which must be a path on this origin |
-| `GET /account` | the account |
+| `GET /account` | the account: its protection, how it signs in, its sessions |
+| `GET /account/add` | choose a way to sign in to add; registers a passkey or a security key |
+| `GET /account/add/app` | add an authenticator app: name it, scan the QR code or type the key, confirm with a code |
+| `GET /account/add/password` | set or change the password, if `allowPasswords` is set |
+| `GET /account/add/recovery-codes` | make new recovery codes and show them once |
 | `GET /invite/<token>` | register an invited account's first passkey |
 | `GET /assets/pyle.js`, `GET /assets/pyle.css` | the pages' script and stylesheet |
 
@@ -139,11 +160,12 @@ base64url):
 | `/signin/stepup/begin`, `/signin/stepup/finish` | as above, for the current session | as above |
 | `/signin/codes` | `{"name"}` and two of `"password"`, `"totp"`, `"recovery"`; `"return"`?, `"acr"`? | as above |
 | `/invite/<token>/begin`, `/invite/<token>/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"name"}` |
-| `/account/authenticators/register/begin`, `…/finish` | `{}`; `{"credential", "name"?}` | creation options; `201 {"id"}` |
-| `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` for the last two) |
-| `/account/totp/begin`, `…/confirm`, `…/remove` | `{}`; `{"pending", "code"}`; `{}` | `{"secret", "uri", "qr", "pending"}`; `204`; `204` |
+| `/account/authenticators/register/begin`, `…/finish` | `{"kind"?}` (`passkey`: discoverable, user verification required; or `security-key`: neither required), which `finish` is held to; `{"credential", "name"?}` | creation options; `201 {"id"}` |
+| `/account/authenticators/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` when it would leave no way in) |
+| `/account/totp/begin`, `…/confirm` | `{"name"?}`; `{"pending", "code", "name"?}` | `{"secret", "uri", "qr", "pending", "name"}`; `201 {"id", "name"}`, a new app beside any others (`409` past five) |
+| `/account/totp/rename`, `…/remove` | `{"id", "name"}`; `{"id"}` | `204` (`409` when it would leave no way in) |
 | `/account/recovery-codes` | `{}` | `{"codes"}`, shown once |
-| `/account/password`, `/account/password/remove` | `{"password"}`; `{}` | `204` |
+| `/account/password`, `/account/password/remove` | `{"password"}`; `{}` | `204` (`409` when the account could not sign in without it) |
 | `/account/sessions/end` | `{"handle"}` | `204` |
 | `/logout` | | `204` |
 
@@ -511,6 +533,17 @@ The keys are made on first use if this is skipped; rotating twice up front
 only means the first clients find a `next` key in `/jwks` already.  `client
 add` prints the secret once.  Then have alice add a second passkey or a
 security key from `/account`, so that losing a phone does not lock her out.
+
+### Upgrading
+
+pyle migrates its database when it opens it, and refuses one written by a
+newer pyle.  Migration 6 makes room for several authenticator apps per
+account: an account's one TOTP secret becomes its app named "Authenticator
+app", which goes on working with the same codes, and its failed-code count
+and lock carry over to the account.  The first code it accepts re-seals its
+secret for its row.  Its last use is shown when the step it
+last accepted came more than a minute after it was set up, and as not used
+otherwise.  There is no way back to an older pyle after it, short of a backup.
 
 ### Docker
 

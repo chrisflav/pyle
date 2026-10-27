@@ -235,11 +235,24 @@ def authFor (ctx : Ctx) (k : SoftKey) : IO Policy.Authentication := do
     | some sa => return sa
     | none => throw (.userError "authFor: no authentication")
 
-/-- Give a user a TOTP secret straight in the store; the secret. -/
-def giveTotp (ctx : Ctx) (u : Store.User) : IO ByteArray := do
+/-- Give a user an authenticator app straight in the store; the app and its
+secret. -/
+def giveTotpApp (ctx : Ctx) (u : Store.User) (name : String := "Authenticator app") :
+    IO (Store.TotpApp × ByteArray) := do
   let secret ← Factor.Totp.generateSecret
-  ctx.store.setTotp u.id (← SignIn.Secrets.sealTotp ctx.rootKey u.id secret) (← ctx.clock)
-  return secret
+  let some app ← ctx.store.addTotpApp u.id name none (← ctx.clock)
+      (SignIn.Secrets.sealTotpApp ctx.rootKey u.id · secret)
+    | throw (.userError "giveTotpApp: the app was refused")
+  return (app, secret)
+
+/-- Give a user an authenticator app straight in the store; its secret. -/
+def giveTotp (ctx : Ctx) (u : Store.User) (name : String := "Authenticator app") :
+    IO ByteArray :=
+  return (← giveTotpApp ctx u name).2
+
+/-- The last accepted step of each of a user's apps. -/
+def lastSteps (ctx : Ctx) (u : Store.UserId) : IO (List (Option Nat)) :=
+  return (← ctx.store.listTotpApps u).toList.map (·.lastStep)
 
 /-- The TOTP code for a secret at a time. -/
 def totpAt (secret : ByteArray) (t : Nat) : String :=
@@ -472,11 +485,11 @@ def codeTests : IO Unit :=
   checkEq "a recovery code alone gets no session" recAlone.status.toCode 400
   check "nothing was used up by those"
     ((← ctx.store.unspentRecoveryCodes dave.id) == 10 &&
-      ((← ctx.store.findTotp dave.id).bind (·.lastStep)).isNone)
+      (← lastSteps ctx dave.id) == [none])
   check "and no session exists" ((← ctx.store.listSessions dave.id).isEmpty)
   let wrongPw ← signIn [("password", "incorrect horse"), ("totp", totpAt secret now)]
   checkEq "a wrong password with a right code is refused" wrongPw.status.toCode 401
-  check "without using up the code" ((← ctx.store.findTotp dave.id).bind (·.lastStep)).isNone
+  check "without using up the code" ((← lastSteps ctx dave.id) == [none])
   let ok ← signIn [("password", pw), ("totp", totpAt secret now)]
   checkEq "a password and a TOTP code sign in" ok.status.toCode 200
   checkEq "amr: pwd, otp, mfa" ((replyJson ok).getObjValAs? (List String) "amr").toOption
@@ -511,7 +524,7 @@ def codeTests : IO Unit :=
       (Json.mkObj [("name", "dave"), ("password", pw), ("totp", wrong)])
       (client := s!"203.0.113.{i}")
   check "five wrong codes lock TOTP"
-    (((← ctx.store.findTotp dave.id).map (·.lockedUntil)).getD 0 > (← clock.get))
+    ((← ctx.store.totpLock dave.id).lockedUntil > (← clock.get))
   check "audited" ((← auditSummary ctx).contains ("totp-locked", "refused"))
   clock.modify (· + 30)
   let locked ← postJson ctx "/signin/codes"
@@ -702,9 +715,8 @@ def totpLockTests : IO Unit := withCtx fun ctx clock => do
   for i in [0:8] do
     discard <| postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
       ("recovery", "AAAAA-AAAAA"), ("totp", wrong)]) (client := s!"198.18.0.{i}")
-  let rec_ ← ctx.store.findTotp nia.id
-  checkEq "wrong recovery codes do not count as TOTP failures"
-    (rec_.map fun t => (t.failures, t.lockedUntil)) (some (0, 0))
+  check "wrong recovery codes do not count as TOTP failures"
+    ((← ctx.store.totpLock nia.id) == {})
   let codes ← Factor.RecoveryCode.generate
   ctx.store.setRecoveryCodes nia.id
     (codes.map (Factor.RecoveryCode.digest (SignIn.Secrets.recoveryKey ctx.rootKey)))
@@ -712,7 +724,7 @@ def totpLockTests : IO Unit := withCtx fun ctx clock => do
     ("recovery", codes.headD ""), ("totp", wrong)])
   checkEq "a right recovery code with a wrong TOTP code is refused" bad.status.toCode 401
   checkEq "without spending the recovery code" (← ctx.store.unspentRecoveryCodes nia.id) 10
-  checkEq "and that TOTP failure counts" ((← ctx.store.findTotp nia.id).map (·.failures)) (some 1)
+  checkEq "and that TOTP failure counts" (← ctx.store.totpLock nia.id).failures 1
   let ok ← postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
     ("recovery", codes.headD ""), ("totp", totpAt secret (← clock.get))])
   checkEq "both right sign in" ok.status.toCode 200

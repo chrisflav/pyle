@@ -83,7 +83,7 @@ comes from an agent acting for Christian, on this one pull request".
 | --- | --- | --- |
 | Passkey (discoverable WebAuthn credential, user verification) | primary, alone `phr` | Phishing-resistant: bound to the origin by the browser. |
 | Security key (WebAuthn, possibly non-discoverable) | primary with UV (`phr`), or second factor | Same ceremony, different flags. |
-| TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports. |
+| TOTP (RFC 6238) | second factor only | SHA-1, 30 s, 6 digits by default: what every authenticator app supports.  Up to five apps per account, together one authenticator and one kind of factor. |
 | Recovery codes | last resort, second factor only | Ten single-use codes, stored hashed, shown once. |
 | Password | optional first factor, never alone | Off by default.  Argon2id.  Exists for devices with no platform authenticator. |
 
@@ -141,8 +141,22 @@ fewer.  pyle states it to services as `pyle_account_acr` and `account_acr`
 (§5), shows it on the account page in plain words, and asks for a passkey
 until there is one.
 
+**The account page.**  `/account` leads with that summary, then lists every
+way in as one table grouped by kind — passkeys and security keys, whether
+synced or kept on the key; authenticator apps; the password; how many
+recovery codes are left — and then the sessions.  Adding happens on
+`/account/add`, which registers a passkey (`residentKey` and user
+verification required) or a security key (`residentKey` discouraged, user
+verification preferred) itself, and sends an authenticator app, a password
+and new recovery codes to a page each.
+
 **At least two.**  A user cannot remove their second-to-last authenticator, and
-is nagged until they have registered two.  Losing a single key should never be
+is nagged until they have registered two.  Each WebAuthn credential counts
+as one, and an account's authenticator apps count as one together.  A
+removal is checked against what it leaves, in the transaction that makes it,
+and rolled back if the factors left reach no level (two touch-only keys, say,
+or apps alone) or are fewer than two authenticators; removing the password,
+which is not counted, is checked only for the level.  Losing a single key should never be
 an administrator's problem.
 
 ## 2. WebAuthn ceremonies
@@ -207,6 +221,20 @@ is accepted for the current time step and one step either side.  The step of
 the last accepted code is stored, and a code for that step or an earlier one is
 refused: a code is good at most once, which RFC 6238 recommends and most
 implementations forget.
+
+An account may have several authenticator apps, each with its own name,
+secret and last accepted step.  A submitted code is checked against each, in
+one attempt, and counts for the first app it verifies for: it uses up that
+app's step and no other's, since a code from one app says nothing about
+another's secret.  The replay rule therefore holds per app — a code accepted
+for an app is never accepted for it again — which is what an observer of the
+code could exploit.  Failed codes and the lock of §7 are counted per account,
+once per attempt, so more apps do not mean more guesses.  Two codes from two
+apps are two factors of one kind and make no authentication: an account's
+apps are often on the same phone.  An account has at most five apps,
+which bounds the secrets one code is checked against; an app whose secret
+does not open under the root key is left out of the check and audited, so
+that one damaged row does not take TOTP away from the others.
 
 **Recovery codes.**  Ten codes of 10 base32 characters, stored as
 HMAC-SHA256 under a server key so a database leak is not a list of working
@@ -412,8 +440,14 @@ than a guarantee.
 
 A root key encrypts every secret column (TOTP secrets, signing keys) with
 ChaCha20-Poly1305, with the row id as associated data so a secret cannot be
-moved to another row.  Signing keys rotate: the JWKS publishes the current key
-and the previous one, and a biscuit root key rotation is announced to services
+moved to another row.  A TOTP secret's associated data names both the user
+and the app (`totp <user> <app>`), so it cannot be moved to another user or
+to another of the same user's apps.  The single secret an account had before
+migration 6 was sealed with the user id alone; that associated data is
+accepted only for a row flagged `legacy_ad`, which only the migration sets,
+and the first code such an app accepts re-seals it with the new associated
+data and clears the flag.  Signing keys rotate: the JWKS publishes the
+current key and the previous one, and a biscuit root key rotation is announced to services
 before it takes effect.
 
 ## 7. Abuse resistance
@@ -423,8 +457,8 @@ before it takes effect.
   whether it exists.
 - **Rate limits** per account and per client address, with exponential
   back-off, on every endpoint that checks a factor.  Five failed TOTP codes
-  lock TOTP for that account for fifteen minutes; WebAuthn is not locked,
-  since it cannot be guessed.
+  lock TOTP for that account for fifteen minutes, however many authenticator
+  apps it has; WebAuthn is not locked, since it cannot be guessed.
 - **CSRF.**  `SameSite=Lax`, plus an `Origin` check on every state-changing
   request; the WebAuthn challenge is itself a CSRF token for the ceremony.
 - **Clickjacking.**  `frame-ancestors 'none'`, and a strict CSP: the sign-in
@@ -443,10 +477,11 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 | --- | --- |
 | `users` | id, handle (random 32 bytes, the WebAuthn user handle), name, groups |
 | `webauthn_credentials` | credential id, user, COSE public key, sign count, flags (and whether it has verified the user), AAGUID, transports, name, created/last used |
-| `totp` | user, encrypted secret, last accepted step |
+| `totp_apps` | id (never reused), user, name, encrypted secret, last accepted step, created/last used, whether the secret still has the old associated data |
+| `totp_lock` | user, failed codes, locked until |
 | `recovery_codes` | user, HMAC, spent-at |
 | `sessions` | id hash, user, amr, auth_time, created, last seen, client hints |
-| `challenges` | challenge, purpose, user, expiry — deleted on first use |
+| `challenges` | challenge, purpose, user, expiry, for a registration the kind asked for — deleted on first use |
 | `clients` | OIDC clients: id, secret hash, redirect URIs, allowed scopes, minimum level |
 | `codes`, `refresh_tokens` | hashes only, with the binding fields of §5.1 |
 | `keys` | encrypted signing keys, state (next/current/previous) |
@@ -454,6 +489,14 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 
 Session ids, codes and refresh tokens are stored as SHA-256 hashes, so reading
 the database does not give anyone a session.
+
+The schema changes only by appended, numbered migrations (`Store/Schema`).
+Migration 6 replaced the one-per-user `totp` table with `totp_apps` and
+`totp_lock`: each account's secret became its first app, named
+"Authenticator app", flagged as sealed with the old associated data (§6.3),
+its last accepted step kept, and its failures and lock moved to the account.
+Migration 7 records with a registration challenge the kind of authenticator
+it was asked for.
 
 ## 9. Properties worth verifying
 
@@ -476,8 +519,8 @@ As in kleis, the point of Lean is that some of these become theorems.
 4. **Authorization codes.**  A token is issued for a code only if the code was
    issued to that client, for that redirect URI, with a challenge the verifier
    hashes to, and has not expired or been used.
-5. **TOTP replay.**  Two accepted TOTP codes for the same user have strictly
-   increasing time steps.
+5. **TOTP replay.**  Two accepted TOTP codes for the same authenticator app
+   have strictly increasing time steps.
 6. **Attenuation.**  Inherited from biscuit: a block appended by a service or
    an agent never widens what the token permits.
 7. **Parsers.**  CBOR, COSE and base64url are total, and encode-then-decode is
@@ -605,7 +648,15 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
    challenge is the code's, and it has not expired.  That it has not been
    used is part 2: `consumeCode` is a `take` on `codes`.
 5. **TOTP replay**: `Totp.verify_increasing` and `Totp.verify_near`, in
-   `Factor/Totp.lean`; the last accepted step is stored per user.
+   `Factor/Totp.lean`; the last accepted step is stored per authenticator
+   app.  Across an account's apps, `Policy.checkTotp` hands them to the pure
+   `Totp.verifyAny`, of which `Pyle.Proofs.Decisions` proves that a code is
+   accepted only for an app it verifies for, for a step after that app's
+   last (`verifyAny_mem`, `verifyAny_increasing`, `verifyAny_near`), and
+   that once the store records that step for the app no code at or before
+   it is accepted for the app again, while the other apps are untouched
+   (`verifyAny_acceptStep`, `acceptStep_other`).  Two codes from two apps
+   are no authentication (`Policy.two_totp`).
 6. **Attenuation**: inherited from `lean-biscuit`.
 7. **Parsers**: base64url (`Base64Url.decode_encode`,
    `Base64Url.encode_decode`) and CBOR (`Cbor.decode_encode`, for well-formed

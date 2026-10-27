@@ -3,7 +3,7 @@ import PyleTests.Account
 /-!
 # The pages
 
-The three pages, their assets and the invitation flow, through
+The pages, their assets and the invitation flow, through
 `Server.route`.  No browser runs here, so the script is checked against the
 server by reading it: every endpoint it posts to is a `POST` route, every page
 it navigates to is a `GET` route, every element id it looks up is on a page,
@@ -33,9 +33,11 @@ def routed (method : Std.Http.Method) (path : String) : Bool :=
 def escapeTests : IO Unit := do
   group "web: escaping and dates"
   checkEq "the five characters" (Web.escape "<a href=\"x\">&'") "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
-  checkEq "the epoch" (Web.formatTime 0) "1970-01-01 00:00 UTC"
-  checkEq "a leap day" (Web.formatTime 951782400) "2000-02-29 00:00 UTC"
-  checkEq "the test clock" (Web.formatTime 1700000000) "2023-11-14 22:13 UTC"
+  checkEq "the epoch" (Web.formatTime 0) "1 Jan 1970, 00:00 UTC"
+  checkEq "a leap day" (Web.formatTime 951782400) "29 Feb 2000, 00:00 UTC"
+  checkEq "the test clock" (Web.formatTime 1700000000) "14 Nov 2023, 22:13 UTC"
+  checkEq "a date, as the prototype writes it" (Web.formatDate 1793000000) "26 Oct 2026"
+  checkEq "December" (Web.formatDate 1703980800) "31 Dec 2023"
   for (s, n) in [("7d", some 604800), ("12h", some 43200), ("30m", some 1800), ("90s", some 90),
       ("d", none), ("7", none), ("0d", none), ("-1d", none), ("7w", none)] do
     checkEq s!"lifetime {s}" (SignIn.parseDuration s) n
@@ -91,7 +93,8 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
   checkEq "/ goes to the account" (root.status.toCode, root.header "Location")
     (303, some "/account")
   let u ← ctx.store.addUser "lee" [] 1
-  let (id, _) ← sessionFor ctx u
+  let (id, lk) ← sessionFor ctx u
+  discard <| signInVia ctx lk
   discard <| giveTotp ctx u
   ctx.store.setPassword u.id "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAA" 1
   let inviteUrl ← SignIn.createInvitation ctx.store ctx.config.issuer "newbie" [] 3600 1700000000
@@ -99,7 +102,11 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
   clock.modify (· + 1)
   let mut pages := []
   for (name, path, cookie) in [("sign-in", "/signin", none), ("step-up", "/signin?max_age=0", some id),
-      ("account", "/account", some id), ("invitation", invitePath, none),
+      ("account", "/account", some id), ("add", "/account/add", some id),
+      ("authenticator-app", "/account/add/app", some id),
+      ("password", "/account/add/password", some id),
+      ("recovery-codes", "/account/add/recovery-codes", some id),
+      ("invitation", invitePath, none),
       ("a missing invitation", "/invite/AAAA", none)] do
     let r ← getPage ctx path cookie
     check s!"the {name} page is HTML" (r.contentType == "text/html; charset=utf-8")
@@ -116,18 +123,13 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
         !containsStr html " onsubmit=" && !containsStr html " onload=" &&
         !containsStr html "javascript:")
     pages := html :: pages
-  -- The account page of a user without TOTP or a password has the set-up
-  -- elements; render that too.
-  let v ← ctx.store.addUser "vic" [] 1
-  let (vid, _) ← sessionFor ctx v
-  let setup := (← getPage ctx "/account" vid).bodyText
-  pages := setup :: pages
-  -- The TOTP set-up: the QR code, then the link with a label of its own, then
-  -- the key to type in.
+  -- The authenticator-app page: the QR code, then the link with a label of its
+  -- own, then the key to type in, all written by the server.
+  let setup := (← getPage ctx "/account/add/app" (some id)).bodyText
   let posOf (s : String) : Nat := ((setup.splitOn s).headD setup).length
-  check "the set-up has a hidden QR code with alternative text"
+  check "the app page has the QR code with alternative text"
     (containsStr setup "<img id=\"totp-qr\" class=\"qr\" \
-      alt=\"QR code for your authenticator app\" hidden>")
+      alt=\"QR code for your authenticator app\" src=\"data:image/svg+xml;base64,")
   check "and says it can be scanned or typed"
     (containsStr setup "Scan this with your authenticator app, or enter the key by hand")
   check "the link to the app is labelled in the page"
@@ -136,12 +138,20 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
     (posOf "id=\"totp-qr\"" < posOf "id=\"totp-uri\"" &&
       posOf "id=\"totp-uri\"" < posOf "id=\"totp-secret\"" &&
       posOf "id=\"totp-secret\"" < setup.length)
-  check "the script shows the QR code and sets the link's target, not its text"
-    (containsStr Web.script "qr.src = data.qr" && containsStr Web.script "qr.hidden = false" &&
-      containsStr Web.script "getElementById('totp-uri').setAttribute('href', data.uri)" &&
-      !containsStr Web.script "textContent = data.uri")
+  check "the script sends the sealed secret back with the code and the name"
+    (containsStr Web.script "pending: body.dataset.pending" &&
+      containsStr Web.script "name: value('app-name')")
   check "the stylesheet gives the QR code a white ground"
     (containsStr Web.stylesheet "img.qr {" && containsStr Web.stylesheet "background: #fff")
+  check "and lets the table scroll in its box"
+    (containsStr Web.stylesheet ".table-scroll { overflow-x: auto;")
+  -- With passwords off, the account page and the choices offer none.
+  let v ← ctx.store.addUser "vic" [] 1
+  let (vid, _) ← sessionFor ctx v
+  let off := { ctx with config := { ctx.config with allowPasswords := false } }
+  check "with passwords off, no password row or choice"
+    (!containsStr (← getPage off "/account" (some vid)).bodyText "/account/add/password" &&
+      !containsStr (← getPage off "/account/add" (some vid)).bodyText "/account/add/password")
   let all := String.join pages
   -- The script against the pages.
   let script := Web.script
@@ -155,7 +165,7 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
     check s!"element #{i} is on a page" (containsStr all s!"id=\"{i}\"")
   for a in (quotedAfter script "action === '").eraseDups do
     check s!"account action {a} is a button" (containsStr all s!"data-action=\"{a}\"")
-  for d in ["mode", "return", "token", "id", "handle", "current"] do
+  for d in ["mode", "return", "token", "id", "handle", "current", "pending", "kind", "replace"] do
     check s!"data-{d} is written by a page" (containsStr all s!"data-{d}=\"")
   let posts := (quotedAfter script "post('" ++ quotedAfter script "act('" ++
     quotedAfter script "getAssertion('").eraseDups
@@ -175,9 +185,13 @@ def assetTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords := t
     check s!"GET {p} is a route" (routed .get p)
   for k in ["challenge", "rpId", "timeout", "userVerification", "allowCredentials", "rp",
       "user", "pubKeyCredParams", "attestation", "authenticatorSelection",
-      "excludeCredentials", "redirect", "pending", "secret", "uri", "qr", "codes"] do
+      "excludeCredentials", "redirect", "codes"] do
     check s!"the script reads {k}" (containsStr script s!"o.{k}" ||
       containsStr script s!"data.{k}")
+  for (p, d) in [("add", "kind"), ("add-app", "pending"), ("add-recovery", "replace")] do
+    check s!"the script handles the {p} page and reads its data-{d}"
+      (containsStr script s!"body.dataset.page === '{p}'" &&
+        containsStr script s!"dataset.{d}")
 
 /-- A `return` with HTML in it is escaped into the page. -/
 def pageEscapeTests : IO Unit := withCtx fun ctx _ => do

@@ -15,7 +15,8 @@ must be good at most once.  The caller stores the step of the last accepted
 code, and `verify` only ever accepts a strictly later step; that is the theorem
 `verify_increasing`, DESIGN.md §9 property 5 for a single user.  An attacker
 who watches a code being typed therefore cannot replay it, not even within the
-same 30 seconds.
+same 30 seconds.  With several apps the rule holds for each app on its own
+(`verifyAny`).
 
 The comparison of the submitted code with each expected one goes through the
 constant-time primitive, since the expected code is derived from the secret
@@ -96,6 +97,24 @@ theorem verify_near {s : ByteArray} {t : Nat} {c : String} {last : Option Nat} {
   unfold verify at h
   have hm := List.mem_of_find?_eq_some h
   simpa using hm
+
+/-! ## Several apps
+
+An account may have several authenticator apps, each with its own secret and
+its own last accepted step.  A submitted code is checked against each in turn
+(`verifyAny`), and counts for the first one it verifies for: it uses up that
+app's step and no other's.  A code from one app says nothing about another
+app's secret, so there is nothing to use up there; and since every app's
+accepted steps strictly increase on their own (`verify_increasing`), a code
+accepted for an app is never accepted for that app again.  What
+`verifyAny` decides is stated in `Pyle.Proofs.Decisions`. -/
+
+/-- Check a submitted code against several apps, each given as an id, its
+secret and the step of the last code it accepted: the first app the code
+verifies for (`verify`), with the step it was accepted for. -/
+def verifyAny {α : Type} (apps : List (α × ByteArray × Option Nat)) (unixTime : Nat)
+    (code : String) : Option (α × Nat) :=
+  apps.findSome? fun (id, secret, lastStep) => (verify secret unixTime code lastStep).map (id, ·)
 
 /-- A fresh 20-byte secret from the operating system's generator. -/
 def generateSecret : IO ByteArray := Crypto.randomBytes secretLength.toUSize

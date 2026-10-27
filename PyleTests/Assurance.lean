@@ -165,13 +165,17 @@ def accountSafetyTests : IO Unit := withCtx fun ctx _ => do
   let page ← getPage ctx "/account" (some rid)
   check "says a device-bound passkey account is well protected"
     (containsStr page.bodyText "<p id=\"safety\">This account can sign in with a security key \
-      that verifies you and keeps its key on the device")
+      that verifies you and keeps its key on the device" &&
+      containsStr page.bodyText "Account protection: strongest")
   let sam ← ctx.store.addUser "sam" [] 1
   let weak ← weakFor ctx sam
   let page ← getPage ctx "/account" (some weak)
   check "and asks an account without a passkey for one"
-    (containsStr page.bodyText "<p id=\"safety\" class=\"notice\">This account signs in \
-      with two factors, but has no passkey")
+    (containsStr page.bodyText "<div id=\"protection\" class=\"protection notice\">" &&
+      containsStr page.bodyText "Account protection: fair" &&
+      containsStr page.bodyText "<p id=\"safety\">This account signs in \
+      with two factors, but has no passkey" &&
+      containsStr page.bodyText "<a class=\"nudge-link\" href=\"/account/add\">Add one</a>")
 
 /-- The device grant still needs `phr`, and its tokens state the level. -/
 def deviceAssuranceTests : IO Unit := withCtx fun ctx clock => do
@@ -285,7 +289,7 @@ def migrationTests : IO Unit := IO.FS.withTempDir fun dir => do
         VALUES (x'04', 1, -7, x'05', 0, 0, 0, x'00', 'added later', 7)"
   checkEq "the database is at version 4" (← s.version) 4
   s.migrate 2
-  checkEq "and is brought to 5" (← s.version) 5
+  checkEq "and is brought forward" (← s.version) Store.schemaVersion
   checkEq "an older client has the mfa floor" ((← s.clientSettings "old").map (·.minAcr))
     (some .mfa)
   checkEq "the credential the invitation made is taken to verify the user"
@@ -430,7 +434,7 @@ def ignoredExtrasTests : IO Unit := withCtx fun ctx _ => do
   checkEq "a passkey with a wrong code still signs in" r.status.toCode 200
   checkEq "and the code is not part of the sign-in"
     ((replyJson r).getObjValAs? (List String) "amr").toOption (some ["hwk", "user"])
-  checkEq "nor counted against TOTP" ((← ctx.store.findTotp una.id).map (·.failures)) (some 0)
+  checkEq "nor counted against TOTP" (← ctx.store.totpLock una.id).failures 0
 
 /-- Rows whose `amr` reads as no level fail closed: a session, a code, a
 refresh token and a device approval that `Policy` could not have written. -/

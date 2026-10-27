@@ -33,9 +33,20 @@ def Store.setPassword (s : Store) (user : UserId) (phc : String) (now : Nat) : I
 def Store.findPassword (s : Store) (user : UserId) : IO (Option String) := s.run fun c =>
   queryOne c "SELECT phc FROM passwords WHERE user_id = ?" #[user] (colText · 0)
 
-/-- Remove a user's password.  Whether there was one. -/
-def Store.removePassword (s : Store) (user : UserId) : IO Bool := s.run fun c => do
-  return (← exec c "DELETE FROM passwords WHERE user_id = ?" #[user]) > 0
+/-- When a user's password was set, if they have one. -/
+def Store.passwordSetAt (s : Store) (user : UserId) : IO (Option Nat) := s.run fun c =>
+  queryOne c "SELECT created FROM passwords WHERE user_id = ?" #[user] (colNat · 0)
+
+/-- Remove a user's password, unless what is left would not reach a level
+(`removeKeepingWayIn`).  A password is not one of the two authenticators §1
+counts, so removing it changes that count for nobody, and only the level is
+checked.  `passwords` is whether the deployment allows them: if not, the
+password is no factor, and removing it takes nothing away. -/
+def Store.removePassword (s : Store) (user : UserId) (passwords : Bool := true) :
+    IO Removal := s.atomically fun c => do
+  let delete := exec c "DELETE FROM passwords WHERE user_id = ?" #[user]
+  if passwords then removeKeepingWayIn c user passwords false delete
+  else return if (← delete) > 0 then .removed else .notFound
 
 /-! ## Capped challenges -/
 
@@ -61,9 +72,9 @@ def Store.addChallengeCapped (s : Store) (ch : Challenge) (client : String)
     (colNat · 0)
   if mine.getD 0 ≥ perClient then return .clientFull
   discard <| exec c
-    "INSERT INTO challenges (challenge, purpose, user_id, expires, client_address) \
-      VALUES (?, ?, ?, ?, ?)"
-    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, client]
+    "INSERT INTO challenges (challenge, purpose, user_id, expires, client_address, kind) \
+      VALUES (?, ?, ?, ?, ?, ?)"
+    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, client, ch.kind]
   return .added
 
 /-- Whether an unspent recovery code with this digest exists, without

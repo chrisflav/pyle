@@ -312,6 +312,24 @@ session Zulip keeps of its own, and says so each time.  Deactivating the
 user there is the administrator's part, as is retiring the account in each
 service before its address is given to anyone else.
 
+**Administration in a browser.**  The same changes, except replacing the
+root key and ending every session at once, can be made from pages under
+`/admin` by an enabled member of the configured `adminGroup`.  The rule is
+one function, `Admin.rule`: anyone else is answered `404` on every path under
+`/admin`, before routing, so that no `405`, `Origin` refusal or redirect
+says the interface is there; an administrator's session must be at `phr`,
+and a weaker one is sent round the step-up of above at `phr` rather than
+refused; and every change also needs a sign-in within the step-up window,
+as an account change does (`Admin.rule_allow`).  Changes are JSON posts
+under the `Origin` check and the rate limiter; pages change nothing.  The
+last enabled administrator cannot be disabled, removed or taken out of the
+group, checked in the transaction that makes the change; the command line is
+not held to it, since it is how a deployment without administrators gets one
+back.  An administrator's change is audited with the administrator as the
+entry's account and what was changed at the start of its detail.  A
+client's secret and an invitation's link are shown once, in the answer that
+made them; the pages name pending invitations by the hash of their token.
+
 ## 5. What services receive
 
 ### 5.1 OpenID Connect
@@ -607,6 +625,9 @@ family (`pyle sessions revoke --all`), and new authenticator apps.
 - **Audit.**  One append-only, hash-chained record per authentication event, in
   the same shape as kleis's §9.3: who, which factor, from where, outcome.
   Never a secret, a code or a challenge.
+- **Administration.**  The pages under `/admin` answer `404` to everyone but an
+  administrator at every path, so probing them learns nothing; they need a
+  passkey session, and a fresh one for a change (§4).
 
 ## 8. State
 
@@ -814,6 +835,12 @@ Every theorem below uses no axioms beyond `propext`, `Classical.choice` and
    be written out again without the square root that recovers `y`, which pyle
    never computes, so that round trip starts from the coordinates.
 
+8. **Administration**: `Admin.rule_allow` — the pages let a request through
+   only for an administrator whose session is at `phr` or better, and a
+   change only with a sign-in within the step-up window; `Admin.rule_hidden`
+   — anyone else is shown nothing.  That the handlers ask `rule` is checked by
+   the tests, not proved.
+
 Not proved: anything about SQLite itself, the triggers or the lock — they are
 the assumptions of part 2; the parsers' totality beyond being total Lean
 functions; and the curve arithmetic (below).
@@ -840,6 +867,7 @@ Pyle/
   Audit.lean
   RootKey.lean reading the root key, and replacing it (§6.4)
   Admin.lean   ending access, disabling and removing accounts (§4)
+  Admin/      the administration pages: who may (`rule`), endpoints, pages, script
 web/           sign-in and account pages (no framework needed; a few hundred lines)
 ```
 

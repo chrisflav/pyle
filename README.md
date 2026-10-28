@@ -47,11 +47,13 @@ Optional keys: `host` (default `127.0.0.1`), `port` (`8420`),
 `trustedProxies` (peer addresses whose `X-Forwarded-For` is believed; none by
 default), `allowPasswords` (`false`: whether users may add a password as one of
 two factors), `attestationRoots` (DER or PEM files of trust anchors for
-`packed` attestation; none) and `aaguidAllowList` (the authenticator models
+`packed` attestation; none), `aaguidAllowList` (the authenticator models
 that may be registered, as AAGUIDs; any by default — when set, it needs
 `attestationRoots`, and only authenticators with a verified attestation chain
 and a listed AAGUID can be registered — which rules out synced platform
-passkeys, since those do not send attestation).  Relative paths are relative to the
+passkeys, since those do not send attestation) and `adminGroup` (`admin`: the
+group whose members may use the administration pages under `/admin`; a group
+name, as below).  Relative paths are relative to the
 configuration file.  Unknown keys are an error.
 
 ```sh
@@ -146,6 +148,84 @@ Every reply pyle makes carries its security headers (a strict CSP with
 the replies `Std.Http` makes on its own before a request reaches pyle — `400`
 for a malformed request, `413` for an oversized body — which carry none of
 them; have the reverse proxy add the headers if that matters.
+
+### The administration pages
+
+Everything above but the root key and ending everyone's sessions can also be
+done in a browser, under `/admin`, by an **administrator**: an enabled
+account in the group `adminGroup` names (`admin` unless configured).  The
+first one is made on the command line, with an invitation:
+
+```sh
+pyle invite alice --group admin    # open the link on a device with a passkey
+```
+
+and from then on administrators can invite others from the pages, and give
+or take the group there.  Group names are 1 to 64 letters, digits, `-`, `_`
+and `.`, starting with a letter or digit: they travel in `Remote-Groups`
+(joined with commas), datalog and tokens.  `user add`, `invite` and the pages
+refuse any other.
+
+The rule, for every page and endpoint under `/admin`:
+
+* Anyone who is not an administrator — no session, an account outside the
+  group, a disabled one — gets `404`, the same `404` as a path that names
+  nothing, for every path under `/admin`: pages, endpoints, the pages'
+  script, misspelt paths, wrong methods and cross-origin posts alike.  The
+  interface does not say it exists, and `/account` links to it only for
+  administrators.
+* An administrator's session must be at `phr` (a passkey, or a security key
+  that verifies the user).  A page sends a weaker session to sign in at
+  `phr` and come back (`/signin?return=…&acr=phr`); an endpoint answers `403
+  step_up_required`, and the page's script confirms with a passkey and tries
+  again.
+* Every change also needs a sign-in within the last five minutes, as changes
+  to one's own account do: `403 step_up_required` otherwise.  Pages never
+  change anything; every change is a JSON `POST` under the same `Origin`
+  check as the account endpoints, and rate limited per administrator and
+  address like them: refused requests count, and too many are `429`.
+* The last enabled administrator cannot be disabled, removed or taken out of
+  the group, by another administrator or by themselves: `409
+  last_administrator`.  The command line is not held to this — it is how a
+  deployment that has lost its administrators gets one back
+  (`pyle user add` or `pyle invite … --group admin`).
+
+Each change is audited in the transaction that makes it or right after it,
+with the administrator as the entry's account and what was changed at the
+start of its detail: `user-changed root "account bob: disabled; 2 sessions,
+…"`, `client-added root "client wiki: registered, confidential, ES256, …"`.
+A client's secret and an invitation's link are in the answer that made them,
+shown once on the page, and nowhere else — not in the audit log, not in the
+lists; pending invitations are named by the hash of their token.
+
+| Page | |
+| --- | --- |
+| `GET /admin` | the accounts: name, display name, email address, groups, disabled, authenticators, the level the account can sign in at, created, last active |
+| `GET /admin/users/<name>` | one account: email address and display name, groups, disable or enable, end its sessions (each, or all with its tokens), its ways in, remove (typing its name to confirm) |
+| `GET /admin/invitations` | make an invitation (name, email address, display name, groups, lifetime) and see its link once; the pending ones, without their tokens, each can be withdrawn |
+| `GET /admin/clients`, `GET /admin/clients/<id>` | the OpenID Connect clients (id, name, kind, ID-token algorithm, minimum level, scopes, redirect and post-logout URIs); register one as `client add` does, its secret shown once; change its name, addresses, scopes and minimum level; remove it (typing its id) |
+| `GET /admin/audit?page=<n>` | the audit log, newest first, fifty entries a page, and whether its chain verifies |
+| `GET /admin/keys` | the signing keys and their states; rotate one use or all three |
+| `GET /admin/assets/admin.js` | the pages' script, for administrators only |
+
+| Endpoint (`POST`) | body | answer |
+| --- | --- | --- |
+| `/admin/users/contact` | `{"name", "email"?, "displayName"?}` (`null` or `""` clears) | `200` the account; `409 email_taken` |
+| `/admin/users/groups` | `{"name", "groups"}` | `200` the account; `409 last_administrator` |
+| `/admin/users/disable`, `…/enable` | `{"name"}` | `200 {"sessions", "families", "codes"}` ended; `204` |
+| `/admin/users/revoke` | `{"name"}` | `200` as above: sessions, refresh tokens and pending codes, as `sessions revoke --user` |
+| `/admin/users/sessions/end` | `{"name", "handle"}` | `204` |
+| `/admin/users/remove` | `{"name", "confirm"}`, `confirm` the name again | `200` as above; `400 confirmation_required`; `409 last_administrator` |
+| `/admin/invitations/create` | `{"name", "email"?, "displayName"?, "groups"?, "ttl"?}` (`7d` by default) | `201 {"url", "name", "expires"}`; `409 name_taken` |
+| `/admin/invitations/revoke` | `{"handle"}` | `204` |
+| `/admin/clients/add` | `{"id", "name"?, "redirectUris", "postLogoutUris"?, "scopes"?, "public"?, "rs256"?, "minAcr"?}` | `201 {"id", "secret"?}`; `409 client_exists` (an id is not replaced, as `client add` would) |
+| `/admin/clients/update` | `{"id", "name"?, "redirectUris"?, "postLogoutUris"?, "scopes"?, "minAcr"?}`, what is left out staying | `204` |
+| `/admin/clients/remove` | `{"id", "confirm"}`, `confirm` the id again | `204` |
+| `/admin/keys/rotate` | `{"use"?}`: `es256`, `rs256` or `biscuit`, all three without | `{"rotated": [{"use", "promoted", "announced"}]}` |
+
+`pyle root-key rotate` and `pyle sessions revoke --all` stay on the command
+line, and the keys page says so: both reach every account at once, and are
+what to do after a leak (see "If a backup leaks"), from a shell on the host.
 
 ### Signing in
 
@@ -631,7 +711,9 @@ pyle client add wiki --name Wiki --redirect https://wiki.example.org/oauth/callb
 The keys are made on first use if this is skipped; rotating twice up front
 only means the first clients find a `next` key in `/jwks` already.  `client
 add` prints the secret once.  Then have alice add a second passkey or a
-security key from `/account`, so that losing a phone does not lock her out.
+security key from `/account`, so that losing a phone does not lock her out.  As a
+member of `admin` she can then invite others and register clients from
+`/admin` as well (see "The administration pages").
 
 ### Upgrading
 

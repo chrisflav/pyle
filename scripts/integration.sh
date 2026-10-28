@@ -146,7 +146,8 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $ISSUER" \
 python3 -I "$ROOT/scripts/e2e.py" --port "$PORT" --issuer "$ISSUER" --invite "$INVITE" \
   --user alice --client app --secret="$SECRET" --redirect "$REDIRECT" --post-logout "$BYE" \
   --public-client tv --fa-host "$FA_HOST" --fa-other "$FA_OTHER" \
-  --fa-secret="$FA_SECRET" --counts "$WORK/counts"
+  --fa-secret="$FA_SECRET" --counts "$WORK/counts" \
+  --pyle "$PYLE" --root-key "$WORK/data/root.key"
 if [ -f "$WORK/counts" ]; then
   read -r P F < "$WORK/counts"
   PASS=$((PASS+P)); FAIL=$((FAIL+F))
@@ -196,6 +197,57 @@ cat "$WORK"/data/pyle.db* | grep -aqF "email: none -> Alice@Example.org" &&
   cat "$WORK"/data/pyle.db* | grep -aqF "email: Alice@Example.org -> alice@new.example.org" &&
   cat "$WORK"/data/pyle.db* | grep -aqF 'display name: "Alice Example" -> none'
 check $? "the audit log records the old and the new values"
+
+echo
+echo "== the root key file"
+KEY="$WORK/data/root.key"
+cp "$KEY" "$WORK/key.current"
+head -c 32 /dev/urandom > "$KEY.new"
+OUT="$("$PYLE" root-key check 2>&1)"
+[ $? -eq 0 ] && cmp -s "$KEY" "$WORK/key.current"
+check $? "a stray .new from a rotation that never committed is ignored" "$OUT"
+OUT="$("$PYLE" root-key rotate 2>&1)"
+check $? "and the next rotation replaces it" "$OUT"
+[ ! -e "$KEY.new" ] && ! cmp -s "$KEY" "$WORK/key.current"
+check $? "leaving only the new key"
+# Committed, not installed: the database records the key now at .new, and
+# the key file still holds the one before.
+mv "$KEY" "$KEY.new"
+cp "$WORK/key.current" "$KEY"
+cp "$KEY.new" "$WORK/key.committed"
+OUT="$("$PYLE" root-key check 2>&1)"
+[ $? -eq 0 ] && cmp -s "$KEY" "$WORK/key.committed" && [ ! -e "$KEY.new" ]
+check $? "a rotation that committed and stopped is finished by the next command" "$OUT"
+grep -q "finished an interrupted root-key rotation" <<< "$OUT"
+check $? "saying so" "$OUT"
+cp "$WORK/key.current" "$KEY"
+OUT="$("$PYLE" keys rotate es256 2>&1)"
+[ $? -ne 0 ] && grep -q "is not the one this database is sealed under" <<< "$OUT"
+check $? "a key file that is not the database's is refused" "$OUT"
+cp "$WORK/key.committed" "$KEY"
+"$PYLE" root-key check > /dev/null 2>&1
+check $? "and accepted again once the right one is back"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz")"
+[ "$CODE" = "200" ]; check $? "the server followed every rotation" "got $CODE"
+
+echo
+echo "== removing an account"
+OUT="$("$PYLE" user remove alice 2>&1)"
+[ $? -eq 2 ] && grep -q -- "--yes" <<< "$OUT"
+check $? "pyle user remove asks for --yes" "$OUT"
+OUT="$("$PYLE" user remove alice --yes 2>&1)"
+check $? "pyle user remove alice --yes" "$OUT"
+! grep -q "^alice	" <<< "$("$PYLE" user list 2>&1)"
+check $? "and she is gone"
+OUT="$("$PYLE" user list --yes 2>&1)"
+[ $? -eq 2 ]; check $? "--yes elsewhere is refused" "$OUT"
+for EVENT in root-key-rotated sessions-revoked user-removed; do
+  cat "$WORK"/data/pyle.db* | grep -aqF "$EVENT"
+  check $? "the audit log records $EVENT"
+done
+cat "$WORK"/data/pyle.db* | grep -aqF "email: alice@new.example.org; "
+check $? "the removal is recorded with her address"
+
 kill -0 "$PYLE_PID" 2>/dev/null
 check $? "the server is still running"
 # Only the oversized body above may have failed a connection.

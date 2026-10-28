@@ -156,7 +156,11 @@ as one, and an account's authenticator apps count as one together.  A
 removal is checked against what it leaves, in the transaction that makes it,
 and rolled back if the factors left reach no level (two touch-only keys, say,
 or apps alone) or are fewer than two authenticators; removing the password,
-which is not counted, is checked only for the level.  Losing a single key should never be
+which is not counted, is checked only for the level.  Recovery codes do not
+count towards that level: they are the last resort (§3), and each sign-in
+spends one, so no removal may leave them as the only second factor.  The
+account's own level, shown on its page and given to services, still counts
+them.  Losing a single key should never be
 an administrator's problem.
 
 ## 2. WebAuthn ceremonies

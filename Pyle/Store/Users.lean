@@ -223,10 +223,14 @@ def Store.renameCredential (s : Store) (user : UserId) (id : ByteArray) (name : 
 
 An account must always be able to sign in again (§1), so a removal is checked
 against what it leaves, inside the transaction that makes it: the factors
-left must reach a level (`Acr.Capabilities.level`, at least `mfa`), and there
-must still be two authenticators — WebAuthn credentials, and the account's
-authenticator apps counted once, since they are one kind of factor and often
-on one phone.  A removal that fails either is rolled back. -/
+left must reach a level (`Acr.Capabilities.level`, at least `mfa`) without
+counting recovery codes, and there must still be two authenticators —
+WebAuthn credentials, and the account's authenticator apps counted once,
+since they are one kind of factor and often on one phone.  A removal that fails either is rolled back.
+
+Recovery codes are left out of the level here because they are the last
+resort (§3): each sign-in spends one, so an account that signs in only thanks
+to them is ten sign-ins from being locked out. -/
 
 /-- The kinds of factor an account has, read on one connection: its
 credentials, whether any verifies the user and whether that one is
@@ -284,14 +288,14 @@ instance : ToString Removal := ⟨fun r => reprStr r⟩
 
 /-- Run `delete` (which removes one factor of `user` and returns how many
 rows it removed) under a savepoint, and keep the removal only if what is left
-`keepsWayIn`; otherwise roll it back.  The caller runs this inside
+`keepsWayIn`, with recovery codes not counted; otherwise roll it back.  The caller runs this inside
 `Store.atomically`, so two concurrent removals cannot both pass the check. -/
 def removeKeepingWayIn (c : SQLite) (user : UserId) (passwords requireTwo : Bool)
     (delete : IO Nat) : IO Removal := do
   discard <| exec c "SAVEPOINT removal"
   let n ← delete
   let outcome ← if n == 0 then pure Removal.notFound else do
-    let caps ← capabilitiesIn c user passwords
+    let caps := { (← capabilitiesIn c user passwords) with recovery := false }
     if keepsWayIn caps (← countAuthenticators c user) requireTwo then pure Removal.removed
     else pure Removal.wouldLockOut
   if outcome == .wouldLockOut then discard <| exec c "ROLLBACK TO removal"

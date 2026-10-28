@@ -92,10 +92,12 @@ sign-in method" leads to `/account/add`, which offers a passkey (recommended),
 a security key, an authenticator app, a password and new recovery codes; a
 passkey or a security key is registered right there, the others have a page
 each.  A removal that would leave the account unable to sign in is refused:
-what is left must still reach a level, and must be two authenticators, the
-apps counting once — so neither the passkey beside two apps nor the one key
-that verifies beside touch-only keys can go, and the password cannot go when
-it is what makes the sign-in two factors.
+what is left must still reach a level without counting recovery codes, and
+must be two authenticators, the apps counting once — so neither the passkey
+beside two apps nor the one key that verifies beside touch-only keys can go,
+and the password cannot go when it is what makes the sign-in two factors.
+Recovery codes are left out because each sign-in spends one: an account that
+could sign in only with them would be ten sign-ins from locked out.
 
 An account can have several authenticator apps (TOTP), each with its own
 secret and name, added, renamed and removed one by one, up to five.  All of

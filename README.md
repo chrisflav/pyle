@@ -58,11 +58,26 @@ configuration file.  Unknown keys are an error.
 pyle init --config pyle.json        # create the root key (mode 0600) and the database
 pyle serve --config pyle.json       # answer HTTP; put a TLS-terminating proxy in front
 pyle user add alice --group admin   # create an account
-pyle user list                      # list the accounts
+pyle user add carol --email carol@example.org --display-name "Carol Smith"
+pyle user set alice --email alice@example.org --display-name "Alice Liddell"
+pyle user set alice --no-email --no-display-name   # clear them again
+pyle user list                      # list the accounts, with addresses and display names
 pyle invite bob --group staff --ttl 7d   # print a link that creates bob's account
+pyle invite dan --email dan@example.org --display-name "Dan Brown"   # with both
 pyle audit verify                   # check the audit log's hash chain
 pyle version
 ```
+
+An account may have an email address and a display name, for services that
+know people by them (the `email` and `profile` scopes below).  Only an
+administrator sets them — `user add`, `user set`, or an invitation, which
+hands them to the account it creates — and the account page shows them
+without offering to change them.  An address is trimmed and checked for its
+shape (at most 254 characters, one `@` with something before it and a domain
+with a dot after it, no whitespace or control characters) and stored as
+given, but two accounts cannot share one in any case: `Ann@Example.org` and
+`ann@example.org` are the same address to pyle.  A display name is 1 to 128
+characters without control characters.  Each `user set` change is audited.
 
 Keep a copy of the root key: the secrets sealed under it cannot be read
 without it.
@@ -213,9 +228,19 @@ pyle client remove taxis
 
 `client add` prints a confidential client's secret once; pyle keeps only its
 hash.  Scopes default to `openid profile groups`; `profile` releases the
-`name` claim and `groups` the `groups` claim; `offline_access` keeps refresh
-tokens alive after the user signs out of pyle; `kleis` lets a client's tokens
-obtain kleis attestations.  `--min-acr` is the lowest level a session must
+`name` claim (the account's display name, or its name if it has none) and
+`preferred_username` (always the account name); `email` releases `email` and
+`email_verified` — always `true`, since only an administrator sets an
+address, never the user — for an account that has an address, and neither
+claim for one that has none; `groups` releases the `groups` claim;
+`offline_access` keeps refresh tokens alive after the user signs out of pyle;
+`kleis` lets a client's tokens obtain kleis attestations.  `email` is not a
+default: a client that is to learn addresses is registered with the scopes
+named, which replace the defaults (`--scope openid --scope profile --scope
+email`, plus `--scope groups` if it wants them).  A service such as Zulip,
+which matches accounts by `email` and refuses a login whose `email_verified`
+is false, needs both the scope and an address on every account that signs in
+to it.  `--min-acr` is the lowest level a session must
 reach to sign in to the client (a short name or an identifier); it defaults
 to `mfa`, and `client list` shows it.
 
@@ -225,7 +250,7 @@ to `mfa`, and `client list` shows it.
 | `GET /jwks` | the ID-token keys: next, current, previous |
 | `GET /authorize` (`POST` is redirected to `GET`) | `response_type=code`, `client_id`, `redirect_uri` (exact match), `scope` (with `openid`), `state`, `nonce`, `code_challenge` + `code_challenge_method=S256` (required), `prompt` (`none`, `login`), `max_age`, `acr_values`, `claims` (its `id_token.acr`) |
 | `POST /token` | `authorization_code` (`code`, `redirect_uri`, `code_verifier`), `refresh_token` (`refresh_token`, optional narrower `scope`), `urn:ietf:params:oauth:grant-type:device_code` (`device_code`); client authentication `client_secret_basic`, `client_secret_post` or `none` |
-| `GET`/`POST /userinfo` | `Authorization: Bearer <access token>`; `sub`, `pyle_account_acr`, and `name` / `groups` as the scope allows |
+| `GET`/`POST /userinfo` | `Authorization: Bearer <access token>`; `sub`, `pyle_account_acr`, and `name` / `preferred_username` / `email` / `email_verified` / `groups` as the scope allows, read from the account as it is now |
 | `GET`/`POST /end_session` | RP-initiated logout: `id_token_hint`, `client_id`, `post_logout_redirect_uri` (registered with `--post-logout`), `state`; asks before signing out (`POST /end_session/confirm`), then shows a link back to the registered address |
 
 The authorization response carries `code`, `state` and `iss` (RFC 9207).
@@ -236,8 +261,9 @@ tokens rotate on every use; presenting one twice revokes its family.  A family
 expires `refreshTokenSeconds` after it began, however often it rotates, and —
 unless the grant included `offline_access` — when the pyle session it came
 from ends.  ID tokens carry `iss sub aud exp iat auth_time nonce amr acr
-pyle_account_acr`, plus `name` with the `profile` scope and `groups` with the
-`groups` scope; `sub` is the account's random handle in base64url, `amr` the
+pyle_account_acr`, plus `name` and `preferred_username` with the `profile`
+scope, `email` and `email_verified` with the `email` scope (when the account
+has an address), and `groups` with the `groups` scope; `sub` is the account's random handle in base64url, `amr` the
 RFC 8176 methods (`hwk`/`swk`, `user`, `otp`, `pwd`, `mfa`, and `rec` for a
 recovery code), `acr` the session's level, and `pyle_account_acr` the
 strongest level the account could sign in at with what it has registered
@@ -546,6 +572,14 @@ and lock carry over to the account.  The first code it accepts re-seals its
 secret for its row.  Its last use is shown when the step it
 last accepted came more than a minute after it was set up, and as not used
 otherwise.  There is no way back to an older pyle after it, short of a backup.
+
+Migration 8 adds an optional email address and display name to accounts and
+invitations, with a unique index over the lower-cased address.  Existing
+accounts and pending invitations get neither, so ID tokens and `/userinfo`
+say what they said before (`name` is still the account name) plus the new
+`preferred_username`; give accounts their addresses with `pyle user set
+<name> --email …` before pointing a service that needs them at pyle.  An
+older pyle refuses the migrated database.
 
 ### Docker
 

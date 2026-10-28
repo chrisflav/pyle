@@ -9,10 +9,16 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
 
 * `pyle init` creates the root key (mode 0600) and the database.
 * `pyle serve` answers HTTP until it is stopped.
-* `pyle user add <name> [--group <group>]…` creates an account.
+* `pyle user add <name> [--group <group>]… [--email <e>] [--display-name <n>]`
+  creates an account.
+* `pyle user set <name> [--email <e> | --no-email] [--display-name <n> |
+  --no-display-name]` sets or clears an account's email address and display
+  name.  Only an administrator sets these, never the user, which is why the
+  `email` claim is stated as verified.
 * `pyle user list` lists the accounts.
-* `pyle invite <name> [--group <group>]… [--ttl <7d>]` prints a link that
-  creates the account `<name>` with its first way in.
+* `pyle invite <name> [--group <group>]… [--ttl <7d>] [--email <e>]
+  [--display-name <n>]` prints a link that creates the account `<name>` with
+  its first way in, and with that address and display name.
 * `pyle audit verify` checks the audit log's hash chain.
 * `pyle client add <id> --redirect <uri>… [--public] [--scope <s>]… [--name <n>]
   [--rs256] [--post-logout <uri>]… [--min-acr <level>]` registers an OpenID
@@ -33,9 +39,12 @@ def usage : String :=
   "commands:\n" ++
   "  init                              create the root key and the database\n" ++
   "  serve                             answer HTTP until stopped\n" ++
-  "  user add <name> [--group <g>]...  create an account\n" ++
+  "  user add <name> [--group <g>]... [--email <e>] [--display-name <n>]\n" ++
+  "                                    create an account\n" ++
+  "  user set <name> [--email <e> | --no-email] [--display-name <n> | --no-display-name]\n" ++
+  "                                    set or clear an account's email and display name\n" ++
   "  user list                         list the accounts\n" ++
-  "  invite <name> [--group <g>]... [--ttl <7d>]\n" ++
+  "  invite <name> [--group <g>]... [--ttl <7d>] [--email <e>] [--display-name <n>]\n" ++
   "                                    print a link that creates an account\n" ++
   "  audit verify                      check the audit log's hash chain\n" ++
   "  client add <id> --redirect <uri>... [--public] [--scope <s>]... [--name <n>]\n" ++
@@ -92,13 +101,60 @@ def openStore (path : System.FilePath) : IO Store.Store := do
   Store.Store.openAt config.database (← Http.systemClock)
 
 /-- `pyle user add`. -/
-def userAdd (path : System.FilePath) (name : String) (groups : List String) : IO UInt32 := do
+def userAdd (path : System.FilePath) (name : String) (groups : List String)
+    (email displayName : Option String) : IO UInt32 := do
   let store ← openStore path
   let now ← Http.systemClock
-  let u ← store.addUser name groups now
+  let u ← store.addUser name groups now email displayName
   discard <| Audit.append store now
     { event := .userAdded, outcome := .success, userName := some u.name, clientAddress := "cli" }
   IO.println s!"pyle: created {u.name} (id {u.id})"
+  return 0
+
+/-- A change `pyle user set` makes to an optional field: set it, clear it, or
+leave it.  The last value given counts, as for the other flags. -/
+def fieldChange (what : String) (values : List String) (clear : Bool) :
+    Except String (Option (Option String)) :=
+  match values, clear with
+  | [], false => .ok none
+  | [], true => .ok (some none)
+  | _ :: _, true => .error s!"give --{what} or --no-{what}, not both"
+  | _ :: _, false => .ok (some values.getLast?)
+
+/-- `pyle user set`: set or clear an account's email address and display
+name, each change audited. -/
+def userSet (path : System.FilePath) (name : String) (emails displayNames : List String)
+    (noEmail noDisplayName : Bool) : IO UInt32 := do
+  let changes := do
+    return (← fieldChange "email" emails noEmail,
+      ← fieldChange "display-name" displayNames noDisplayName)
+  let (email, displayName) ← match changes with
+    | .ok c => pure c
+    | .error e =>
+      IO.eprintln s!"pyle: {e}"
+      return 2
+  if email.isNone && displayName.isNone then
+    IO.eprintln "pyle: nothing to change: give --email, --no-email, --display-name or \
+      --no-display-name"
+    return 2
+  -- Both are checked before either is written, so a bad one changes nothing.
+  discard <| Store.normalizeContact (email.getD none) (displayName.getD none)
+  let store ← openStore path
+  let some u ← store.findUserByName name
+    | IO.eprintln s!"pyle: there is no user named '{name}'"
+      return 1
+  let now ← Http.systemClock
+  let audit (detail : String) := discard <| Audit.append store now
+    { event := .userChanged, outcome := .success, userName := some u.name,
+      clientAddress := "cli", detail }
+  if let some e := email then
+    discard <| store.setUserEmail u.id e
+    audit (if e.isSome then "email address set" else "email address removed")
+  if let some d := displayName then
+    discard <| store.setUserDisplayName u.id d
+    audit (if d.isSome then "display name set" else "display name removed")
+  let some u ← store.findUser u.id | return 1
+  IO.println s!"pyle: {u.name}: email {u.email.getD "-"}, display name {u.displayName.getD "-"}"
   return 0
 
 /-- `pyle user list`. -/
@@ -108,7 +164,8 @@ def userList (path : System.FilePath) : IO UInt32 := do
     let n ← store.authenticatorCount u.id
     let groups := if u.groups.isEmpty then "-" else ",".intercalate u.groups
     let state := if u.disabled then " (disabled)" else ""
-    IO.println s!"{u.name}\tgroups: {groups}\tauthenticators: {n}{state}"
+    IO.println s!"{u.name}\tgroups: {groups}\tauthenticators: {n}\temail: \
+      {u.email.getD "-"}\tdisplay name: {u.displayName.getD "-"}{state}"
   return 0
 
 /-- `pyle client add`. -/
@@ -182,7 +239,7 @@ def keysList (path : System.FilePath) : IO UInt32 := do
 /-- `pyle invite`: issue an invitation and print its link.  `ttl` is a
 lifetime such as `7d` or `12h`; seven days if not given. -/
 def invite (path : System.FilePath) (name : String) (groups : List String)
-    (ttl : Option String) : IO UInt32 := do
+    (ttl email displayName : Option String) : IO UInt32 := do
   let seconds ← match ttl with
     | none => pure (7 * 86400)
     | some t => match SignIn.parseDuration t with
@@ -194,6 +251,7 @@ def invite (path : System.FilePath) (name : String) (groups : List String)
   let store ← Store.Store.openAt config.database (← Http.systemClock)
   let now ← Http.systemClock
   let url ← SignIn.createInvitation store config.issuer name groups seconds now
+    (email := email) (displayName := displayName)
   discard <| Audit.append store now
     { event := .userChanged, outcome := .success, userName := some name,
       clientAddress := "cli", detail := "invited" }
@@ -225,6 +283,10 @@ def main (args : List String) : IO UInt32 := do
   let (rs256, args) := takeSwitch "--rs256" args
   let (ttls, args) := takeFlag "--ttl" args
   let (minAcrs, args) := takeFlag "--min-acr" args
+  let (emails, args) := takeFlag "--email" args
+  let (displayNames, args) := takeFlag "--display-name" args
+  let (noEmail, args) := takeSwitch "--no-email" args
+  let (noDisplayName, args) := takeSwitch "--no-display-name" args
   try
     match args with
     | ["version"] =>
@@ -234,9 +296,14 @@ def main (args : List String) : IO UInt32 := do
     | ["serve"] =>
       Server.run (← Config.load (← configPath configs))
       return 0
-    | ["user", "add", name] => userAdd (← configPath configs) name groups
+    | ["user", "add", name] =>
+      userAdd (← configPath configs) name groups emails.getLast? displayNames.getLast?
+    | ["user", "set", name] =>
+      userSet (← configPath configs) name emails displayNames noEmail noDisplayName
     | ["user", "list"] => userList (← configPath configs)
-    | ["invite", name] => invite (← configPath configs) name groups ttls.getLast?
+    | ["invite", name] =>
+      invite (← configPath configs) name groups ttls.getLast? emails.getLast?
+        displayNames.getLast?
     | ["audit", "verify"] => auditVerify (← configPath configs)
     | ["client", "add", id] =>
       clientAdd (← configPath configs) id redirects scopes names postLogout isPublic rs256

@@ -56,8 +56,8 @@ or one `BEGIN IMMEDIATE` transaction under the store's lock (`Store.run`,
 * `take k p` with `p` the rows `Store.deviceDecision` collects is
   `Store.pollDeviceCodeFor`: one `BEGIN IMMEDIATE` transaction that reads the
   `device_codes` row and deletes it if it is collected;
-* `take k p` with `p` "live, its name and handle free and the credential id
-  unused" is `Store.redeemInvitation`: one `BEGIN IMMEDIATE` transaction
+* `take k p` with `p` "live, its name, handle and email address free and the
+  credential id unused" is `Store.redeemInvitation`: one `BEGIN IMMEDIATE` transaction
   that reads the `invitations` row, checks it, and deletes it only if every
   check passes (the account it then creates is not modelled);
 * `update` is a statement that changes a row in place without deleting it:

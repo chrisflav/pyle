@@ -109,6 +109,113 @@ def userTests : IO Unit := withCtx fun ctx _ => do
   check "disabled" (← s.setUserDisabled bob.id true)
   checkEq "and reads back disabled" ((← s.findUser bob.id).map (·.disabled)) (some true)
 
+/-- Email addresses and display names: what is accepted, how it is stored,
+and that two accounts cannot share an address in any case. -/
+def contactTests : IO Unit := withCtx fun ctx _ => do
+  group "store: email addresses and display names"
+  let s := ctx.store
+  let okEmail (e : String) := (normalizeEmail e).toOption
+  checkEq "an address is trimmed and kept as given" (okEmail "  Ann.Lee@Example.ORG\n")
+    (some "Ann.Lee@Example.ORG")
+  checkEq "a plus and a subdomain are fine" (okEmail "a+zulip@mail.example.org")
+    (some "a+zulip@mail.example.org")
+  for (why, e) in [("empty", "   "), ("without an @", "ann.example.org"),
+      ("with two @", "a@b@example.org"), ("empty before the @", "@example.org"),
+      ("on a domain without a dot", "ann@localhost"),
+      ("on a domain ending in a dot", "ann@example."),
+      ("on a domain starting with a dot", "a@.org"), ("spaced", "ann lee@example.org"),
+      ("tabbed", "ann\t@example.org"), ("with a control character", "ann\x01@example.org"),
+      ("with a NUL", "ann\x00@example.org"),
+      ("too long", String.ofList (List.replicate 243 'a') ++ "@example.org")] do
+    check s!"an address {why} is refused" (okEmail e).isNone
+  checkEq "254 characters is the most" ((okEmail (String.ofList (List.replicate 242 'a') ++
+    "@example.org")).map (·.length)) (some 254)
+  let okName (n : String) := (normalizeDisplayName n).toOption
+  checkEq "a display name is trimmed" (okName "  Ann Lee ") (some "Ann Lee")
+  checkEq "and may be any printable text" (okName "Zoë O'Brien-Łukasz 李")
+    (some "Zoë O'Brien-Łukasz 李")
+  check "an empty display name is refused" (okName " ").isNone
+  check "one with a newline inside is refused" (okName "Ann\nLee").isNone
+  check "one with a C1 control is refused" (okName "Ann\u0085Lee").isNone
+  checkEq "128 characters is the most"
+    ((okName (String.ofList (List.replicate 128 'x'))).map (·.length)) (some 128)
+  check "129 is too many" (okName (String.ofList (List.replicate 129 'x'))).isNone
+  -- Accounts.
+  let ann ← s.addUser "ann" [] 10 (email := some " Ann@Example.org ")
+    (displayName := some "Ann Lee")
+  checkEq "an account is created with an address and a display name"
+    ((← s.findUser ann.id).map fun u => (u.email, u.displayName))
+    (some (some "Ann@Example.org", some "Ann Lee"))
+  let bob ← s.addUser "bob" [] 11
+  checkEq "or without" ((← s.findUser bob.id).map fun u => (u.email, u.displayName))
+    (some (none, none))
+  check "a bad address refuses the account" (← throws (s.addUser "cy" [] 12 (email := some "cy")))
+  check "and creates nothing" (← s.findUserByName "cy").isNone
+  check "a bad display name too" (← throws (s.addUser "cy" [] 12 (displayName := some "")))
+  let taken {α : Type} (act : IO α) : IO Bool := do
+    try discard act; return false
+    catch e => return ((toString e).splitOn "already used by the account 'ann'").length > 1
+  check "another account cannot have the same address in another case, and is told whose"
+    (← taken (s.addUser "cy" [] 12 (email := some "ann@EXAMPLE.org")))
+  check "nor be given it later" (← taken (s.setUserEmail bob.id (some "ANN@example.org")))
+  check "the database refuses it too, whatever path tries" (← throws (s.run fun c => exec c
+    "UPDATE users SET email = 'ann@example.ORG' WHERE id = ?" #[bob.id]))
+  check "an account may be given its own address again, in another case"
+    (← s.setUserEmail ann.id (some "ann@example.org"))
+  checkEq "and keeps it as given" ((← s.findUser ann.id).bind (·.email)) (some "ann@example.org")
+  check "bob gets one of his own" (← s.setUserEmail bob.id (some "bob@example.org"))
+  check "a bad one is refused" (← throws (s.setUserEmail bob.id (some "bob@")))
+  checkEq "and leaves his as it was" ((← s.findUser bob.id).bind (·.email))
+    (some "bob@example.org")
+  check "an address is cleared" (← s.setUserEmail ann.id none)
+  checkEq "and is then none" ((← s.findUser ann.id).bind (·.email)) none
+  check "which frees it for another account" (← s.setUserEmail bob.id (some "ANN@example.org"))
+  check "accounts without an address do not collide"
+    ((← s.addUser "dee" [] 13).email.isNone && (← s.addUser "eve" [] 14).email.isNone)
+  check "a display name is set" (← s.setUserDisplayName bob.id (some " Bob Ray "))
+  checkEq "trimmed" ((← s.findUser bob.id).bind (·.displayName)) (some "Bob Ray")
+  check "and refused when bad" (← throws (s.setUserDisplayName bob.id (some "a\x07b")))
+  check "and cleared" (← s.setUserDisplayName bob.id none)
+  checkEq "to none" ((← s.findUser bob.id).bind (·.displayName)) none
+  check "setting them on an unknown account says so"
+    (!(← s.setUserEmail ⟨999⟩ (some "x@example.org")) && !(← s.setUserDisplayName ⟨999⟩ none))
+  checkEq "lookups are unaffected" ((← s.findUserByName "bob").map (·.id)) (some bob.id)
+  checkEq "and the list carries them" ((← s.listUsers).toList.map (·.email))
+    [none, some "ANN@example.org", none, none]
+
+/-- Migration 8 brings a version-7 database forward: its accounts keep
+everything and have no address or display name, and its invitations neither. -/
+def contactMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
+  group "store: migration 8"
+  let s ← Store.openFile (dir / "old.db")
+  let token := SecretHash.of (ByteArray.mk #[9])
+  s.run fun c => do
+    discard <| currentVersion c
+    for m in migrations.take 7 do
+      for st in m.statements do discard <| exec c st
+      discard <| exec c
+        "INSERT INTO schema_version (version, description, applied) VALUES (?, ?, ?)"
+        #[m.version, m.description, (1 : Nat)]
+    discard <| exec c
+      "INSERT INTO users (handle, name, groups, created) VALUES (?, 'old', '[\"staff\"]', 5)"
+      #[.blob (ByteArray.mk #[1, 2, 3])]
+    discard <| exec c
+      "INSERT INTO invitations (token_hash, user_name, groups, created_by, created, expires) \
+        VALUES (?, 'later', '[]', 'cli', 1, 100)" #[token]
+  checkEq "the database is at version 7" (← s.version) 7
+  s.migrate 2
+  checkEq "and is brought forward" (← s.version) schemaVersion
+  let some old ← s.findUserByName "old" | check "the old account is still there" false
+  checkEq "the account keeps its handle, groups and creation time"
+    (old.handle.toList, old.groups, old.created) ([1, 2, 3], ["staff"], 5)
+  checkEq "and has no address or display name" (old.email, old.displayName) (none, none)
+  checkEq "the old invitation reads, without them"
+    ((← s.findInvitation token 50).map fun i => (i.userName, i.email, i.displayName))
+    (some ("later", none, none))
+  check "the account can be given an address" (← s.setUserEmail old.id (some "old@example.org"))
+  check "which the new index holds to"
+    (← throws (s.addUser "new" [] 6 (email := some "OLD@example.org")))
+
 /-- A credential for `user` with id `id`. -/
 def sampleCredential (user : UserId) (id : ByteArray) (userVerified : Bool := true) :
     Credential :=
@@ -466,6 +573,13 @@ def deviceTests : IO Unit := withCtx fun ctx _ => do
   checkEq "an invitation is redeemed" ((← s.consumeInvitation (.of inv) 50).map (·.userName))
     (some "bob")
   check "once" ((← s.consumeInvitation (.of inv) 51).isNone)
+  let inv ← Crypto.randomBytes 32
+  s.addInvitation (.of inv)
+    { userName := "cy", groups := [], createdBy := "cli", created := 1, expires := 100,
+      email := some "Cy@example.org", displayName := some "Cy Young" }
+  checkEq "an invitation carries an address and a display name"
+    ((← s.consumeInvitation (.of inv) 50).map fun i => (i.email, i.displayName))
+    (some (some "Cy@example.org", some "Cy Young"))
   let k (kid : String) (state : KeyState) : StoredKey :=
     { kid, algorithm := "ES256", state, sealedKey := "sealed".toUTF8,
       publicKey := "pub".toUTF8, created := 1 }
@@ -514,11 +628,44 @@ def configTests : IO Unit := do
     "\"http://localhost:8080\", \"rpId\": \"localhost\", " ++
     "\"origins\": [\"http://localhost:8080\"]}")) matches .ok _)
 
+/-- Redeeming an invitation gives the account the invitation's address and
+display name, unless another account has taken the address since. -/
+def invitationContactTests : IO Unit := withCtx fun ctx _ => do
+  group "store: invitations with an address"
+  let s := ctx.store
+  let invite (name : String) (email : Option String) : IO SecretHash := do
+    let t := SecretHash.of (← Crypto.randomBytes 32)
+    s.addInvitation t { userName := name, groups := ["staff"], createdBy := "cli", created := 1,
+                        expires := 100, email, displayName := email.map fun _ => "Fay Wray" }
+    return t
+  let redeem (t : SecretHash) : IO (Except String User) := do
+    let handle ← Crypto.randomBytes 32
+    let id ← Crypto.randomBytes 16
+    s.redeemInvitation t handle (sampleCredential · id) 50
+  match ← redeem (← invite "fay" (some "Fay@example.org")) with
+  | .ok u =>
+    checkEq "the account gets the invitation's address and display name"
+      ((← s.findUser u.id).map fun u => (u.email, u.displayName, u.groups))
+      (some (some "Fay@example.org", some "Fay Wray", ["staff"]))
+  | .error e => check "an invitation with an address is redeemed" false e
+  match ← redeem (← invite "gus" none) with
+  | .ok u => checkEq "one without gives none" (u.email, u.displayName) (none, none)
+  | .error e => check "an invitation without an address is redeemed" false e
+  let late ← invite "hal" (some "hal@example.org")
+  discard <| s.addUser "ian" [] 2 (email := some "HAL@example.org")
+  checkEq "an address taken since the invitation stops its redemption"
+    (← redeem late).toOption.isNone true
+  check "which creates nothing" (← s.findUserByName "hal").isNone
+  check "and leaves the invitation" (← s.findInvitation late 50).isSome
+
 /-- The store. -/
 def storeTests : IO Unit := do
   configTests
   schemaTests
   userTests
+  contactTests
+  contactMigrationTests
+  invitationContactTests
   credentialTests
   wayInTests
   storedFactorTests

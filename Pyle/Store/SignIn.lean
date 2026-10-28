@@ -10,8 +10,9 @@ it (to greet the person by the name they are invited as), and redeeming it.
 **Redeeming is one transaction.**  An invitation is consumed when its first
 credential is stored (DESIGN §1): the account and its credential are created
 in the same `BEGIN IMMEDIATE` transaction that deletes the invitation, after
-checking that the invitation is still live, the name still free and the
-credential id not registered to anyone.  Two browsers racing with the same
+checking that the invitation is still live, the name (and the email address
+it carries, if any) still free and the credential id not registered to
+anyone.  Two browsers racing with the same
 invitation therefore cannot both create an account, and a registration that
 fails part-way leaves the invitation as it was.
 -/
@@ -87,34 +88,32 @@ def Store.hasRecoveryCode (s : Store) (user : UserId) (digest : ByteArray) : IO 
 
 /-! ## Invitations -/
 
-/-- Read an invitation row: `user_name, groups, created_by, created, expires`. -/
-def readInvitation (st : SQLite.Stmt) : IO Invitation := do
-  return { userName := ← colText st 0, groups := ← colList st 1, createdBy := ← colText st 2,
-           created := ← colNat st 3, expires := ← colNat st 4 }
-
 /-- The live invitation with this token hash, without using it up. -/
 def Store.findInvitation (s : Store) (tokenHash : SecretHash) (now : Nat) :
     IO (Option Invitation) := s.run fun c => do
   let row ← queryOne c
-    "SELECT user_name, groups, created_by, created, expires FROM invitations \
-      WHERE token_hash = ?" #[tokenHash] readInvitation
+    s!"SELECT {invitationColumns} FROM invitations WHERE token_hash = ?" #[tokenHash]
+    readInvitation
   return row.filter (now < ·.expires)
 
 /-- Redeem an invitation by storing its first credential: in one transaction,
-check that the invitation is live, its name free and the credential id
-unused, then delete the invitation, create the account with the given
-WebAuthn user handle, and store the credential `cred` makes for it.  The new
-account, or why nothing was done. -/
+check that the invitation is live, its name and email address free and the
+credential id unused, then delete the invitation, create the account with the
+given WebAuthn user handle and the invitation's email address and display
+name, and store the credential `cred` makes for it.  The new account, or why
+nothing was done. -/
 def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteArray)
     (cred : UserId → Credential) (now : Nat) : IO (Except String User) :=
   s.atomically fun c => do
     let some inv ← queryOne c
-        "SELECT user_name, groups, created_by, created, expires FROM invitations \
-          WHERE token_hash = ?" #[tokenHash] readInvitation
+        s!"SELECT {invitationColumns} FROM invitations WHERE token_hash = ?" #[tokenHash]
+        readInvitation
       | return .error "no such invitation"
     if inv.expires ≤ now then return .error "the invitation has expired"
     if (← queryOne c "SELECT 1 FROM users WHERE name = ?" #[inv.userName] (colInt · 0)).isSome
     then return .error "the name is taken"
+    if let some e := inv.email then
+      if (← emailOwner c e).isSome then return .error "the email address is taken"
     if (← queryOne c "SELECT 1 FROM users WHERE handle = ?" #[handle] (colInt · 0)).isSome then
       return .error "the user handle is taken"
     let probe := cred ⟨0⟩
@@ -123,9 +122,10 @@ def Store.redeemInvitation (s : Store) (tokenHash : SecretHash) (handle : ByteAr
       return .error "the credential is already registered"
     discard <| exec c "DELETE FROM invitations WHERE token_hash = ?" #[tokenHash]
     let some u ← queryOne c
-        s!"INSERT INTO users (handle, name, groups, created) VALUES (?, ?, ?, ?) \
-          RETURNING {userColumns}"
-        #[handle, inv.userName, encodeList inv.groups, now] readUser
+        s!"INSERT INTO users (handle, name, groups, created, email, display_name) \
+          VALUES (?, ?, ?, ?, ?, ?) RETURNING {userColumns}"
+        #[handle, inv.userName, encodeList inv.groups, now, Value.opt inv.email,
+          Value.opt inv.displayName] readUser
       | throw (.userError "store: the new user was not returned")
     let k := cred u.id
     discard <| exec c

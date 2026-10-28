@@ -23,8 +23,10 @@ What an OpenID Connect client learns about the user (OpenID Connect Core
   given what it has registered (`Acr.Capabilities.level`), so that a service
   can tell an account that has no passkey from one that chose not to use it;
   absent for an account that could not sign in again;
-* `name` and `groups` — the account's name when the scope includes `profile`,
-  its groups when it includes `groups`.
+* `name` and `preferred_username` when the scope includes `profile` — the
+  display name (the account name if it has none) and the account name;
+  `email` and `email_verified` when it includes `email` and the account has
+  an address; `groups` when it includes `groups` (`scopedClaims`).
 
 It is signed with the client's algorithm: ES256 unless the client was
 registered for RS256, with the current key of that algorithm, named in the
@@ -44,10 +46,22 @@ one.  Shared by ID tokens and `/userinfo`. -/
 def accountClaims (account : Option Acr) : List (String × Json) :=
   (account.map fun a => [(accountAcrClaim, Json.str a.identifier)]).getD []
 
-/-- The claims about the user that a scope releases: `name` for `profile`,
-`groups` for `groups`.  Shared by ID tokens and `/userinfo`. -/
+/-- The claims about the user that a scope releases.  Shared by ID tokens and
+`/userinfo`:
+
+* `profile`: `name`, the display name if the account has one and its name
+  otherwise, and `preferred_username`, always its name;
+* `email`: `email` and `email_verified`, `true`, if the account has an
+  address — an administrator set it, never the user — and neither if not;
+* `groups`: `groups`. -/
 def scopedClaims (u : Store.User) (scopes : List String) : List (String × Json) :=
-  (if scopes.contains "profile" then [("name", Json.str u.name)] else []) ++
+  (if scopes.contains "profile" then
+    [("name", Json.str (u.displayName.getD u.name)), ("preferred_username", Json.str u.name)]
+   else []) ++
+  (match u.email with
+   | some e => if scopes.contains "email" then
+       [("email", Json.str e), ("email_verified", Json.bool true)] else []
+   | none => []) ++
   (if scopes.contains "groups" then [("groups", Json.arr (u.groups.map Json.str).toArray)]
    else [])
 

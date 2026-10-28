@@ -640,6 +640,100 @@ def keyTests : IO Unit := withCtx fun ctx clock => do
   check "rotation leaves the other uses alone"
     ((← Keys.published ctx.store .idTokenRs256).all (·.state == .current))
 
+/-- The `email` scope and the `profile` claims: `email` and `email_verified`
+only with the scope and an address, `name` the display name when there is
+one, `preferred_username` always the account name; the same in the ID token
+and at `/userinfo`, and listed by discovery. -/
+def emailClaimTests : IO Unit := withCtx fun ctx _ => do
+  group "oidc: email and profile claims"
+  let alice ← ctx.store.addUser "alice" ["staff"] 1 (email := some "Alice@Example.org")
+    (displayName := some "Alice Liddell")
+  let bob ← ctx.store.addUser "bob" [] 1
+  let (appSecret, _) ← addClients ctx
+  let some secret ← registerClient ctx.store "chat" "Chat" [appRedirect]
+      ["openid", "profile", "email", "groups"] false {} 1
+    | check "a client with the email scope" false
+  let aliceCookie ← signedIn ctx alice
+  let bobCookie ← signedIn ctx bob
+  -- The claims of the ID token and of /userinfo for a grant of `scope`.
+  let claimsFor (cookie scope : String) : IO (Json × Json) := do
+    let t ← exchange ctx (← obtainCode ctx cookie "chat" (scope := scope)) secret
+      (client := "chat")
+    let idClaims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
+    let u ← get ctx "/userinfo"
+      (headers := [("Authorization", s!"Bearer {(jsonStr t "access_token").getD ""}")])
+    return (idClaims, bodyJson u)
+  let str (j : Json) (k : String) := (j.getObjValAs? String k).toOption
+  let has (j : Json) (k : String) := (j.getObjVal? k).toOption.isSome
+  let (idt, info) ← claimsFor aliceCookie "openid profile email"
+  for (where_, j) in [("the ID token", idt), ("userinfo", info)] do
+    checkEq s!"{where_}: name is the display name" (str j "name") (some "Alice Liddell")
+    checkEq s!"{where_}: preferred_username is the account name"
+      (str j "preferred_username") (some "alice")
+    checkEq s!"{where_}: email, as it was given" (str j "email") (some "Alice@Example.org")
+    check s!"{where_}: email_verified is true"
+      (j.getObjVal? "email_verified" == .ok (Json.bool true))
+    check s!"{where_}: no groups without the scope" (!has j "groups")
+  let (idt, info) ← claimsFor aliceCookie "openid profile"
+  for (where_, j) in [("the ID token", idt), ("userinfo", info)] do
+    check s!"{where_}: without the email scope, neither email claim"
+      (!has j "email" && !has j "email_verified" && has j "name")
+  let (idt, info) ← claimsFor aliceCookie "openid email"
+  for (where_, j) in [("the ID token", idt), ("userinfo", info)] do
+    check s!"{where_}: email without profile, and no name"
+      (has j "email" && !has j "name" && !has j "preferred_username")
+  let (idt, info) ← claimsFor bobCookie "openid profile email groups"
+  for (where_, j) in [("the ID token", idt), ("userinfo", info)] do
+    checkEq s!"{where_}: without a display name, name is the account name" (str j "name")
+      (some "bob")
+    checkEq s!"{where_}: and so is preferred_username" (str j "preferred_username") (some "bob")
+    check s!"{where_}: no address, neither email claim" (!has j "email" && !has j "email_verified")
+  -- /userinfo reads the account afresh.
+  let t ← exchange ctx (← obtainCode ctx aliceCookie "chat" (scope := "openid email")) secret
+    (client := "chat")
+  let access := (jsonStr t "access_token").getD ""
+  discard <| ctx.store.setUserEmail alice.id (some "alice@new.example.org")
+  let u ← get ctx "/userinfo" (headers := [("Authorization", s!"Bearer {access}")])
+  checkEq "userinfo gives the address as it is now" (jsonStr u "email")
+    (some "alice@new.example.org")
+  discard <| ctx.store.setUserEmail alice.id none
+  let u ← get ctx "/userinfo" (headers := [("Authorization", s!"Bearer {access}")])
+  check "and none once it is removed" ((bodyJson u).getObjVal? "email").toOption.isNone
+  discard <| ctx.store.setUserEmail alice.id (some "Alice@Example.org")
+  -- Refreshing keeps the scope, and may narrow it.
+  let t ← exchange ctx (← obtainCode ctx aliceCookie "chat" (scope := "openid profile email"))
+    secret (client := "chat")
+  let r ← postForm ctx "/token" [("grant_type", "refresh_token"),
+    ("refresh_token", (jsonStr t "refresh_token").getD "")] (basic "chat" secret)
+  let claims := (← verifyEs256 ctx ((jsonStr r "id_token").getD "")).toOption.getD .null
+  checkEq "a refreshed ID token keeps the email" (str claims "email") (some "Alice@Example.org")
+  let r ← postForm ctx "/token" [("grant_type", "refresh_token"),
+    ("refresh_token", (jsonStr r "refresh_token").getD ""), ("scope", "openid profile")]
+    (basic "chat" secret)
+  let claims := (← verifyEs256 ctx ((jsonStr r "id_token").getD "")).toOption.getD .null
+  check "and one narrowed to leave email out has none" (r.status.toCode == 200 &&
+    !has claims "email" && has claims "name")
+  let wider ← postForm ctx "/token" [("grant_type", "refresh_token"),
+    ("refresh_token", (jsonStr r "refresh_token").getD ""), ("scope", "openid email groups")]
+    (basic "chat" secret)
+  checkEq "nor widened past the original grant" (jsonStr wider "error") (some "invalid_scope")
+  -- A client registered with the default scopes may not ask for it.
+  let r ← get ctx (authorizeUrl "app" (scope := "openid profile email")) aliceCookie
+  checkEq "a client without the email scope is refused it" (param (location r) "error")
+    (some "invalid_scope")
+  let t ← exchange ctx (← obtainCode ctx aliceCookie) appSecret
+  let claims := (← verifyEs256 ctx ((jsonStr t "id_token").getD "")).toOption.getD .null
+  check "and its ID tokens carry no address" (!has claims "email" &&
+    str claims "preferred_username" == some "alice")
+  checkEq "the default scopes are unchanged" defaultScopes ["openid", "profile", "groups"]
+  -- Discovery.
+  let d := bodyJson (← get ctx "/.well-known/openid-configuration")
+  let listed (k : String) := (d.getObjValAs? (List String) k).toOption.getD []
+  check "discovery lists the email scope" ((listed "scopes_supported").contains "email")
+  check "and the email, email_verified and preferred_username claims"
+    (["email", "email_verified", "preferred_username", "name"].all
+      (listed "claims_supported").contains)
+
 /-- The OpenID Connect tests. -/
 def providerTests : IO Unit := do
   discoveryTests
@@ -648,6 +742,7 @@ def providerTests : IO Unit := do
   promptTests
   rpLogoutTests
   scopeAndFamilyTests
+  emailClaimTests
   keyTests
 
 end PyleTests

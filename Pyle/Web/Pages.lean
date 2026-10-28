@@ -334,14 +334,25 @@ def withAccount (ctx : Ctx) (r : Req) (path : String) (act : Session → User �
   let some u ← ctx.store.findUser s.user | return Reply.redirect (signInUrl path)
   act s u
 
+/-- The account's display name and email address, as services are told
+them, read-only: an administrator sets both (`pyle user set`), never the
+user. -/
+def contactDetails (u : User) : String :=
+  let name := (u.displayName.map escape).getD s!"{escape u.name} <span class=\"meta\">(no \
+    display name set)</span>"
+  let email := (u.email.map escape).getD "<span class=\"meta\">none</span>"
+  s!"<p class=\"account-details\" id=\"account-details\">Name: <span id=\"display-name\">\
+    {name}</span> · Email: <span id=\"email\">{email}</span> \
+    <span class=\"meta\">· set by your administrator</span></p>"
+
 /-- `GET /account?added=…`. -/
 def account : Handler := fun ctx r => withAccount ctx r "/account" fun s u => do
   let added := r.queryParams.toOption.bind (lookupOnce · "added")
   let groups := if u.groups.isEmpty then "" else
     s!" <span class=\"meta\">· groups: {escape (", ".intercalate u.groups)}</span>"
   return htmlReply (page "account" "Your account" [] (← accountContent ctx s u added)
-    (aside := s!"<p class=\"signed-in\">Signed in as <strong>{escape u.name}</strong>\
-      {groups}</p>"))
+    (aside := s!"<div class=\"who\">\n<p class=\"signed-in\">Signed in as \
+      <strong>{escape u.name}</strong>{groups}</p>\n{contactDetails u}\n</div>"))
 
 /-! ## Adding a way to sign in -/
 

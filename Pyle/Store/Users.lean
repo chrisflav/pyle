@@ -41,9 +41,15 @@ structure User where
   created : Nat
   /-- A disabled account cannot sign in, and its sessions are not honoured. -/
   disabled : Bool
+  /-- Its email address (migration 8), set by an administrator and never by
+  the user: what the `email` claim says. -/
+  email : Option String := none
+  /-- What the `name` claim says in place of `name`, if set (migration 8). -/
+  displayName : Option String := none
 
 /-- The columns of `users`, in the order `readUser` reads them. -/
-def userColumns : String := "id, handle, name, groups, created, disabled"
+def userColumns : String :=
+  "id, handle, name, groups, created, disabled, email, display_name"
 
 /-- Read a `users` row selected with `userColumns`. -/
 def readUser (stmt : SQLite.Stmt) : IO User := do
@@ -53,7 +59,9 @@ def readUser (stmt : SQLite.Stmt) : IO User := do
     name := ← colText stmt 2
     groups := ← colList stmt 3
     created := ← colNat stmt 4
-    disabled := (← colInt stmt 5) != 0 }
+    disabled := (← colInt stmt 5) != 0
+    email := ← colOpt colText stmt 6
+    displayName := ← colOpt colText stmt 7 }
 
 /-- Whether a user name is acceptable: 1 to 64 characters from lower-case
 letters, digits, `-`, `_` and `.`, starting with a letter or digit.  Names
@@ -65,23 +73,116 @@ def validUserName (name : String) : Bool :=
     cs.all (fun c => c.isLower || c.isDigit || c == '-' || c == '_' || c == '.') &&
     (cs.head?.any fun c => c.isLower || c.isDigit)
 
-/-- Create an account with a fresh random handle.  Fails if the name is
-invalid or taken. -/
-def Store.addUser (s : Store) (name : String) (groups : List String) (now : Nat) :
-    IO User := do
+/-! ## Email addresses and display names
+
+Both are set by an administrator, never by the user (migration 8), and both
+are optional.  An address is checked only for its shape — nothing is sent to
+it — and is stored as given, trimmed; uniqueness ignores the case of ASCII
+letters, as the database's `lower` does, which is what its unique index is
+over. -/
+
+/-- Whether a character is a control character (C0, DEL or C1). -/
+def isControl (c : Char) : Bool :=
+  c.val < 0x20 || (0x7f ≤ c.val && c.val < 0xa0)
+
+/-- The longest email address accepted (RFC 5321's path limit, less the
+angle brackets). -/
+def maxEmailLength : Nat := 254
+
+/-- The longest display name accepted. -/
+def maxDisplayNameLength : Nat := 128
+
+/-- An email address as it is stored, or why it is not one: trimmed, at most
+`maxEmailLength` characters, no whitespace or control characters, exactly one
+`@` with a non-empty local part before it and a domain containing a dot after
+it, not starting or ending with one. -/
+def normalizeEmail (given : String) : Except String String :=
+  let e := given.trimAscii.toString
+  let fail (why : String) : Except String String :=
+    .error s!"'{e}' is not an acceptable email address: {why}"
+  if e.isEmpty then .error "an email address cannot be empty"
+  else if e.length > maxEmailLength then fail s!"longer than {maxEmailLength} characters"
+  else if e.any fun c => c.isWhitespace || isControl c then
+    fail "it contains whitespace or a control character"
+  else match e.splitOn "@" with
+    | [localPart, domain] =>
+      if localPart.isEmpty then fail "nothing before the '@'"
+      else if !domain.contains '.' || domain.startsWith "." || domain.endsWith "." then
+        fail "the domain after the '@' needs a dot, inside it"
+      else .ok e
+    | _ => fail "it needs exactly one '@'"
+
+/-- A display name as it is stored, or why it is not one: trimmed, 1 to
+`maxDisplayNameLength` characters, no control characters. -/
+def normalizeDisplayName (given : String) : Except String String :=
+  let n := given.trimAscii.toString
+  if n.isEmpty then .error "a display name cannot be empty"
+  else if n.length > maxDisplayNameLength then
+    .error s!"a display name is at most {maxDisplayNameLength} characters"
+  else if n.any isControl then .error "a display name cannot contain control characters"
+  else .ok n
+
+/-- `normalizeEmail` and `normalizeDisplayName` of optional values, throwing
+the reason for a bad one. -/
+def normalizeContact (email displayName : Option String) :
+    IO (Option String × Option String) := do
+  let norm (f : String → Except String String) : Option String → IO (Option String)
+    | none => pure none
+    | some v => match f v with
+      | .ok v => pure (some v)
+      | .error why => throw (.userError why)
+  return (← norm normalizeEmail email, ← norm normalizeDisplayName displayName)
+
+/-- The account other than `except` that has this email address, ignoring
+the case of ASCII letters, if there is one: its name. -/
+def emailOwner (c : SQLite) (email : String) (except : Option UserId := none) :
+    IO (Option String) :=
+  queryOne c "SELECT name FROM users WHERE email IS NOT NULL AND lower(email) = lower(?) \
+    AND id IS NOT ?" #[email, Value.opt except] (colText · 0)
+
+/-- The error for an address another account has. -/
+def emailTaken (email owner : String) : IO.Error :=
+  .userError s!"the email address '{email}' is already used by the account '{owner}' \
+    (addresses are compared ignoring case)"
+
+/-- Create an account with a fresh random handle, and optionally an email
+address and a display name (`normalizeEmail`, `normalizeDisplayName`).  Fails
+if the name is invalid or taken, or the address invalid or another account's. -/
+def Store.addUser (s : Store) (name : String) (groups : List String) (now : Nat)
+    (email displayName : Option String := none) : IO User := do
   unless validUserName name do
     throw (.userError s!"'{name}' is not a valid user name (lower-case letters, digits, \
       '-', '_' and '.', at most 64)")
+  let (email, displayName) ← normalizeContact email displayName
   let handle ← Crypto.randomBytes 32
   s.atomically fun c => do
     if (← queryOne c "SELECT 1 FROM users WHERE name = ?" #[name] (colInt · 0)).isSome then
       throw (.userError s!"there is already a user named '{name}'")
+    if let some e := email then
+      if let some owner ← emailOwner c e then throw (emailTaken e owner)
     let some u ← queryOne c
-        s!"INSERT INTO users (handle, name, groups, created) VALUES (?, ?, ?, ?) \
-          RETURNING {userColumns}"
-        #[handle, name, encodeList groups, now] readUser
+        s!"INSERT INTO users (handle, name, groups, created, email, display_name) \
+          VALUES (?, ?, ?, ?, ?, ?) RETURNING {userColumns}"
+        #[handle, name, encodeList groups, now, Value.opt email, Value.opt displayName] readUser
       | throw (.userError "store: the new user was not returned")
     return u
+
+/-- Set or clear an account's email address (`normalizeEmail`).  Fails if the
+address is invalid or another account's.  Whether the account existed. -/
+def Store.setUserEmail (s : Store) (id : UserId) (email : Option String) : IO Bool := do
+  let (email, _) ← normalizeContact email none
+  s.atomically fun c => do
+    if let some e := email then
+      if let some owner ← emailOwner c e (some id) then throw (emailTaken e owner)
+    return (← exec c "UPDATE users SET email = ? WHERE id = ?" #[Value.opt email, id]) > 0
+
+/-- Set or clear an account's display name (`normalizeDisplayName`).  Fails if
+the name is invalid.  Whether the account existed. -/
+def Store.setUserDisplayName (s : Store) (id : UserId) (displayName : Option String) :
+    IO Bool := do
+  let (_, displayName) ← normalizeContact none displayName
+  s.run fun c => return (← exec c "UPDATE users SET display_name = ? WHERE id = ?"
+    #[Value.opt displayName, id]) > 0
 
 /-- Look an account up by name. -/
 def Store.findUserByName (s : Store) (name : String) : IO (Option User) := s.run fun c =>

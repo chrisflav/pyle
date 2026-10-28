@@ -357,9 +357,35 @@ def migration7 : Migration where
     "ALTER TABLE challenges ADD COLUMN kind TEXT NOT NULL DEFAULT ''"
   ]
 
+/-- An email address and a display name per account, for services that know
+people by them (DESIGN.md §5.1, the `email` and `profile` scopes):
+
+* `users.email` is set by an administrator (`pyle user add --email`, `pyle
+  user set --email`, or an invitation), never by the user, which is why ID
+  tokens state it as verified.  It is stored as given, but two accounts
+  cannot share one: the unique index is over `lower(email)`, so addresses
+  that differ only in the case of ASCII letters collide.  An account without
+  one — every account created before this migration — has `NULL`, which the
+  index leaves out;
+* `users.display_name` is what the `name` claim says in place of the account
+  name, when it is set;
+* `invitations` carries both, so that the account an invitation creates gets
+  them.  An invitation issued before this migration has neither. -/
+def migration8 : Migration where
+  version := 8
+  description := "email addresses and display names"
+  statements := [
+    "ALTER TABLE users ADD COLUMN email TEXT",
+    "ALTER TABLE users ADD COLUMN display_name TEXT",
+    "CREATE UNIQUE INDEX users_email ON users(lower(email)) WHERE email IS NOT NULL",
+    "ALTER TABLE invitations ADD COLUMN email TEXT",
+    "ALTER TABLE invitations ADD COLUMN display_name TEXT"
+  ]
+
 /-- Every migration, in order.  Append only. -/
 def migrations : List Migration :=
-  [migration1, migration2, migration3, migration4, migration5, migration6, migration7]
+  [migration1, migration2, migration3, migration4, migration5, migration6, migration7,
+   migration8]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

@@ -449,25 +449,39 @@ structure Invitation where
   created : Nat
   /-- When it stops being accepted. -/
   expires : Nat
+  /-- The email address the account gets, if any (migration 8). -/
+  email : Option String := none
+  /-- The display name the account gets, if any (migration 8). -/
+  displayName : Option String := none
 
-/-- Record an invitation under the hash of its token. -/
+/-- The columns of `invitations` but its token hash, in the order
+`readInvitation` reads them. -/
+def invitationColumns : String :=
+  "user_name, groups, created_by, created, expires, email, display_name"
+
+/-- Read an invitation row selected with `invitationColumns`. -/
+def readInvitation (st : SQLite.Stmt) : IO Invitation := do
+  return { userName := ← colText st 0, groups := ← colList st 1, createdBy := ← colText st 2,
+           created := ← colNat st 3, expires := ← colNat st 4,
+           email := ← colOpt colText st 5, displayName := ← colOpt colText st 6 }
+
+/-- Record an invitation under the hash of its token.  The email address and
+display name are stored as they are given: `SignIn.createInvitation` checks
+them first. -/
 def Store.addInvitation (s : Store) (tokenHash : SecretHash) (i : Invitation) : IO Unit :=
   s.run fun c => do
     discard <| exec c
-      "INSERT INTO invitations (token_hash, user_name, groups, created_by, created, expires) \
-        VALUES (?, ?, ?, ?, ?, ?)"
-      #[tokenHash, i.userName, encodeList i.groups, i.createdBy, i.created, i.expires]
+      "INSERT INTO invitations (token_hash, user_name, groups, created_by, created, expires, \
+        email, display_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      #[tokenHash, i.userName, encodeList i.groups, i.createdBy, i.created, i.expires,
+        Value.opt i.email, Value.opt i.displayName]
 
 /-- Consume an invitation: delete it and return it if it had not expired. -/
 def Store.consumeInvitation (s : Store) (tokenHash : SecretHash) (now : Nat) :
     IO (Option Invitation) := s.run fun c => do
   let row ← queryOne c
-    "DELETE FROM invitations WHERE token_hash = ? \
-      RETURNING user_name, groups, created_by, created, expires"
-    #[tokenHash] fun st => do
-      return { userName := ← colText st 0, groups := ← colList st 1,
-               createdBy := ← colText st 2, created := ← colNat st 3,
-               expires := ← colNat st 4 : Invitation }
+    s!"DELETE FROM invitations WHERE token_hash = ? RETURNING {invitationColumns}"
+    #[tokenHash] readInvitation
   return row.filter (now < ·.expires)
 
 end Store

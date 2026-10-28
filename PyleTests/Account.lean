@@ -759,7 +759,7 @@ def reviewFixTests : IO Unit := withSignInCtx (fun c => { c with allowPasswords 
   -- The pages.
   let page := (← getPage ctx "/account" id).bodyText
   check "\"Signed in as\" is beside the heading"
-    (containsStr page "<div class=\"page-head\">\n<h1>Your account</h1>\n\
+    (containsStr page "<div class=\"page-head\">\n<h1>Your account</h1>\n<div class=\"who\">\n\
       <p class=\"signed-in\">Signed in as <strong>quin</strong>")
   check "dates are written as the prototype does"
     (containsStr page s!"added {Web.formatDate 1700000000}" &&

@@ -73,11 +73,24 @@ know people by them (the `email` and `profile` scopes below).  Only an
 administrator sets them — `user add`, `user set`, or an invitation, which
 hands them to the account it creates — and the account page shows them
 without offering to change them.  An address is trimmed and checked for its
-shape (at most 254 characters, one `@` with something before it and a domain
-with a dot after it, no whitespace or control characters) and stored as
-given, but two accounts cannot share one in any case: `Ann@Example.org` and
-`ann@example.org` are the same address to pyle.  A display name is 1 to 128
-characters without control characters.  Each `user set` change is audited.
+shape (at most 254 characters, printable ASCII without spaces, one `@` with
+something before it and a domain with a dot after it) and stored as given,
+but two accounts cannot share one in any case: `Ann@Example.org` and
+`ann@example.org` are the same address to pyle.  Addresses must be ASCII
+because pyle compares them ignoring ASCII case only, while services compare
+them ignoring Unicode case.  A display name is 1 to 128 characters, without
+control characters, invisible formatting characters (zero-width and
+bidirectional controls and the like), line separators or spaces other than
+the ASCII one.  `user set` changes both in one transaction, and the audit
+log records each change with the old and the new value (`email: a@x.org ->
+b@x.org`); `user add` and `invite` record the address they were given.
+
+> **Warning.**  Services such as Zulip key accounts by email address.  Taking
+> an address from one account (`user set --no-email`, or a new `--email`) and
+> giving it to another hands the second account everything the first had in
+> those services — its messages, its rooms, its admin rights.  Change an
+> address only when it is the same person's, and otherwise retire the old
+> account in each service first.
 
 Keep a copy of the root key: the secrets sealed under it cannot be read
 without it.
@@ -243,6 +256,15 @@ is false, needs both the scope and an address on every account that signs in
 to it.  `--min-acr` is the lowest level a session must
 reach to sign in to the client (a short name or an identifier); it defaults
 to `mfa`, and `client list` shows it.
+
+> **Warning.**  Services such as Zulip key accounts by the `email` claim, so
+> moving an address from one pyle account to another hands the second the
+> first's account in those services (see `user set` under Usage).  And taking
+> `email` away from a client — registering it again without the scope — does
+> not reach grants it already has: refresh-token families granted earlier
+> keep their scope, and go on releasing the address in ID tokens and at
+> `/userinfo` until they expire or are revoked (`client remove` revokes them
+> all).
 
 | Endpoint | |
 | --- | --- |

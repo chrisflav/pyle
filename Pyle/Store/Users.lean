@@ -77,13 +77,42 @@ def validUserName (name : String) : Bool :=
 
 Both are set by an administrator, never by the user (migration 8), and both
 are optional.  An address is checked only for its shape — nothing is sent to
-it — and is stored as given, trimmed; uniqueness ignores the case of ASCII
-letters, as the database's `lower` does, which is what its unique index is
-over. -/
+it — and is stored as given, trimmed.  It must be printable ASCII: uniqueness
+ignores case as the database's `lower` does, which folds ASCII letters only
+(the unique index is over it), while services that key accounts by address
+(Zulip) fold Unicode case, so a non-ASCII address could be two accounts to
+pyle and one to the service.
+
+A display name may be any text people read, but not text that hides or
+reorders what is around it: control and format characters, line and paragraph
+separators and non-ASCII spaces are refused (`hiddenInDisplayName`). -/
 
 /-- Whether a character is a control character (C0, DEL or C1). -/
 def isControl (c : Char) : Bool :=
   c.val < 0x20 || (0x7f ≤ c.val && c.val < 0xa0)
+
+/-- Ranges of code points that a display name may not contain beside the
+control characters: the format characters (general category Cf — soft
+hyphen, zero-width characters, bidirectional controls, invisible operators,
+the byte-order mark, interlinear annotations, tags…), the line and paragraph
+separators, and every space but the ASCII one.  Hard-coded from Unicode 15.1,
+since Lean has no table of categories. -/
+def hiddenRanges : List (Nat × Nat) :=
+  [(0x00a0, 0x00a0), (0x00ad, 0x00ad), (0x0600, 0x0605), (0x061c, 0x061c),
+   (0x06dd, 0x06dd), (0x070f, 0x070f), (0x0890, 0x0891), (0x08e2, 0x08e2),
+   (0x1680, 0x1680), (0x180e, 0x180e), (0x2000, 0x200f), (0x2028, 0x202f),
+   (0x205f, 0x2064), (0x2066, 0x206f), (0x3000, 0x3000), (0xfeff, 0xfeff),
+   (0xfff9, 0xfffb), (0x110bd, 0x110bd), (0x110cd, 0x110cd), (0x13430, 0x1343f),
+   (0x1bca0, 0x1bca3), (0x1d173, 0x1d17a), (0xe0001, 0xe0001), (0xe0020, 0xe007f)]
+
+/-- Whether a character may not appear in a display name: a control
+character, or one of `hiddenRanges`. -/
+def hiddenInDisplayName (c : Char) : Bool :=
+  isControl c || hiddenRanges.any fun r => decide (r.1 ≤ c.toNat ∧ c.toNat ≤ r.2)
+
+/-- Whether a character is printable ASCII other than the space: `!` to `~`. -/
+def isPrintableAscii (c : Char) : Bool :=
+  0x21 ≤ c.val && c.val ≤ 0x7e
 
 /-- The longest email address accepted (RFC 5321's path limit, less the
 angle brackets). -/
@@ -93,17 +122,18 @@ def maxEmailLength : Nat := 254
 def maxDisplayNameLength : Nat := 128
 
 /-- An email address as it is stored, or why it is not one: trimmed, at most
-`maxEmailLength` characters, no whitespace or control characters, exactly one
-`@` with a non-empty local part before it and a domain containing a dot after
-it, not starting or ending with one. -/
+`maxEmailLength` characters, printable ASCII only (`!` to `~`, so no spaces
+either), exactly one `@` with a non-empty local part before it and a domain
+containing a dot after it, not starting or ending with one. -/
 def normalizeEmail (given : String) : Except String String :=
   let e := given.trimAscii.toString
   let fail (why : String) : Except String String :=
     .error s!"'{e}' is not an acceptable email address: {why}"
   if e.isEmpty then .error "an email address cannot be empty"
+  else if e.any isControl then .error "an email address cannot contain control characters"
+  else if !e.all isPrintableAscii then
+    fail "email addresses must be ASCII, printable and without spaces"
   else if e.length > maxEmailLength then fail s!"longer than {maxEmailLength} characters"
-  else if e.any fun c => c.isWhitespace || isControl c then
-    fail "it contains whitespace or a control character"
   else match e.splitOn "@" with
     | [localPart, domain] =>
       if localPart.isEmpty then fail "nothing before the '@'"
@@ -113,13 +143,15 @@ def normalizeEmail (given : String) : Except String String :=
     | _ => fail "it needs exactly one '@'"
 
 /-- A display name as it is stored, or why it is not one: trimmed, 1 to
-`maxDisplayNameLength` characters, no control characters. -/
+`maxDisplayNameLength` characters, none of them `hiddenInDisplayName`. -/
 def normalizeDisplayName (given : String) : Except String String :=
   let n := given.trimAscii.toString
   if n.isEmpty then .error "a display name cannot be empty"
   else if n.length > maxDisplayNameLength then
     .error s!"a display name is at most {maxDisplayNameLength} characters"
-  else if n.any isControl then .error "a display name cannot contain control characters"
+  else if n.any hiddenInDisplayName then
+    .error "a display name cannot contain control or invisible formatting characters, \
+      line separators, or spaces other than the ASCII space"
   else .ok n
 
 /-- `normalizeEmail` and `normalizeDisplayName` of optional values, throwing
@@ -167,22 +199,41 @@ def Store.addUser (s : Store) (name : String) (groups : List String) (now : Nat)
       | throw (.userError "store: the new user was not returned")
     return u
 
-/-- Set or clear an account's email address (`normalizeEmail`).  Fails if the
-address is invalid or another account's.  Whether the account existed. -/
-def Store.setUserEmail (s : Store) (id : UserId) (email : Option String) : IO Bool := do
-  let (email, _) ← normalizeContact email none
+/-- Change an account's email address and display name together: for each,
+`none` leaves it, `some none` clears it and `some (some v)` sets it.  Both new
+values are checked (`normalizeEmail`, `normalizeDisplayName`, the address not
+another account's) before either is written, and both are written in one
+transaction, so a bad one changes nothing.  The account before and after, or
+`none` if there is no such account. -/
+def Store.setUserContact (s : Store) (id : UserId)
+    (email displayName : Option (Option String) := none) : IO (Option (User × User)) := do
+  let (newEmail, newName) ← normalizeContact (email.getD none) (displayName.getD none)
   s.atomically fun c => do
-    if let some e := email then
-      if let some owner ← emailOwner c e (some id) then throw (emailTaken e owner)
-    return (← exec c "UPDATE users SET email = ? WHERE id = ?" #[Value.opt email, id]) > 0
+    let some before ← queryOne c s!"SELECT {userColumns} FROM users WHERE id = ?" #[id]
+        readUser
+      | return none
+    if email.isSome then
+      if let some e := newEmail then
+        if let some owner ← emailOwner c e (some id) then throw (emailTaken e owner)
+      discard <| exec c "UPDATE users SET email = ? WHERE id = ?" #[Value.opt newEmail, id]
+    if displayName.isSome then
+      discard <| exec c "UPDATE users SET display_name = ? WHERE id = ?"
+        #[Value.opt newName, id]
+    let some after ← queryOne c s!"SELECT {userColumns} FROM users WHERE id = ?" #[id]
+        readUser
+      | throw (.userError "store: the account was not read back")
+    return some (before, after)
 
-/-- Set or clear an account's display name (`normalizeDisplayName`).  Fails if
-the name is invalid.  Whether the account existed. -/
+/-- Set or clear an account's email address (`setUserContact`).  Fails if the
+address is invalid or another account's.  Whether the account existed. -/
+def Store.setUserEmail (s : Store) (id : UserId) (email : Option String) : IO Bool :=
+  return (← s.setUserContact id (email := some email)).isSome
+
+/-- Set or clear an account's display name (`setUserContact`).  Fails if the
+name is invalid.  Whether the account existed. -/
 def Store.setUserDisplayName (s : Store) (id : UserId) (displayName : Option String) :
-    IO Bool := do
-  let (_, displayName) ← normalizeContact none displayName
-  s.run fun c => return (← exec c "UPDATE users SET display_name = ? WHERE id = ?"
-    #[Value.opt displayName, id]) > 0
+    IO Bool :=
+  return (← s.setUserContact id (displayName := some displayName)).isSome
 
 /-- Look an account up by name. -/
 def Store.findUserByName (s : Store) (name : String) : IO (Option User) := s.run fun c =>

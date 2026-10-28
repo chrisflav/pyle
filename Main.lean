@@ -13,8 +13,11 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
   creates an account.
 * `pyle user set <name> [--email <e> | --no-email] [--display-name <n> |
   --no-display-name]` sets or clears an account's email address and display
-  name.  Only an administrator sets these, never the user, which is why the
-  `email` claim is stated as verified.
+  name, in one transaction, auditing the old and new values.  Only an
+  administrator sets these, never the user, which is why the `email` claim is
+  stated as verified.  Services such as Zulip key accounts by address: an
+  address freed here and given to another account hands that account
+  whatever the old one had there.
 * `pyle user list` lists the accounts.
 * `pyle invite <name> [--group <group>]… [--ttl <7d>] [--email <e>]
   [--display-name <n>]` prints a link that creates the account `<name>` with
@@ -55,7 +58,10 @@ def usage : String :=
   "  keys rotate [es256|rs256|biscuit] promote the next signing key, announce a new one\n" ++
   "  keys list                         list the signing keys\n" ++
   "  version                           print the version\n\n" ++
-  "The configuration file defaults to $PYLE_CONFIG, then ./pyle.json."
+  "The configuration file defaults to $PYLE_CONFIG, then ./pyle.json.\n\n" ++
+  "Warning: services such as Zulip key accounts by email address.  Moving an address\n" ++
+  "from one account to another (user set) hands the second account whatever the\n" ++
+  "first had in those services."
 
 /-- Take every `--flag value` pair out of an argument list. -/
 def takeFlag (flag : String) : List String → List String × List String
@@ -107,7 +113,8 @@ def userAdd (path : System.FilePath) (name : String) (groups : List String)
   let now ← Http.systemClock
   let u ← store.addUser name groups now email displayName
   discard <| Audit.append store now
-    { event := .userAdded, outcome := .success, userName := some u.name, clientAddress := "cli" }
+    { event := .userAdded, outcome := .success, userName := some u.name, clientAddress := "cli",
+      detail := Audit.contactDetail u.email u.displayName }
   IO.println s!"pyle: created {u.name} (id {u.id})"
   return 0
 
@@ -122,7 +129,8 @@ def fieldChange (what : String) (values : List String) (clear : Bool) :
   | _ :: _, false => .ok (some values.getLast?)
 
 /-- `pyle user set`: set or clear an account's email address and display
-name, each change audited. -/
+name, both in one transaction, each change audited with the old and the new
+value. -/
 def userSet (path : System.FilePath) (name : String) (emails displayNames : List String)
     (noEmail noDisplayName : Bool) : IO UInt32 := do
   let changes := do
@@ -137,24 +145,21 @@ def userSet (path : System.FilePath) (name : String) (emails displayNames : List
     IO.eprintln "pyle: nothing to change: give --email, --no-email, --display-name or \
       --no-display-name"
     return 2
-  -- Both are checked before either is written, so a bad one changes nothing.
-  discard <| Store.normalizeContact (email.getD none) (displayName.getD none)
   let store ← openStore path
-  let some u ← store.findUserByName name
-    | IO.eprintln s!"pyle: there is no user named '{name}'"
-      return 1
+  let noUser : IO UInt32 := do
+    IO.eprintln s!"pyle: there is no user named '{name}'"
+    return 1
+  let some u ← store.findUserByName name | noUser
+  let some (before, after) ← store.setUserContact u.id email displayName | noUser
   let now ← Http.systemClock
-  let audit (detail : String) := discard <| Audit.append store now
-    { event := .userChanged, outcome := .success, userName := some u.name,
-      clientAddress := "cli", detail }
-  if let some e := email then
-    discard <| store.setUserEmail u.id e
-    audit (if e.isSome then "email address set" else "email address removed")
-  if let some d := displayName then
-    discard <| store.setUserDisplayName u.id d
-    audit (if d.isSome then "display name set" else "display name removed")
-  let some u ← store.findUser u.id | return 1
-  IO.println s!"pyle: {u.name}: email {u.email.getD "-"}, display name {u.displayName.getD "-"}"
+  let changes := Audit.contactChanges before after
+  for detail in changes do
+    discard <| Audit.append store now
+      { event := .userChanged, outcome := .success, userName := some u.name,
+        clientAddress := "cli", detail }
+  if changes.isEmpty then IO.println s!"pyle: {u.name}: nothing changed"
+  IO.println s!"pyle: {after.name}: email {after.email.getD "-"}, display name \
+    {after.displayName.getD "-"}"
   return 0
 
 /-- `pyle user list`. -/
@@ -252,9 +257,12 @@ def invite (path : System.FilePath) (name : String) (groups : List String)
   let now ← Http.systemClock
   let url ← SignIn.createInvitation store config.issuer name groups seconds now
     (email := email) (displayName := displayName)
+  let (email, displayName) ← Store.normalizeContact email displayName
+  let contact := Audit.contactDetail email displayName
   discard <| Audit.append store now
     { event := .userChanged, outcome := .success, userName := some name,
-      clientAddress := "cli", detail := "invited" }
+      clientAddress := "cli", detail := if contact.isEmpty then "invited"
+        else s!"invited; {contact}" }
   IO.println url
   return 0
 
@@ -287,6 +295,17 @@ def main (args : List String) : IO UInt32 := do
   let (displayNames, args) := takeFlag "--display-name" args
   let (noEmail, args) := takeSwitch "--no-email" args
   let (noDisplayName, args) := takeSwitch "--no-display-name" args
+  -- The contact flags mean something to three commands, and the clearing ones
+  -- to one; anywhere else they would be silently ignored, so they are refused.
+  let (takesContact, takesClear) := match args with
+    | ["user", "set", _] => (true, true)
+    | ["user", "add", _] | ["invite", _] => (true, false)
+    | _ => (false, false)
+  if (!takesContact && (!emails.isEmpty || !displayNames.isEmpty)) ||
+      (!takesClear && (noEmail || noDisplayName)) then
+    IO.eprintln "pyle: --email and --display-name are for user add, user set and invite; \
+      --no-email and --no-display-name for user set only"
+    return 2
   try
     match args with
     | ["version"] =>

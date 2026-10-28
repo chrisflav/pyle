@@ -213,6 +213,10 @@ def clean (max : Nat) (s : String) : String :=
   (String.ofList (s.toList.filter fun c => c.toNat ≥ 0x20 && c.toNat != 0x7f)).take max
     |>.toString
 
+/-- The longest `detail` kept: room for an email-address change, old and new
+address at their longest (`"email: <254> -> <254>"`). -/
+def maxDetailLength : Nat := 640
+
 /-- A record as it is logged: the user name kept only if it is a valid one,
 every other field cleaned and bounded. -/
 def sanitise (r : Record) : Record :=
@@ -220,7 +224,7 @@ def sanitise (r : Record) : Record :=
     userName := r.userName.map fun n => if validUserName n then n else invalidUserName
     factor := r.factor.map (clean 128)
     clientAddress := clean 64 r.clientAddress
-    detail := clean 256 r.detail }
+    detail := clean maxDetailLength r.detail }
 
 /-- Append a record at time `now`, after `sanitise`.  Reading the last hash and inserting the
 next entry are one transaction, so concurrent appends cannot fork the chain. -/
@@ -257,6 +261,41 @@ def entries (s : Store) : IO (Array Entry) := s.run fun c =>
 /-- Verify the whole stored chain. -/
 def verify (s : Store) : IO (Except String Nat) :=
   return verifyChain (← entries s).toList
+
+/-! ## Email addresses and display names
+
+Services key accounts by their email address, so which account had which
+address, and when, is a question the log must answer: changes record the
+addresses themselves.  An address is printable ASCII without spaces
+(`normalizeEmail`), so `->` and `;` cannot be mistaken inside one; a display
+name has no control characters (`normalizeDisplayName`) and is quoted. -/
+
+/-- An optional address as the log writes it. -/
+def showEmail : Option String → String
+  | some e => e
+  | none => "none"
+
+/-- An optional display name as the log writes it. -/
+def showDisplayName : Option String → String
+  | some n => s!"\"{n}\""
+  | none => "none"
+
+/-- The details of a change to an account's address and display name, one per
+field that changed: `email: a@x -> b@y`, `email: a@x -> none`,
+`display name: "Ann" -> none`. -/
+def contactChanges (before after : User) : List String :=
+  (if before.email != after.email then
+    [s!"email: {showEmail before.email} -> {showEmail after.email}"] else []) ++
+  (if before.displayName != after.displayName then
+    [s!"display name: {showDisplayName before.displayName} -> \
+      {showDisplayName after.displayName}"] else [])
+
+/-- The details of a new account's or an invitation's address and display
+name, those it has, joined with `; `. -/
+def contactDetail (email displayName : Option String) : String :=
+  "; ".intercalate <|
+    (email.map (s!"email: {·}")).toList ++
+    (displayName.map fun n => s!"display name: {showDisplayName (some n)}").toList
 
 end Audit
 end Pyle

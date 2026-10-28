@@ -128,6 +128,16 @@ def contactTests : IO Unit := withCtx fun ctx _ => do
       ("with a NUL", "ann\x00@example.org"),
       ("too long", String.ofList (List.replicate 243 'a') ++ "@example.org")] do
     check s!"an address {why} is refused" (okEmail e).isNone
+  -- pyle folds ASCII case only, services fold Unicode case: two addresses
+  -- distinct to pyle must not be one to them.
+  for e in ["eve@exÄmple.org", "eve@exämple.org", "évé@example.org", "ann b@example.org",
+      "ann@example.org​", "ｅve@example.org"] do
+    check s!"a non-ASCII address ({e}) is refused as such"
+      (match normalizeEmail e with
+       | .error why => (why.splitOn "email addresses must be ASCII").length > 1
+       | .ok _ => false)
+  checkEq "every printable ASCII character but the space may appear"
+    (okEmail "!#$%&'*+-/=?^_`{|}~.\"()<>[]:;,\\0Az@example.org").isSome true
   checkEq "254 characters is the most" ((okEmail (String.ofList (List.replicate 242 'a') ++
     "@example.org")).map (·.length)) (some 254)
   let okName (n : String) := (normalizeDisplayName n).toOption
@@ -137,6 +147,23 @@ def contactTests : IO Unit := withCtx fun ctx _ => do
   check "an empty display name is refused" (okName " ").isNone
   check "one with a newline inside is refused" (okName "Ann\nLee").isNone
   check "one with a C1 control is refused" (okName "Ann\u0085Lee").isNone
+  for (what, c) in [("a zero-width space", '​'), ("a zero-width joiner", '‍'),
+      ("a left-to-right mark", '‎'), ("a right-to-left mark", '‏'),
+      ("a right-to-left override", '‮'), ("a left-to-right embedding", '‪'),
+      ("a right-to-left isolate", '⁧'), ("a pop directional isolate", '⁩'),
+      ("a byte-order mark", '﻿'), ("a soft hyphen", '­'),
+      ("a word joiner", '⁠'), ("an Arabic letter mark", '؜'),
+      ("a line separator", ' '), ("a paragraph separator", ' '),
+      ("a no-break space", ' '), ("an ogham space", ' '),
+      ("an en quad", ' '), ("a hair space", ' '),
+      ("a narrow no-break space", ' '), ("a medium mathematical space", ' '),
+      ("an ideographic space", '　'), ("a language tag", Char.ofNat 0xe0001),
+      ("a tag letter", Char.ofNat 0xe0041)] do
+    check s!"one with {what} inside is refused" (okName s!"Ann{c}Lee").isNone
+  check "even at either end, where trimming does not reach"
+    ((okName " Ann").isNone && (okName "Ann　").isNone)
+  checkEq "but not one with accents, other scripts or emoji" (okName "Ånn Lée 李 🙂 ﷺ")
+    (some "Ånn Lée 李 🙂 ﷺ")
   checkEq "128 characters is the most"
     ((okName (String.ofList (List.replicate 128 'x'))).map (·.length)) (some 128)
   check "129 is too many" (okName (String.ofList (List.replicate 129 'x'))).isNone
@@ -182,6 +209,35 @@ def contactTests : IO Unit := withCtx fun ctx _ => do
   checkEq "lookups are unaffected" ((← s.findUserByName "bob").map (·.id)) (some bob.id)
   checkEq "and the list carries them" ((← s.listUsers).toList.map (·.email))
     [none, some "ANN@example.org", none, none]
+  -- Both fields in one transaction.
+  match ← s.setUserContact ann.id (email := some (some "ann@example.net"))
+      (displayName := some (some "Ann Lee")) with
+  | some (before, after) =>
+    checkEq "both are changed together, and the account before and after is given"
+      ((before.email, before.displayName), (after.email, after.displayName))
+      ((none, some "Ann Lee"), (some "ann@example.net", some "Ann Lee"))
+    checkEq "the audit details name the old and the new address, and only what changed"
+      (Audit.contactChanges before after) ["email: none -> ann@example.net"]
+  | none => check "both are changed together" false
+  check "a bad display name beside a good address" (← throws (s.setUserContact ann.id
+    (email := some (some "ann@example.com")) (displayName := some (some "Ann‮Lee"))))
+  checkEq "changes neither" ((← s.findUser ann.id).map fun u => (u.email, u.displayName))
+    (some (some "ann@example.net", some "Ann Lee"))
+  -- bob has ANN@example.org now.
+  check "a taken address beside a good display name is refused" (← throws (s.setUserContact
+    ann.id (email := some (some "ann@EXAMPLE.org")) (displayName := some none)))
+  checkEq "and changes neither either" ((← s.findUser ann.id).map fun u => (u.email, u.displayName))
+    (some (some "ann@example.net", some "Ann Lee"))
+  checkEq "an unknown account is none" ((← s.setUserContact ⟨999⟩ (some none) none).isNone) true
+  let some ann' ← s.findUser ann.id | check "ann" false
+  checkEq "an address changed and a display name removed are two details"
+    (Audit.contactChanges ann' { ann' with email := some "a@x.org", displayName := none })
+    ["email: ann@example.net -> a@x.org", "display name: \"Ann Lee\" -> none"]
+  checkEq "an address removed" (Audit.contactChanges ann' { ann' with email := none })
+    ["email: ann@example.net -> none"]
+  checkEq "a new account's details" (Audit.contactDetail (some "a@x.org") (some "A B"))
+    "email: a@x.org; display name: \"A B\""
+  checkEq "and none without" (Audit.contactDetail none none) ""
 
 /-- Migration 8 brings a version-7 database forward: its accounts keep
 everything and have no address or display name, and its invitations neither. -/

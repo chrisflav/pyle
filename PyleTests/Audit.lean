@@ -70,7 +70,7 @@ def sanitiseTests : IO Unit := withCtx fun ctx _ => do
   checkEq "a name with NUL is not a name" e.userName (some invalidUserName)
   checkEq "control characters are removed" (e.clientAddress, e.detail) ("1.2.3.4", "abc")
   let e ← append s 3 { base with detail := String.ofList (List.replicate 10000 'd') }
-  checkEq "fields are bounded" e.detail.length 256
+  checkEq "fields are bounded" e.detail.length maxDetailLength
   let e ← append s 4 { base with outcome := .success, userName := some "alice" }
   checkEq "a valid name is kept" e.userName (some "alice")
   checkEq "and the chain still verifies" (← verify s).toOption (some 4)

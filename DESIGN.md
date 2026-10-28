@@ -311,7 +311,13 @@ with an address, and neither for one without; `groups` gives `groups`.
 (`pyle user add`/`user set --email`, or an invitation), never by the user,
 and pyle sends no mail, so "verified" means vouched for by whoever runs pyle.
 Two accounts cannot share an address, compared ignoring case, so a service
-that matches accounts by `email` cannot be handed someone else's.  `email` is
+that matches accounts by `email` cannot be handed someone else's; addresses
+are printable ASCII, since pyle folds ASCII case only and services fold
+Unicode case.  Moving an address between accounts does hand one account
+another's identity in such services, so the audit log records every change
+with the old and the new address.  Display names refuse control and format
+characters (bidirectional and zero-width controls), line separators and
+non-ASCII spaces.  `email` is
 not among a client's default scopes; it is granted only to clients registered
 with it.
 

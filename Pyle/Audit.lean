@@ -93,6 +93,8 @@ inductive Event where
   | invitationRevoked
   /-- Signing keys rotated. -/
   | keysRotated
+  /-- The audit log's hash chain checked from the administration pages. -/
+  | auditVerified
   deriving BEq, Repr, Inhabited
 
 /-- The name stored for an event. -/
@@ -120,6 +122,7 @@ def Event.toString : Event → String
   | .invitationIssued => "invitation-issued"
   | .invitationRevoked => "invitation-revoked"
   | .keysRotated => "keys-rotated"
+  | .auditVerified => "audit-verified"
 
 instance : ToString Event := ⟨Event.toString⟩
 
@@ -297,6 +300,11 @@ def entries (s : Store) : IO (Array Entry) := s.run fun c =>
 def recent (s : Store) (limit offset : Nat) : IO (Array Entry) := s.run fun c =>
   query c s!"SELECT {entryColumns} FROM audit ORDER BY seq DESC LIMIT ? OFFSET ?"
     #[limit, offset] readEntry
+
+/-- The newest entry for an event, if there is one. -/
+def lastOf (s : Store) (event : Event) : IO (Option Entry) := s.run fun c =>
+  queryOne c s!"SELECT {entryColumns} FROM audit WHERE event = ? ORDER BY seq DESC LIMIT 1"
+    #[event.toString] readEntry
 
 /-- How many entries there are. -/
 def count (s : Store) : IO Nat := s.run fun c => do

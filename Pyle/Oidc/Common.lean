@@ -23,6 +23,11 @@ namespace Oidc
 open Http
 open Lean (Json)
 
+/-- The scopes pyle knows: discovery lists them, and a client is registered
+with these only. -/
+def scopesSupported : List String :=
+  ["openid", "profile", "email", "groups", "offline_access", "kleis"]
+
 /-- Percent-encode everything but RFC 3986's unreserved characters, for a
 query parameter's name or value. -/
 def urlEncode (s : String) : String :=

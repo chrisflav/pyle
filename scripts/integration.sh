@@ -197,6 +197,13 @@ for G in "a,b" "a b" "-x"; do
   [ $? -eq 2 ] && grep -q "is not a group name" <<< "$OUT"
   check $? "pyle invite --group '$G' is refused" "$OUT"
 done
+OUT="$("$PYLE" invite bob --ttl 91d 2>&1)"
+[ $? -eq 2 ] && grep -q "an invitation lives at most 90 days" <<< "$OUT"
+check $? "pyle invite --ttl 91d is refused" "$OUT"
+OUT="$("$PYLE" client add odd --redirect "$REDIRECT" --scope openid --scope emails 2>&1)"
+[ $? -ne 0 ] && grep -q "'emails' is not a scope pyle knows" <<< "$OUT" &&
+  ! grep -q "^odd	" <<< "$("$PYLE" client list 2>&1)"
+check $? "pyle client add with an unknown scope is refused" "$OUT"
 "$PYLE" user set alice --email alice@new.example.org > /dev/null 2>&1
 grep -aqF "email: none -> Alice@Example.org" "$WORK"/data/pyle.db* &&
   grep -aqF "email: Alice@Example.org -> alice@new.example.org" "$WORK"/data/pyle.db* &&

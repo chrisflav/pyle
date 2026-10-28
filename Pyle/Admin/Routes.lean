@@ -53,7 +53,8 @@ def routes : List Route := [
   .mk' .post "/admin/clients/add" addClient,
   .mk' .post "/admin/clients/update" updateClient,
   .mk' .post "/admin/clients/remove" removeClient,
-  .mk' .post "/admin/keys/rotate" rotateKeys
+  .mk' .post "/admin/keys/rotate" rotateKeys,
+  .mk' .post "/admin/audit/verify" verifyAudit
 ]
 
 end Admin

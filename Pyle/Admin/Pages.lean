@@ -20,7 +20,7 @@ What an administrator sees under `/admin`, driven by `/admin/assets/admin.js`
   clients, registering one (its secret shown once), changing one, removing
   one.
 * `GET /admin/audit?page=<n>` — the audit log, newest first, fifty entries a
-  page, and whether its hash chain verifies.
+  page, and the last check of its hash chain, which a button repeats.
 * `GET /admin/keys` — the signing keys and their states, and rotating them.
 
 Every page answers `404` to anyone but an administrator, and sends an
@@ -318,18 +318,30 @@ def clientPage : Handler := fun ctx r => withAdministratorPage ctx r fun _ _ => 
 /-- How many entries a page of the audit log shows. -/
 def auditPageSize : Nat := 50
 
+/-- The page of the audit log a query asks for, from 1 to `pages`: anything
+else — no number, zero, past the last page, a number too large for the
+database — is the nearest of those. -/
+def auditPageOf (query : Option String) (pages : Nat) : Nat :=
+  min (max ((query.bind String.toNat?).getD 1) 1) (max pages 1)
+
 /-- `GET /admin/audit?page=<n>`: the newest entries first, a page at a time,
-and whether the whole chain verifies. -/
+and the last check of the chain, with a button for another
+(`POST /admin/audit/verify`): checking reads every entry, so viewing does
+not. -/
 def auditPage : Handler := fun ctx r => withAdministratorPage ctx r fun _ _ => do
-  let n := ((r.queryParams.toOption.bind (lookupOnce · "page")).bind String.toNat?).getD 1
-  let n := max n 1
   let total ← Audit.count ctx.store
   let pages := max 1 ((total + auditPageSize - 1) / auditPageSize)
+  let n := auditPageOf (r.queryParams.toOption.bind (lookupOnce · "page")) pages
   let entries ← Audit.recent ctx.store auditPageSize ((n - 1) * auditPageSize)
-  let chain := match ← Audit.verify ctx.store with
-    | .ok k => s!"<p id=\"audit-chain\">The log's {k} entries form an unbroken chain.</p>\n"
-    | .error e => s!"<p id=\"audit-chain\" class=\"notice\"><strong>The audit log is broken: \
-        {escape e}</strong></p>\n"
+  let chain := match ← Audit.lastOf ctx.store .auditVerified with
+    | none => "<p id=\"audit-chain\">The chain has not been checked from these pages yet.</p>\n"
+    | some e =>
+      let by_ := (e.userName.map fun u => s!" by {escape u}").getD ""
+      if e.outcome == "success" then
+        s!"<p id=\"audit-chain\">Last checked {formatTime e.time}{by_}: {escape e.detail}.</p>\n"
+      else
+        s!"<p id=\"audit-chain\" class=\"notice\"><strong>Last checked {formatTime e.time}\
+          {by_}: {escape e.detail}</strong></p>\n"
   let rows := entries.toList.map fun e =>
     row [toString e.seq, formatTime e.time, escape e.event, optText e.userName,
       optText e.factor, escape e.clientAddress, escape e.outcome, escape e.detail]
@@ -341,11 +353,14 @@ def auditPage : Handler := fun ctx r => withAdministratorPage ctx r fun _ _ => d
     (if n < pages then " " ++ link (n + 1) "Older →" else "") ++ "</p>\n"
   return adminPage "admin-audit" "Audit log" "audit" [] <|
     chain ++
+    "<div class=\"buttons\">\n<button type=\"button\" id=\"audit-verify\" class=\"secondary\">\
+      Check the chain now</button>\n</div>\n" ++
     "<p class=\"hint\">An entry made from these pages names the administrator as its account, \
       and what was changed at the start of its detail.</p>\n" ++
     nav ++
     table "Audit log" ["#", "Time", "Event", "Account", "Factor", "From", "Outcome", "Detail"]
       rows "No entries." ++ nav
+
 
 /-! ## Signing keys -/
 

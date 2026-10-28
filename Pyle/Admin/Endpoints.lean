@@ -28,14 +28,15 @@ read and proved about:
   do: `403 step_up_required` otherwise.
 
 Every endpoint is a `POST` and takes part in the `Origin` check, and is counted
-against the rate limiter for the administrator's account and address
-(`SignIn.limited`): a refused request counts as a failure, a successful one
-does not.
+against the rate limiter for the administrator's account and address, under
+keys apart from those of sign-ins (`limiterKeys`): a refused request counts
+as a failure, a successful one does not, and neither slows down a sign-in.
 
 **The last administrator.**  An administrator cannot be disabled, removed or
-taken out of `adminGroup` when no other enabled administrator would be left
-(`leavesAnotherAdministrator`): `409 last_administrator`.  This holds for an
-administrator acting on their own account too.  The check and the change are
+taken out of `adminGroup` when no other enabled administrator who can sign
+in at `phr` would be left (`leavesAnotherAdministrator`): `409
+last_administrator`.  This holds for an administrator acting on their own
+account too.  The check and the change are
 one transaction.
 
 **Secrets.**  A confidential client's secret and an invitation's link are in
@@ -57,6 +58,7 @@ nothing.
 | `/admin/clients/update` | `{"id", "name"?, "redirectUris"?, "postLogoutUris"?, "scopes"?, "minAcr"?}` | `204` |
 | `/admin/clients/remove` | `{"id", "confirm"}` (`confirm` = `id`) | `204` |
 | `/admin/keys/rotate` | `{"use"?}` (`es256`, `rs256`, `biscuit`; all three without) | `{"rotated"}` |
+| `/admin/audit/verify` | `{}` | `{"ok", "entries"}` or `{"ok": false, "error"}` |
 -/
 
 namespace Pyle
@@ -131,11 +133,19 @@ def decision (ctx : Ctx) (r : Req) (mutating : Bool) :
 /-- The `404` of a path that does not exist, word for word the router's. -/
 def hidden : Reply := Reply.error .notFound "not_found"
 
+/-- The rate-limiter keys of administrators' changes: the account and the
+address, under names of their own, so that an administrator's refused
+changes are counted apart from sign-ins — ten `409`s do not slow down the
+next sign-in, from the account or the address — while still being counted
+per account and per address (an IPv6 address by its /64). -/
+def limiterKeys (account address : String) : String × String :=
+  ("admin:" ++ account, "admin:" ++ addressPrefix address)
+
 /-- Run `act` for an administrator's change: `404` for anyone else, `403
 step_up_required` below `phr` or without a fresh sign-in, then the body as
-JSON, counted against the rate limiter for the administrator (`event` is what
-a refusal by the limiter is audited as).  A reply below `400` takes the
-attempt back. -/
+JSON, counted against the rate limiter for the administrator under keys of
+its own (`limiterKeys`); a refusal by the limiter is audited as `event`.  A
+reply below `400` takes the attempt back. -/
 def withAdministrator (ctx : Ctx) (r : Req) (event : Audit.Event)
     (act : Session → User → Json → IO Reply) : IO Reply := do
   match ← decision ctx r (mutating := true) with
@@ -143,9 +153,14 @@ def withAdministrator (ctx : Ctx) (r : Req) (event : Audit.Event)
     let j ← match jsonBody r with
       | .ok j => pure j
       | .error rep => return rep
-    limited ctx r event (some u.name) fun lim attempt => do
+    let (account, address) := limiterKeys u.name r.clientAddress
+    match ← ctx.limiter.tryAcquire (some account) address (← ctx.clock) with
+    | .error wait =>
+      Audit.log ctx r event .refused (userName := some u.name) (detail := "rate limited")
+      return rateLimited wait
+    | .ok attempt =>
       let rep ← act s u j
-      if rep.status.toCode < 400 then lim.succeed attempt
+      if rep.status.toCode < 400 then ctx.limiter.succeed attempt
       return rep
   | (.hidden, _) | (_, none) => return hidden
   | _ => return stepUpRequired
@@ -317,7 +332,7 @@ def setGroups : Handler := fun ctx r => withAdministrator ctx r .userChanged fun
   let out ← ctx.store.atomically fun c => do
     let some cur ← accountIn c u.id | return Outcome.missing
     if cur.groups.contains group && !groups.contains group &&
-        !(← leavesAnotherAdministrator c group u.id) then
+        !(← leavesAnotherAdministrator c group ctx.config.allowPasswords u.id) then
       auditIn c now r admin .userChanged .refused
         s!"account {u.name}: leaving {group} would leave no administrator"
       return .lastAdministrator
@@ -340,7 +355,7 @@ def disable : Handler := fun ctx r => withAdministrator ctx r .userChanged fun s
   let group := ctx.config.adminGroup
   let now ← ctx.clock
   let out ← ctx.store.atomically fun c => do
-    unless ← leavesAnotherAdministrator c group u.id do
+    unless ← leavesAnotherAdministrator c group ctx.config.allowPasswords u.id do
       auditIn c now r admin .userChanged .refused
         s!"account {u.name}: disabling it would leave no administrator"
       return Outcome.lastAdministrator
@@ -404,7 +419,7 @@ def remove : Handler := fun ctx r => withAdministrator ctx r .userRemoved fun s 
   let group := ctx.config.adminGroup
   let now ← ctx.clock
   let out ← ctx.store.atomically fun c => do
-    unless ← leavesAnotherAdministrator c group u.id do
+    unless ← leavesAnotherAdministrator c group ctx.config.allowPasswords u.id do
       auditIn c now r admin .userRemoved .refused
         s!"account {u.name}: removing it would leave no administrator"
       return Outcome.lastAdministrator
@@ -496,20 +511,20 @@ def addClient : Handler := fun ctx r => withAdministrator ctx r .clientAdded fun
     orReply (stringsOf j "postLogoutUris") fun postLogout => orReply (stringsOf j "scopes")
     fun scopes => orReply (flag j "public") fun isPublic => orReply (flag j "rs256") fun rs256 =>
     orReply (levelOf j "minAcr") fun minAcr => do
-  if (← ctx.store.findClient id).isSome then
-    return Reply.error .conflict "client_exists"
-      s!"there is already a client '{id}'; remove it first to register it again"
   let settings : ClientSettings :=
     { idTokenAlg := if rs256 then "RS256" else "ES256",
       postLogoutRedirectUris := postLogout.getD [], minAcr := minAcr.getD .mfa }
   let name := (name.map (·.trimAscii.toString)).getD id
-  let res : Except String (Option String) ←
-    tryCatch (Except.ok <$> Oidc.registerClient ctx.store id name (redirects.getD [])
+  let res : Except String (Option (Option String)) ←
+    tryCatch (Except.ok <$> Oidc.addClient ctx.store id name (redirects.getD [])
         (scopes.getD []) isPublic settings (← ctx.clock))
       (fun e => pure (.error (toString e)))
   match res with
   | .error why => return badRequest why
-  | .ok secret =>
+  | .ok none =>
+    return Reply.error .conflict "client_exists"
+      s!"there is already a client '{id}'; remove it first to register it again"
+  | .ok (some secret) =>
     let some c ← ctx.store.findClient id | return noSuchClient
     audit ctx r admin .clientAdded .success <|
       s!"client {id}: registered, " ++ clientSummary
@@ -523,7 +538,8 @@ post-logout addresses, scopes and minimum level (`Oidc.updateClient`); what
 the body leaves out stays. -/
 def updateClient : Handler := fun ctx r =>
     withAdministrator ctx r .clientChanged fun _ admin j => do
-  let some id := strField j "id" | return badRequest "'id' is missing"
+  let some id := (strField j "id").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+    | return badRequest "'id' is missing"
   let some c ← ctx.store.findClient id | return noSuchClient
   let settings := (← ctx.store.clientSettings id).getD {}
   orReply (optionalText j "name") fun name => orReply (stringsOf j "redirectUris") fun redirects =>
@@ -563,8 +579,9 @@ as `pyle client remove` does.  `confirm` must be the client's id, as
 typed. -/
 def removeClient : Handler := fun ctx r =>
     withAdministrator ctx r .clientRemoved fun _ admin j => do
-  let some id := strField j "id" | return badRequest "'id' is missing"
-  if strField j "confirm" != some id then
+  let some id := (strField j "id").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+    | return badRequest "'id' is missing"
+  if (strField j "confirm").map (·.trimAscii.toString) != some id then
     return Reply.error .badRequest "confirmation_required"
       "type the client's id to confirm that it is to be removed"
   unless ← ctx.store.removeClient id do return noSuchClient
@@ -594,6 +611,23 @@ def rotateKeys : Handler := fun ctx r => withAdministrator ctx r .keysRotated fu
     out := out.push (Json.mkObj [("use", u.name), ("promoted", toJson rot.promoted),
       ("announced", rot.announced)])
   return .json (Json.mkObj [("rotated", Json.arr out)])
+
+/-! ## The audit log -/
+
+/-- `POST /admin/audit/verify`: check the whole hash chain (`Audit.verify`),
+which reads every entry and so is not done on every view of the audit page,
+and record the result as an `audit-verified` entry, which the page shows.
+The answer is `{"ok", "entries"}` or `{"ok": false, "error"}`; a broken
+chain is not a failed request. -/
+def verifyAudit : Handler := fun ctx r =>
+    withAdministrator ctx r .auditVerified fun _ admin _ => do
+  match ← Audit.verify ctx.store with
+  | .ok n =>
+    audit ctx r admin .auditVerified .success s!"audit log: {n} entries form an unbroken chain"
+    return .json (Json.mkObj [("ok", toJson true), ("entries", toJson n)])
+  | .error e =>
+    audit ctx r admin .auditVerified .failure s!"audit log: broken: {e}"
+    return .json (Json.mkObj [("ok", toJson false), ("error", Json.str e)])
 
 end Admin
 end Pyle

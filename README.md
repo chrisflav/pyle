@@ -183,10 +183,13 @@ The rule, for every page and endpoint under `/admin`:
   to one's own account do: `403 step_up_required` otherwise.  Pages never
   change anything; every change is a JSON `POST` under the same `Origin`
   check as the account endpoints, and rate limited per administrator and
-  address like them: refused requests count, and too many are `429`.
-* The last enabled administrator cannot be disabled, removed or taken out of
-  the group, by another administrator or by themselves: `409
-  last_administrator`.  The command line is not held to this — it is how a
+  address: refused requests count, and too many are `429`.  They are counted
+  apart from sign-ins, so refused changes never slow down signing in.
+* The last enabled administrator who can sign in at `phr` — who has a
+  passkey or a security key that verifies them — cannot be disabled, removed
+  or taken out of the group, by another administrator or by themselves: `409
+  last_administrator`.  An administrator with only an authenticator app could
+  not use the pages, and does not count.  The command line is not held to this — it is how a
   deployment that has lost its administrators gets one back
   (`pyle user add` or `pyle invite … --group admin`).
 
@@ -204,7 +207,7 @@ lists; pending invitations are named by the hash of their token.
 | `GET /admin/users/<name>` | one account: email address and display name, groups, disable or enable, end its sessions (each, or all with its tokens), its ways in, remove (typing its name to confirm) |
 | `GET /admin/invitations` | make an invitation (name, email address, display name, groups, lifetime) and see its link once; the pending ones, without their tokens, each can be withdrawn |
 | `GET /admin/clients`, `GET /admin/clients/<id>` | the OpenID Connect clients (id, name, kind, ID-token algorithm, minimum level, scopes, redirect and post-logout URIs); register one as `client add` does, its secret shown once; change its name, addresses, scopes and minimum level; remove it (typing its id) |
-| `GET /admin/audit?page=<n>` | the audit log, newest first, fifty entries a page, and whether its chain verifies |
+| `GET /admin/audit?page=<n>` | the audit log, newest first, fifty entries a page (a page past the last is the last), and the last check of its chain, with a button for another: viewing does not read the whole log |
 | `GET /admin/keys` | the signing keys and their states; rotate one use or all three |
 | `GET /admin/assets/admin.js` | the pages' script, for administrators only |
 
@@ -216,12 +219,13 @@ lists; pending invitations are named by the hash of their token.
 | `/admin/users/revoke` | `{"name"}` | `200` as above: sessions, refresh tokens and pending codes, as `sessions revoke --user` |
 | `/admin/users/sessions/end` | `{"name", "handle"}` | `204` |
 | `/admin/users/remove` | `{"name", "confirm"}`, `confirm` the name again | `200` as above; `400 confirmation_required`; `409 last_administrator` |
-| `/admin/invitations/create` | `{"name", "email"?, "displayName"?, "groups"?, "ttl"?}` (`7d` by default) | `201 {"url", "name", "expires"}`; `409 name_taken` |
+| `/admin/invitations/create` | `{"name", "email"?, "displayName"?, "groups"?, "ttl"?}` (`7d` by default, at most `90d`, as for `pyle invite`) | `201 {"url", "name", "expires"}`; `409 name_taken` |
 | `/admin/invitations/revoke` | `{"handle"}` | `204` |
-| `/admin/clients/add` | `{"id", "name"?, "redirectUris", "postLogoutUris"?, "scopes"?, "public"?, "rs256"?, "minAcr"?}` | `201 {"id", "secret"?}`; `409 client_exists` (an id is not replaced, as `client add` would) |
-| `/admin/clients/update` | `{"id", "name"?, "redirectUris"?, "postLogoutUris"?, "scopes"?, "minAcr"?}`, what is left out staying | `204` |
+| `/admin/clients/add` | `{"id", "name"?, "redirectUris", "postLogoutUris"?, "scopes"?, "public"?, "rs256"?, "minAcr"?}` | `201 {"id", "secret"?}`; `409 client_exists`: an id is checked and inserted in one transaction, and never replaced, as `pyle client add` replaces it |
+| `/admin/clients/update` | `{"id", "name"?, "redirectUris"?, "postLogoutUris"?, "scopes"?, "minAcr"?}`, what is left out staying; scopes given must include `openid` (an empty list is refused, not read as the defaults) | `204` |
 | `/admin/clients/remove` | `{"id", "confirm"}`, `confirm` the id again | `204` |
 | `/admin/keys/rotate` | `{"use"?}`: `es256`, `rs256` or `biscuit`, all three without | `{"rotated": [{"use", "promoted", "announced"}]}` |
+| `/admin/audit/verify` | `{}` | `{"ok", "entries"}` or `{"ok": false, "error"}`, and an `audit-verified` entry the audit page shows |
 
 `pyle root-key rotate` and `pyle sessions revoke --all` stay on the command
 line, and the keys page says so: both reach every account at once, and are
@@ -230,7 +234,7 @@ what to do after a leak (see "If a backup leaks"), from a shell on the host.
 ### Signing in
 
 Accounts are created by invitation: `pyle invite <name>` prints
-`<issuer>/invite/<token>` (valid for seven days unless `--ttl` says otherwise;
+`<issuer>/invite/<token>` (valid for seven days unless `--ttl` says otherwise, at most ninety;
 only the token's hash is stored).  Whoever opens it creates the account's
 first passkey, is told the account is ready, and signs in with it from there.
 
@@ -367,7 +371,9 @@ pyle client remove taxis
 ```
 
 `client add` prints a confidential client's secret once; pyle keeps only its
-hash.  Scopes default to `openid profile groups`; `profile` releases the
+hash.  Run again with an id already registered, it replaces that client and
+its secret (the administration pages refuse instead).  Scopes default to `openid profile groups`, and must be ones pyle knows
+(`openid`, `profile`, `email`, `groups`, `offline_access`, `kleis`); `profile` releases the
 `name` claim (the account's display name, or its name if it has none) and
 `preferred_username` (always the account name); `email` releases `email` and
 `email_verified` — always `true`, since only an administrator sets an

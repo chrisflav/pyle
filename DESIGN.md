@@ -322,8 +322,9 @@ and a weaker one is sent round the step-up of above at `phr` rather than
 refused; and every change also needs a sign-in within the step-up window,
 as an account change does (`Admin.rule_allow`).  Changes are JSON posts
 under the `Origin` check and the rate limiter; pages change nothing.  The
-last enabled administrator cannot be disabled, removed or taken out of the
-group, checked in the transaction that makes the change; the command line is
+last enabled administrator who can sign in at `phr` cannot be disabled,
+removed or taken out of the group, checked in the transaction that makes the
+change; the command line is
 not held to it, since it is how a deployment without administrators gets one
 back.  An administrator's change is audited with the administrator as the
 entry's account and what was changed at the start of its detail.  A

@@ -234,6 +234,16 @@ function setupAdminKeys() {
   });
 }
 
+// The audit log: checking the chain reads every entry, so it is asked for.
+function setupAdminAudit() {
+  on('audit-verify', 'click', async function () {
+    try {
+      await adminAct('/admin/audit/verify', {});
+      again();
+    } catch (e) { failed(e); }
+  });
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   const body = document.body;
   if (body.dataset.page === 'admin-user') setupAdminUser(body);
@@ -241,6 +251,7 @@ document.addEventListener('DOMContentLoaded', function () {
   else if (body.dataset.page === 'admin-clients') setupAdminClients();
   else if (body.dataset.page === 'admin-client') setupAdminClient(body);
   else if (body.dataset.page === 'admin-keys') setupAdminKeys();
+  else if (body.dataset.page === 'admin-audit') setupAdminAudit();
 });"##
 
 end Admin

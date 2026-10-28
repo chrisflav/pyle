@@ -27,10 +27,6 @@ namespace Oidc
 open Http
 open Lean (Json)
 
-/-- The scopes pyle knows. -/
-def scopesSupported : List String :=
-  ["openid", "profile", "email", "groups", "offline_access", "kleis"]
-
 /-- The claims ID tokens and `/userinfo` carry. -/
 def claimsSupported : List String :=
   ["iss", "sub", "aud", "exp", "iat", "auth_time", "nonce", "amr", "acr", accountAcrClaim, "name",

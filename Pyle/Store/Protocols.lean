@@ -47,6 +47,22 @@ def Store.setClientSettings (s : Store) (id : String) (cs : ClientSettings) : IO
       WHERE id = ?"
     #[cs.idTokenAlg, encodeList cs.postLogoutRedirectUris, cs.minAcr.identifier, id]) > 0
 
+/-- Register a new client with its settings, in one transaction, unless its
+id is taken: then nothing is written.  Unlike `Store.putClient` it never
+replaces a client, so two registrations racing for one id cannot both
+succeed, nor one overwrite the other's secret.  Whether it was registered. -/
+def Store.addClient (s : Store) (cl : Client) (cs : ClientSettings) : IO Bool :=
+  s.atomically fun c => do
+    if (← queryOne c "SELECT 1 FROM clients WHERE id = ?" #[cl.id] (colInt · 0)).isSome then
+      return false
+    discard <| exec c
+      "INSERT INTO clients (id, name, secret_hash, redirect_uris, scopes, created, id_token_alg, \
+        post_logout_redirect_uris, min_acr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      #[cl.id, cl.name, Value.opt cl.secretHash, encodeList cl.redirectUris,
+        encodeList cl.scopes, cl.created, cs.idTokenAlg, encodeList cs.postLogoutRedirectUris,
+        cs.minAcr.identifier]
+    return true
+
 /-- Change what can change about a client without registering it again — its
 name, redirect URIs, scopes, post-logout addresses and minimum level — in one
 statement.  Its id, secret, ID-token algorithm and the grants it holds stay as

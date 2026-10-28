@@ -1073,9 +1073,11 @@ def run(a):
     check(r.status == 200, "and removes her account", repr(r))
     rc, out = pyle("user", "list")
     check(rc == 0 and "carol" not in out, "pyle user list agrees", out)
+    r = browser.post_json("/admin/audit/verify", {})
+    check(r.status == 200 and r.json().get("ok") is True, "she checks the audit chain", repr(r))
     r = browser.get("/admin/audit")
     check(r.status == 200 and "unbroken chain" in r.text and "user-removed" in r.text,
-          "the audit page shows it, and the chain verifies", repr(r))
+          "the audit page shows the removal, and the check", repr(r))
 
 
 def main():

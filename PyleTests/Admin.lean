@@ -69,11 +69,19 @@ def adminAccessTests : IO Unit := withCtx fun ctx clock => do
   let nothing ← getPage ctx "/nothing-here"
   let same (r : Reply) : Bool :=
     r.status.toCode == 404 && r.bodyText == nothing.bodyText &&
-      r.contentType == nothing.contentType
+      r.contentType == nothing.contentType && r.headers == nothing.headers
   let root ← ctx.store.addUser "root" ["admin"] 1
   let (rid, rk) ← sessionFor ctx root
   let bob ← ctx.store.addUser "bob" ["staff"] 1
   let (bid, _) ← sessionFor ctx bob
+  -- HEAD and OPTIONS, which no route takes, would be 405 with an Allow header.
+  for m in [Std.Http.Method.head, .options] do
+    for cookie in [none, some bid] do
+      for p in ["/admin", "/admin/users/bob", "/admin/assets/admin.js"] do
+        let r ← Server.route ctx (Req.mk' m p (cookieHeader cookie))
+        check s!"{m} {p} is the 404 of nothing, signed in: {cookie.isSome}" (same r)
+  checkEq "and an administrator's is the router's 405"
+    ((← Server.route ctx (Req.mk' .head "/admin" (cookieHeader (some rid)))).status.toCode) 405
   -- No session at all.
   for p in adminPages "bob" "none" ++ ["/admin/assets/admin.js", "/admin/nothing",
       "/admin/users/bob/more", "//admin", "/admin/"] do
@@ -201,6 +209,18 @@ def lastAdminTests : IO Unit := withCtx fun ctx _ => do
     ((← audited ctx "root" "user-removed" "refused" "account root: removing it") &&
       (← audited ctx "root" "user-changed" "refused" "account root: leaving admin"))
   check "she keeps her session" ((← getPage ctx "/admin" rid).status.toCode == 200)
+  -- An administrator who could not sign in at phr does not count.
+  let tess ← ctx.store.addUser "tess" ["admin"] 1
+  let tk ← SoftKey.new (uv := false)
+  enrol ctx tess tk
+  discard <| giveTotp ctx tess
+  check "beside an administrator with only a touch-only key and an app, still the last"
+    (last (← adminPost ctx "/admin/users/groups" [("name", "root"),
+      ("groups", toJson ["staff"])] rid) &&
+      last (← adminPost ctx "/admin/users/disable" [("name", "root")] rid))
+  check "but tess, who cannot use the pages, may be taken out of the group"
+    ((← adminPost ctx "/admin/users/groups" [("name", "tess"), ("groups", toJson ([] : List String))]
+      rid).status.toCode == 200)
   -- With a second administrator, each of these is allowed.
   let ann ← ctx.store.addUser "ann" ["admin"] 1
   let (aid, _) ← sessionFor ctx ann
@@ -384,10 +404,21 @@ def adminInvitationTests : IO Unit := withCtx fun ctx _ => do
       ([("name", "eve"), ("ttl", "soon")], "a lifetime that is none"),
       ([("name", "eve"), ("email", "x")], "a bad address"),
       ([("name", "eve"), ("groups", toJson ["a,b"])], "a bad group"),
+      ([("name", "eve"), ("ttl", "91d")], "a lifetime over ninety days"),
+      ([("name", "eve"), ("ttl", "7777h")], "or in hours"),
+      ([("name", "eve"), ("ttl", "99999999999999999999999999d")], "a lifetime past any clock"),
       ([], "no name")] : List (List (String × Json) × String)) do
     checkEq s!"{what} is refused"
       (← adminPost ctx "/admin/invitations/create" body rid).status.toCode 400
+  let long ← adminPost ctx "/admin/invitations/create" [("name", "eve"), ("ttl", "91d")] rid
+  check "saying how long an invitation may live"
+    (containsStr long.bodyText "an invitation lives at most 90 days")
   checkEq "none of which left an invitation" (← ctx.store.listInvitations now).size 1
+  check "and createInvitation refuses it for the command line too"
+    (← throws (SignIn.createInvitation ctx.store ctx.config.issuer "eve" [] (91 * 86400) now))
+  let ninety ← adminPost ctx "/admin/invitations/create" [("name", "ninety"), ("ttl", "90d")] rid
+  checkEq "ninety days will do" ninety.status.toCode 201
+  checkEq "two pending now" (← ctx.store.listInvitations now).size 2
   let some (h, _) := pending[0]? | check "pending" false
   let w ← adminPost ctx "/admin/invitations/revoke" [("handle", Admin.invitationHandle h)] rid
   checkEq "withdrawing it" w.status.toCode 204
@@ -456,9 +487,39 @@ def adminClientTests : IO Unit := withCtx fun ctx _ => do
       ([("id", "x"), ("redirectUris", toJson ["https://x.example/"]),
         ("scopes", toJson ["profile"])], "scopes without openid"),
       ([("id", "x"), ("redirectUris", toJson ["https://x.example/"]), ("minAcr", "gold")],
-        "a level that is none")] : List (List (String × Json) × String)) do
+        "a level that is none"),
+      ([("id", "x"), ("redirectUris", toJson ["https://x.example/"]),
+        ("scopes", toJson ["openid", "admin"])], "a scope pyle does not know")]
+      : List (List (String × Json) × String)) do
     checkEq s!"{what} is refused" (← adminPost ctx "/admin/clients/add" body rid).status.toCode 400
   check "none of which registered anything" ((← ctx.store.findClient "x").isNone)
+  let unknown ← adminPost ctx "/admin/clients/add" [("id", "x"),
+    ("redirectUris", toJson ["https://x.example/"]), ("scopes", toJson ["openid", "emails"])] rid
+  check "an unknown scope is named, with the ones pyle knows"
+    (containsStr unknown.bodyText "'emails' is not a scope pyle knows (it knows openid, profile, \
+      email, groups, offline_access, kleis)")
+  check "and the command line's registerClient refuses it too"
+    (← throws (Oidc.registerClient ctx.store "x" "X" ["https://x.example/"] ["openid", "emails"]
+      false {} 1))
+  -- Registering an id that is taken changes nothing, however the requests race.
+  let some before ← ctx.store.findClient "wiki" | check "wiki" false
+  let tasks ← (List.range 4).mapM fun _ => IO.asTask (Oidc.addClient ctx.store "wiki" "Again"
+    ["https://wiki.example.org/cb"] [] false {} 2)
+  let results ← tasks.mapM fun t => IO.ofExcept t.get
+  check "an id that is taken is never registered again" (results.all (·.isNone))
+  check "and keeps its secret and name"
+    ((← ctx.store.findClient "wiki").map (fun c => (c.secretHash == before.secretHash, c.name)) ==
+      some (true, "<b>Wiki</b>"))
+  let racers ← (List.range 4).mapM fun _ => IO.asTask (Oidc.addClient ctx.store "race" "Race"
+    ["https://race.example.org/cb"] [] false {} 2)
+  let won ← racers.mapM fun t => IO.ofExcept t.get
+  checkEq "of four racing for a new id, one registers it" (won.filter (·.isSome)).length 1
+  let winner := (won.findSome? id).bind id
+  check "and its secret is the one stored"
+    ((← ctx.store.findClient "race").bind (·.secretHash) == winner.map Oidc.tokenHash)
+  check "pyle client add still replaces a client, with a new secret"
+    ((← Oidc.registerClient ctx.store "race" "Race" ["https://race.example.org/cb"] [] false {} 3)
+      |>.any fun s => some (Oidc.tokenHash s) != winner.map Oidc.tokenHash)
   -- Changing.
   let u ← adminPost ctx "/admin/clients/update" [("id", "wiki"),
     ("redirectUris", toJson ["https://wiki.example.org/cb2", "https://wiki.example.org/cb"]),
@@ -480,11 +541,23 @@ def adminClientTests : IO Unit := withCtx fun ctx _ => do
     (some c2.redirectUris)
   checkEq "an unknown client is a 404"
     (← adminPost ctx "/admin/clients/update" [("id", "nope")] rid).status.toCode 404
+  let empty ← adminPost ctx "/admin/clients/update" [("id", "wiki"),
+    ("scopes", toJson ([] : List String))] rid
+  checkEq "empty scopes are refused, not read as the defaults" empty.status.toCode 400
+  check "saying openid is needed" (containsStr empty.bodyText "include openid")
+  checkEq "an unknown scope is refused on a change too"
+    (← adminPost ctx "/admin/clients/update" [("id", "wiki"),
+      ("scopes", toJson ["openid", "everything"])] rid).status.toCode 400
+  let sc ← adminPost ctx "/admin/clients/update" [("id", " wiki "),
+    ("scopes", toJson ["openid", "profile"])] rid
+  checkEq "the id is trimmed, as when adding" sc.status.toCode 204
+  checkEq "and the scopes are as given" ((← ctx.store.findClient "wiki").map (·.scopes))
+    (some ["openid", "profile"])
   -- Removing.
   let wrong ← adminPost ctx "/admin/clients/remove" [("id", "wiki"), ("confirm", "WIKI")] rid
   checkEq "removal needs the id typed exactly" (wrong.status.toCode, errorOf wrong)
     (400, "confirmation_required")
-  let rm ← adminPost ctx "/admin/clients/remove" [("id", "wiki"), ("confirm", "wiki")] rid
+  let rm ← adminPost ctx "/admin/clients/remove" [("id", " wiki"), ("confirm", "wiki ")] rid
   checkEq "with it, the client is removed" rm.status.toCode 204
   check "and gone" ((← ctx.store.findClient "wiki").isNone)
   check "audited" (← audited ctx "root" "client-removed" "success" "client wiki: removed")
@@ -515,9 +588,16 @@ def adminKeyAuditTests : IO Unit := withCtx fun ctx _ => do
     (!(adminPosts.any fun p => containsStr p "root-key" || containsStr p "all"))
   let audit ← getPage ctx "/admin/audit" rid
   checkEq "the audit page answers" audit.status.toCode 200
-  check "and says the chain is whole"
-    (containsStr audit.bodyText "entries form an unbroken chain")
+  check "without checking the chain on every view"
+    (containsStr audit.bodyText "has not been checked from these pages yet" &&
+      containsStr audit.bodyText "id=\"audit-verify\"")
   check "newest first" (containsStr audit.bodyText "keys-rotated")
+  let v ← adminPost ctx "/admin/audit/verify" [] rid
+  checkEq "checking it is asked for, and answers" (v.status.toCode,
+    ((replyJson v).getObjValAs? Bool "ok").toOption) (200, some true)
+  check "the page then shows the result, and who asked"
+    (containsStr (← getPage ctx "/admin/audit" rid).bodyText "entries form an unbroken chain" &&
+      (← audited ctx "root" "audit-verified" "success" "audit log: "))
   for _ in [0:60] do
     let filler : Audit.Record :=
       { event := .signIn, outcome := .failure, clientAddress := "x", detail := "filler" }
@@ -528,13 +608,20 @@ def adminKeyAuditTests : IO Unit := withCtx fun ctx _ => do
   check "with links between them"
     (containsStr p1 "href=\"/admin/audit?page=2\"" && containsStr p2 "href=\"/admin/audit?page=1\"")
   check "the newest on the first" (!containsStr p1 "keys-rotated" && containsStr p2 "keys-rotated")
-  checkEq "a page that is no number is the first"
-    (← getPage ctx "/admin/audit?page=x" rid).status.toCode 200
-  -- A broken chain is said so.
+  for (q, want) in [("x", 1), ("0", 1), ("3", 2), ("99999999999999999999999999999", 2),
+      ("-1", 1)] do
+    let pg ← getPage ctx s!"/admin/audit?page={q}" rid
+    check s!"page={q} is page {want}"
+      (pg.status.toCode == 200 && containsStr pg.bodyText s!"Page {want} of 2")
+  checkEq "clamped, whatever is asked for" (Admin.auditPageOf (some "18446744073709551616") 7) 7
+  -- A broken chain is said so, once checked.
   discard <| ctx.store.run fun c =>
     Store.exec c "UPDATE audit SET detail = 'changed' WHERE seq = 2" #[]
-  check "a broken chain is reported"
-    (containsStr (← getPage ctx "/admin/audit" rid).bodyText "The audit log is broken")
+  let b ← adminPost ctx "/admin/audit/verify" [] rid
+  checkEq "a broken chain is reported by the check" (((replyJson b).getObjValAs? Bool "ok").toOption)
+    (some false)
+  check "and on the page"
+    (containsStr (← getPage ctx "/admin/audit" rid).bodyText "audit log: broken: entry 2")
 
 /-- Hostile names, addresses and display names, everywhere they are shown. -/
 def adminEscapeTests : IO Unit := withCtx fun ctx _ => do
@@ -585,6 +672,30 @@ def adminRateLimitTests : IO Unit := withCtx fun ctx _ => do
   check "and audited as rate limited"
     ((← Audit.entries ctx.store).any fun e => e.event == "user-removed" &&
       e.outcome == "refused" && e.detail == "rate limited")
+
+/-- Refused changes are counted apart from sign-ins. -/
+def adminLimiterApartTests : IO Unit := withCtx fun ctx clock => do
+  group "admin: refused changes do not hold back sign-ins"
+  let root ← ctx.store.addUser "root" ["admin"] 1
+  let (rid, rk) ← sessionFor ctx root
+  let secret ← giveTotp ctx root
+  let mut codes := #[]
+  for _ in [0:10] do
+    let r ← postJson ctx "/admin/users/disable" (Json.mkObj [("name", "root")]) (some rid)
+    codes := codes.push r.status.toCode
+  check "ten changes refused as the last administrator, and then held back"
+    (codes.toList.take 4 == [409, 409, 409, 409] && codes.contains 429) s!"{codes}"
+  let s ← signInVia ctx rk
+  checkEq "her next passkey sign-in, from the same address, is not" s.status.toCode 200
+  let up ← stepUpVia ctx rk (some rid)
+  checkEq "nor a step-up" up.status.toCode 200
+  let k2 ← SoftKey.new (uv := false)
+  enrol ctx root k2
+  let codeSignIn ← signInVia ctx k2 (beginBody := Json.mkObj [("name", "root")])
+    (extra := [("totp", Json.str (totpAt secret (← clock.get)))])
+  checkEq "nor one that names her account" codeSignIn.status.toCode 200
+  checkEq "the keys are the administrator's own" (Admin.limiterKeys "root" "2001:db8::1")
+    ("admin:root", "admin:8193:3512:0:0::/64")
 
 /-- The pages against the policy and the script, as `assetTests` does for
 the others. -/
@@ -637,7 +748,8 @@ def adminPageTests : IO Unit := withCtx fun ctx _ => do
     check s!"POST {p} is a route" (routed .post p)
   for p in (quotedAfter script "location.assign('").eraseDups do
     check s!"GET {p} is a route" (routed .get p)
-  for pg in ["admin-user", "admin-invitations", "admin-clients", "admin-client", "admin-keys"] do
+  for pg in ["admin-user", "admin-invitations", "admin-clients", "admin-client", "admin-keys",
+      "admin-audit"] do
     check s!"the script handles the {pg} page"
       (containsStr script s!"body.dataset.page === '{pg}'" && containsStr all s!"data-page=\"{pg}\"")
   check "and steps up at phr" (containsStr script "acr: 'phr'" &&
@@ -688,6 +800,7 @@ def adminTests : IO Unit := do
   adminKeyAuditTests
   adminEscapeTests
   adminRateLimitTests
+  adminLimiterApartTests
   adminPageTests
 
 end PyleTests

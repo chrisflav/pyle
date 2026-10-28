@@ -776,7 +776,7 @@ def roots (keys : List String) : List PublicKey :=  -- each "ed25519/<hex>"
     return { algorithm := .ed25519, key := ← Bytes.ofHex? hex.toString }
 
 match Pyle.Token.verify (roots published) "wiki" now bearer "allow if group(\"staff\");" with
-| .ok who => -- who.user, who.groups, who.amr, who.client, who.authTime, who.scopes
+| .ok who => -- who.subject, who.user, who.groups, who.amr, who.client, who.authTime, who.scopes
 | .error why => -- 401
 ```
 
@@ -786,6 +786,11 @@ language verifies it with any biscuit library, giving the facts
 `time(<now>)` and `audience("<client id>")` and reading `user`, `group` and
 `amr` from the authority block only.  One that would rather not verify
 anything asks `GET /userinfo` with the token.
+
+Identify the user by the `subject` fact (`who.subject`, the account's
+stable handle, the same as the ID token's `sub`), not by `user`: a name is
+given again once `pyle user remove` frees it, and the next account of that
+name is someone else.  Tokens issued before pyle stated `subject` lack it.
 
 ### diff-reviewer, taxis and orchestra
 

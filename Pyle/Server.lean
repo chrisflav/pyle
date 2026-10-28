@@ -67,25 +67,57 @@ def routes : List Route := [
   .mk' .post "/logout" logout
 ] ++ SignIn.routes ++ Oidc.routes
 
+/-- How often a server whose key is not yet the key file's tries to install
+it, in seconds. -/
+def settleSeconds : Nat := 10
+
 /-- The context with the root key the database is sealed under now.  A
 context with a `rootKeyCache` compares the fingerprint it holds with the
 database's — one indexed read — and, when `pyle root-key rotate` has replaced
 the key since, reads the new one (`RootKey.resolve`, which also finishes a
 rotation that stopped before installing its key) and keeps it for the
 requests after.  It does not wait for the root key's lock: while a rotation
-holds it, the pending key is used as it is and the rotation installs it. -/
+holds it, the pending key is used as it is and the rotation installs it.
+
+A rotation can also die between its commit and its rename, after the server
+found the lock taken and took the pending key.  The fingerprints then agree,
+and nothing would ever install the key: the key file would stay the old one —
+and a backup of it with the database unrestorable — for as long as the server
+runs.  So while the key in use is not the key file's (`rootKeyUnsettled`
+holds when that was last tried), the server tries again to finish the
+rename, at most once every `settleSeconds`. -/
 def withCurrentRootKey (ctx : Ctx) : IO Ctx := do
   let some cache := ctx.rootKeyCache | return ctx
   let (held, key) ← cache.get
   match ← ctx.store.recordedRootKey with
   | some recorded =>
-    if recorded == held then return { ctx with rootKey := key }
+    if recorded == held then
+      settle ctx key
+      return { ctx with rootKey := key }
     let key ← RootKey.resolve ctx.store ctx.config.rootKeyFile (← ctx.clock)
       (locking := .tryOnly)
     cache.set (Store.rootKeyId key, key)
     IO.eprintln s!"pyle: the root key was replaced; now using {RootKey.showId recorded}"
+    if let some unsettled := ctx.rootKeyUnsettled then
+      let onDisk ← RootKey.tryLoad ctx.config.rootKeyFile
+      let now ← ctx.clock
+      unsettled.set (if onDisk == some key then none else some now)
     return { ctx with rootKey := key }
   | none => return { ctx with rootKey := key }
+where
+  /-- Retry installing a key that is in use but not yet the key file's. -/
+  settle (ctx : Ctx) (key : ByteArray) : IO Unit := do
+    let some unsettled := ctx.rootKeyUnsettled | return
+    let some last ← unsettled.get | return
+    let now ← ctx.clock
+    if now < last + settleSeconds then return
+    unsettled.set (some now)
+    try
+      discard <| RootKey.resolve ctx.store ctx.config.rootKeyFile now (locking := .tryOnly)
+    catch e => IO.eprintln s!"pyle: installing the root key: {e}"
+    if (← RootKey.tryLoad ctx.config.rootKeyFile) == some key then
+      unsettled.set none
+      IO.eprintln "pyle: the root key file now holds the key in use"
 
 /-- Answer one request, under the current root key.  A root key that cannot
 be read any more is a `503` until it can. -/
@@ -124,7 +156,8 @@ def openCtx (config : Config) (clock : IO Nat := systemClock) : IO Ctx := do
   let store ← Store.Store.openAt config.database (← clock)
   let rootKey ← RootKey.resolve store config.rootKeyFile (← clock)
   return { config, store, limiter := ← RateLimiter.new, rootKey, clock,
-           rootKeyCache := some (← IO.mkRef (Store.rootKeyId rootKey, rootKey)) }
+           rootKeyCache := some (← IO.mkRef (Store.rootKeyId rootKey, rootKey)),
+           rootKeyUnsettled := some (← IO.mkRef none) }
 
 /-! ## The `Std.Http` adapter -/
 

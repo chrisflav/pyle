@@ -654,6 +654,29 @@ def rotationRaceTests : IO Unit := do
     check "the database's key is the key file's" (← keyConsistent ctx.store path)
     check "and opens every signing key"
       ((← ctx.store.allKeys).all (RootKey.opensKey (← RootKey.load path)))
+  -- A rotation that dies after the server took its pending key: the server
+  -- installs it itself once the lock is free.
+  IO.FS.withTempDir fun dir => do
+    let clock ← IO.mkRef 1700000000
+    let ctx ← serverCtx dir clock
+    let path := ctx.config.rootKeyFile
+    let key0 ← RootKey.load path
+    let alice ← ctx.store.addUser "alice" [] 1
+    let (cookie, _) ← sessionFor ctx alice
+    let during ← IO.mkRef 0
+    discard <| (RootKey.rotate (← Store.Store.openAt ctx.config.database 1) path 2
+      (afterCommit := do
+        during.set (← get ctx "/account" cookie).status.toCode.toNat
+        throw (.userError "died before the rename"))).toBaseIO
+    checkEq "a request while the rotation held the lock is served" (← during.get) 200
+    check "the rotation died: the key file is still the old one" ((← RootKey.load path) == key0)
+    checkEq "and a request at once is served" (← get ctx "/account" cookie).status.toCode 200
+    check "without trying the rename again so soon" ((← RootKey.load path) == key0)
+    clock.modify (· + Server.settleSeconds)
+    checkEq "a request later is served" (← get ctx "/account" cookie).status.toCode 200
+    check "and installs the key the server uses" ((← keyConsistent ctx.store path) &&
+      (← RootKey.load path) == (← Server.withCurrentRootKey ctx).rootKey)
+    check "which is not the old one" ((← RootKey.load path) != key0)
   -- A rename that fails after the commit says what to do, and is finished.
   IO.FS.withTempDir fun dir => do
     let clock ← IO.mkRef 1700000000

@@ -24,18 +24,24 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
   A disabled account cannot sign in by any method, its sessions and refresh
   tokens are gone, and `/userinfo` refuses its access tokens.
 * `pyle user remove <name> --yes` deletes an account and everything that is
-  its, recording its name and email address in the audit log.
+  its, and the pending invitations for its name or address, recording its
+  name and email address in the audit log.  The name and the address are
+  then free for another account, which services keying accounts by them take
+  for the removed one.
 * `pyle sessions list [--user <name>]` lists the sessions.
 * `pyle sessions revoke --all | --user <name>` ends sessions, revokes every
   refresh-token family (those tied to a session and those that are not:
   `offline_access`, the device grant) and withdraws authorization, device and
   forward-authentication codes not yet redeemed, for everyone or one account.
-  Access tokens already issued live until they expire.
+  Access tokens already issued live until they expire.  None of these three
+  reaches the sessions a relying party (Zulip, say) keeps of its own:
+  deactivate the user there too.
 * `pyle root-key rotate` replaces the root key: everything sealed under it is
   re-sealed under a new one in one transaction, recovery codes (keyed by it,
   and not re-keyable) are deleted, forward-authentication cookies stop
-  verifying, and the old key file is overwritten.  A running server picks up
-  the new key with its next request.  Take a fresh backup afterwards.
+  verifying, and the old key file's bytes are zeroed as far as the filesystem
+  allows.  A running server picks up the new key with its next request.
+  Take a fresh backup afterwards, and destroy the other copies of the old key.
 * `pyle root-key check` checks the key file against the database, finishing
   a rotation that stopped before installing its key.
 * `pyle invite <name> [--group <group>]… [--ttl <7d>] [--email <e>]
@@ -278,7 +284,11 @@ def rootKeyRotate (path : System.FilePath) : IO UInt32 := do
   let rot ← RootKey.rotate store config.rootKeyFile (← Http.systemClock)
   let r := rot.resealed
   IO.println s!"pyle: replaced the root key {RootKey.showId rot.oldId} by \
-    {RootKey.showId rot.newId} in {config.rootKeyFile}; the old key is overwritten"
+    {RootKey.showId rot.newId} in {config.rootKeyFile}"
+  IO.println "pyle: the old key file's bytes were zeroed, as far as the filesystem allows: \
+    a copy-on-write filesystem, an SSD or a snapshot may keep them.  Destroy every other \
+    copy of the old key too, in backups included, unless you mean to keep it with the \
+    backups it opens"
   IO.println s!"pyle: re-sealed {r.keys} signing keys (the same kids) and {r.totpApps} \
     authenticator apps"
   IO.println s!"pyle: deleted {r.recoveryCodes} recovery codes of {r.recoveryAccounts} \
@@ -287,7 +297,7 @@ def rootKeyRotate (path : System.FilePath) : IO UInt32 := do
     their users round the grant once more"
   IO.println "pyle: a running server picks up the new key with its next request"
   IO.println s!"pyle: take a fresh backup now, of the database and of the new key \
-    {config.rootKeyFile}: older backups of the database do not open under it"
+    {config.rootKeyFile}: older backups of the database open only under the old key"
   return 0
 
 /-- `pyle root-key check`: the key file against the database, finishing a
@@ -309,6 +319,11 @@ def findNamed (store : Store.Store) (name : String) : IO (Option Store.User) := 
 /-- What ending access came to, as `pyle` says it. -/
 def describe (r : Store.Revocation) : String :=
   s!"{r.sessions} sessions, {r.families} refresh-token families and {r.codes} pending codes"
+
+/-- What ending access in pyle does not do. -/
+def relyingParties : String :=
+  "pyle: this ends pyle's sessions and the tokens pyle issued, not the sessions services \
+    such as Zulip keep of their own: deactivate the user there too"
 
 /-- `pyle sessions list [--user <name>]`. -/
 def sessionsList (path : System.FilePath) (user : Option String) : IO UInt32 := do
@@ -343,6 +358,7 @@ def sessionsRevoke (path : System.FilePath) (all : Bool) (user : Option String) 
     | none => "every account"
   IO.println s!"pyle: ended {describe r} of {whose}"
   IO.println "pyle: access tokens already issued live until they expire (accessTokenSeconds)"
+  IO.println relyingParties
   return 0
 
 /-- `pyle user disable <name>`. -/
@@ -351,6 +367,7 @@ def userDisable (path : System.FilePath) (name : String) : IO UInt32 := do
   let some u ← findNamed store name | return 1
   let some r ← Admin.disableUser store u (← Http.systemClock) | return 1
   IO.println s!"pyle: disabled {u.name}, and ended {describe r}"
+  IO.println relyingParties
   return 0
 
 /-- `pyle user enable <name>`. -/
@@ -370,7 +387,11 @@ def userRemove (path : System.FilePath) (name : String) (yes : Bool) : IO UInt32
   let store ← openStore path
   let some u ← findNamed store name | return 1
   let some r ← Admin.removeUser store u (← Http.systemClock) | return 1
-  IO.println s!"pyle: removed {u.name} (email {u.email.getD "-"}), and ended {describe r}"
+  IO.println s!"pyle: removed {u.name} (email {u.email.getD "-"}), and ended {describe r}; \
+    deleted {r.invitations} pending invitations for the name or address"
+  IO.println relyingParties
+  IO.println "pyle: the name and the address are free now; a service that keys accounts by \
+    either hands whoever gets them next what this account had there"
   return 0
 
 /-- `pyle invite`: issue an invitation and print its link.  `ttl` is a

@@ -927,7 +927,9 @@ def run(a):
     check(len(new_key) == 32 and new_key != old_key, "the key file holds a new key")
     check(oct(os.stat(a.root_key).st_mode & 0o777) == "0o600", "mode 0600",
           oct(os.stat(a.root_key).st_mode))
-    check(not os.path.exists(a.root_key + ".new"), "and nothing is left at .new")
+    key_dir, key_name = os.path.split(a.root_key)
+    left = [n for n in os.listdir(key_dir) if n.startswith(key_name + ".new-")]
+    check(not left, "and nothing is left pending", repr(left))
     r = browser.get("/account")
     check(r.status == 200, "the session still works, without a restart", repr(r))
     r = ask("/reports", cookies=[f"__Host-pyle-forward={fwd}"])
@@ -969,6 +971,8 @@ def run(a):
     check(rc == 2, "pyle sessions revoke needs --all or --user", out)
     rc, out = pyle("sessions", "revoke", "--user", a.user)
     check(rc == 0 and "sessions" in out, "pyle sessions revoke --user", out)
+    check("deactivate the user there too" in out,
+          "and says it does not reach the services' own sessions", out)
     r = browser.get("/account")
     check(r.status in (302, 303), "her session is gone", repr(r))
     r = late.get("/account")

@@ -13,6 +13,13 @@ refresh-token family — those tied to a session and those that are not, from
 Access tokens already issued are biscuits that services check offline: they
 live until they expire (`accessTokenSeconds`), though `/userinfo` and the
 kleis attestation refuse a disabled or removed account's at once.
+
+**Only pyle's own.**  None of this reaches into a relying party: a session
+a user already has at Zulip, say, is that service's, and lives on until the
+service ends it.  Deactivate the user there too.  And `user remove` frees the
+account's name and email address for another account, which services that
+key accounts by either would take for the removed one (README, the warning
+under Usage).
 -/
 
 namespace Pyle
@@ -62,7 +69,8 @@ def removeUser (store : Store) (u : User) (now : Nat) : IO (Option Revocation) :
     discard <| Audit.appendIn c now
       { event := .userRemoved, outcome := .success, userName := some gone.name,
         clientAddress := "cli",
-        detail := s!"email: {Audit.showEmail gone.email}; {revocationDetail r}" }
+        detail := s!"email: {Audit.showEmail gone.email}; {revocationDetail r}; \
+          {r.invitations} pending invitations for the name or address deleted" }
     return some r
 
 end Admin

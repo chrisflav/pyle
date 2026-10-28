@@ -101,7 +101,7 @@ def rotationTests : IO Unit := IO.FS.withTempDir fun dir => do
   let key1 ← RootKey.load config.rootKeyFile
   check "the key file holds a new key" (key1 != key0 && key1.size == 32)
   checkEq "still mode 0600" (← fileMode config.rootKeyFile) 600
-  check "and nothing is left at .new" !(← (RootKey.newPath config.rootKeyFile).pathExists)
+  check "and nothing is left pending" (← RootKey.pendingFiles config.rootKeyFile).isEmpty
   checkEq "the database records the new key" (← ctx.store.recordedRootKey)
     (some (Store.rootKeyId key1))
   checkEq "the rotation reports it" (rot.oldId, rot.newId)
@@ -202,21 +202,21 @@ def crashTests : IO Unit := do
     let config := ctx.config
     let key0 ← RootKey.load config.rootKeyFile
     Keys.ensure ctx.store ctx.rootKey .biscuitRoot 1
-    let next := RootKey.newPath config.rootKeyFile
     check "interrupted after writing the new key"
       (← throws (RootKey.rotate ctx.store config.rootKeyFile 2 (interrupt := some .afterNew)))
-    check "the new key is left at .new, mode 0600"
-      ((← next.pathExists) && (← fileMode next) == 600)
+    let pending ← RootKey.pendingFiles config.rootKeyFile
+    check "the new key is left pending, mode 0600"
+      (pending.length == 1 && (← pending.allM fun p => return (← fileMode p) == 600))
     checkEq "the database still records the old key" (← ctx.store.recordedRootKey)
       (some (Store.rootKeyId key0))
     check "and its keys open under it" ((← ctx.store.allKeys).all (RootKey.opensKey key0))
     check "nothing was audited" !((← Audit.entries ctx.store).any (·.event == "root-key-rotated"))
     let ctx' ← Server.openCtx config clock.get
-    check "a restart uses the old key, ignoring .new" (ctx'.rootKey == key0)
+    check "a restart uses the old key, ignoring the pending one" (ctx'.rootKey == key0)
     let rot ← RootKey.rotate ctx.store config.rootKeyFile 3
-    check "the next rotation replaces the stale .new and succeeds"
-      ((← RootKey.load config.rootKeyFile) != key0 && !(← next.pathExists) &&
-        rot.oldId == Store.rootKeyId key0)
+    check "the next rotation removes the stale pending key and succeeds"
+      ((← RootKey.load config.rootKeyFile) != key0 &&
+        (← RootKey.pendingFiles config.rootKeyFile).isEmpty && rot.oldId == Store.rootKeyId key0)
   -- Committed, not installed.
   IO.FS.withTempDir fun dir => do
     let clock ← IO.mkRef 1700000000
@@ -224,10 +224,11 @@ def crashTests : IO Unit := do
     let config := ctx.config
     let key0 ← RootKey.load config.rootKeyFile
     Keys.ensure ctx.store ctx.rootKey .biscuitRoot 1
-    let next := RootKey.newPath config.rootKeyFile
     check "interrupted after the commit"
       (← throws (RootKey.rotate ctx.store config.rootKeyFile 2 (interrupt := some .afterCommit)))
-    let some key1 ← RootKey.tryLoad next | check "the new key is at .new" false
+    let some fp ← ctx.store.recordedRootKey | check "a key is recorded" false
+    let next := RootKey.pendingPath config.rootKeyFile fp
+    let some key1 ← RootKey.tryLoad next | check "the new key is pending, named by it" false
     checkEq "the database records the new key" (← ctx.store.recordedRootKey)
       (some (Store.rootKeyId key1))
     check "while the key file is still the old one" ((← RootKey.load config.rootKeyFile) == key0)
@@ -248,7 +249,7 @@ def crashTests : IO Unit := do
       (← get ctx "/account" cookie).status.toCode 200
     let key1 ← RootKey.load config.rootKeyFile
     checkEq "installing the new key" (← ctx.store.recordedRootKey) (some (Store.rootKeyId key1))
-    check "from .new" !(← (RootKey.newPath config.rootKeyFile).pathExists)
+    check "from its pending file" (← RootKey.pendingFiles config.rootKeyFile).isEmpty
     check "and using it" ((← Server.withCurrentRootKey ctx).rootKey == key1)
   -- A key file that is not the database's.
   IO.FS.withTempDir fun dir => do
@@ -265,10 +266,12 @@ def crashTests : IO Unit := do
     check "and by the commands" (← failsWith (RootKey.resolve ctx.store config.rootKeyFile 3)
       "refusing to start")
     let other ← Crypto.randomBytes 32
-    Sys.writeNewPrivate (RootKey.newPath config.rootKeyFile).toString other
-    check "so is a .new that does not match either"
+    let strayPath := RootKey.pendingPath config.rootKeyFile (Store.rootKeyId key0)
+    Sys.writeNewPrivate strayPath.toString other
+    check "so is a pending file named for the database's key that does not hold it"
       (← throws (RootKey.resolve ctx.store config.rootKeyFile 3))
-    check "and it is left alone" ((← RootKey.tryLoad (RootKey.newPath config.rootKeyFile)) == some other)
+    check "and it is left alone" ((← RootKey.tryLoad strayPath) == some other)
+    IO.FS.removeFile strayPath
     -- The running server answers 503 until the right key is back.
     let some cache := ctx.rootKeyCache | check "a cache" false
     cache.set (ByteArray.mk #[0], key0)
@@ -277,7 +280,8 @@ def crashTests : IO Unit := do
     IO.FS.removeFile config.rootKeyFile
     IO.FS.writeBinFile config.rootKeyFile key0
     checkEq "and recovers once it is back" (← get ctx "/account" cookie).status.toCode 200
-    check "without a rotation to finish, the stray .new is ignored"
+    Sys.writeNewPrivate (RootKey.pendingPath config.rootKeyFile other).toString other
+    check "without a rotation to finish, a stray pending key is ignored"
       ((← RootKey.resolve ctx.store config.rootKeyFile 4) == key0)
   -- No key file at all.
   IO.FS.withTempDir fun dir => do
@@ -512,10 +516,28 @@ def userRemoveTests : IO Unit := withCtx fun ctx clock => do
   discard <| giveTotp ctx alice
   ctx.store.setRecoveryCodes alice.id .empty [ByteArray.mk #[1]]
   ctx.store.setPassword alice.id "phc" 1
-  let rt := (jsonStr (← exchange ctx (← obtainCode ctx cookie) secret) "refresh_token").getD ""
+  let t ← exchange ctx (← obtainCode ctx cookie) secret
+  let rt := (jsonStr t "refresh_token").getD ""
+  let access := (jsonStr t "access_token").getD ""
+  let bearer (a : String) : List (String × String) := [("Authorization", s!"Bearer {a}")]
+  checkEq "her access token is good at /userinfo before"
+    (← get ctx "/userinfo" (headers := bearer access)).status.toCode 200
   discard <| obtainCode ctx cookie
+  -- Invitations an administrator issued for her name, and for her address
+  -- under another name, before she was removed; and one for someone else.
+  let inv (name : String) (email : Option String) : IO Unit := do
+    ctx.store.addInvitation (.of (← Crypto.randomBytes 32))
+      { userName := name, groups := ["admin"], createdBy := "cli", created := 1,
+        expires := (← clock.get) + 3600, email }
+  inv "alice" (some "alice@example.org")
+  inv "alice2" (some "ALICE@example.org")
+  inv "carol" (some "carol@example.org")
   let some r ← Admin.removeUser ctx.store alice (← clock.get) | check "alice is removed" false
   checkEq "ending her session and family first" (r.sessions, r.families) (1, 1)
+  checkEq "and deleting the invitations for her name and her address" r.invitations 2
+  let left ← ctx.store.run fun c => Store.query c "SELECT user_name FROM invitations" #[]
+    (Store.colText · 0)
+  checkEq "only the unrelated invitation is left" left.toList ["carol"]
   checkEq "she is gone" ((← ctx.store.findUserByName "alice").map (·.name)) none
   let count (table : String) : IO Nat := do
     let n ← ctx.store.run fun c => Store.queryOne c
@@ -536,12 +558,131 @@ def userRemoveTests : IO Unit := withCtx fun ctx clock => do
   checkEq "the name and address can be given again, to an account with nothing"
     ((← ctx.store.listCredentials again.id).size, (← ctx.store.listTotpApps again.id).size)
     (0, 0)
+  checkEq "the removed account's access token does not answer for the new alice"
+    (← get ctx "/userinfo" (headers := bearer access)).status.toCode 401
+  -- A token from before pyle stated the subject: accepted only for an
+  -- account that existed at the sign-in it descends from.
+  let now ← clock.get
+  let legacy (authTime : Nat) : IO String :=
+    Token.issue ctx.store ctx.rootKey
+      { user := "alice", amr := ["hwk", "user"], acr := "phrh", authTime, groups := [],
+        client := "app", audience := ["app", Token.pyleAudience] } now (now + 60)
+  checkEq "a token without a subject, from a sign-in before the account existed, is refused"
+    (← get ctx "/userinfo" (headers := bearer (← legacy 1))).status.toCode 401
+  checkEq "one from a sign-in since is accepted"
+    (← get ctx "/userinfo" (headers := bearer (← legacy now))).status.toCode 200
+  let fresh ← signedIn ctx again
+  let t2 ← exchange ctx (← obtainCode ctx fresh) secret
+  checkEq "and the new alice's own token is good"
+    (← get ctx "/userinfo" (headers := bearer ((jsonStr t2 "access_token").getD ""))).status.toCode
+    200
   checkEq "removing someone who is not there" (← Admin.removeUser ctx.store alice 3).isSome false
+
+/-- Whether the database's key is the key file's, with nothing pending. -/
+def keyConsistent (store : Store.Store) (path : System.FilePath) : IO Bool := do
+  let some key ← RootKey.tryLoad path | return false
+  return (← store.recordedRootKey) == some (Store.rootKeyId key) &&
+    (← RootKey.pendingFiles path).isEmpty
+
+/-- Rotations racing each other and the server never lose the database's key. -/
+def rotationRaceTests : IO Unit := do
+  group "root key: concurrent rotations"
+  -- In the window between a rotation's commit and its rename: the server
+  -- uses the pending key without renaming, and a second rotation waits.
+  IO.FS.withTempDir fun dir => do
+    let clock ← IO.mkRef 1700000000
+    let ctx ← serverCtx dir clock
+    let path := ctx.config.rootKeyFile
+    let key0 ← RootKey.load path
+    Keys.ensure ctx.store ctx.rootKey .biscuitRoot 1
+    let s1 ← Store.Store.openAt ctx.config.database 1
+    let s2 ← Store.Store.openAt ctx.config.database 1
+    let seen ← IO.mkRef (false, false, false)
+    let second ← IO.mkRef none
+    let rot1 ← RootKey.rotate s1 path 2 (afterCommit := do
+      let some fp ← ctx.store.recordedRootKey | pure ()
+      let k ← RootKey.resolve ctx.store path 2 (locking := .tryOnly)
+      let fileStill := (← RootKey.load path) == key0
+      let t ← IO.asTask (prio := .dedicated) (RootKey.rotate s2 path 3)
+      IO.sleep 300
+      let waiting := !(← IO.hasFinished t)
+      seen.set (Store.rootKeyId k == fp, fileStill, waiting)
+      second.set (some t))
+    let (serverHadIt, untouched, waited) ← seen.get
+    check "in the window, the server takes the committed key from its pending file"
+      serverHadIt
+    check "without renaming it" untouched
+    check "and a second rotation waits for the lock" waited
+    let some t ← second.get | check "the second rotation ran" false
+    match ← IO.wait t with
+    | .ok rot2 =>
+      check "it then starts from the first one's key" (rot2.oldId == rot1.newId)
+    | .error e => check "the second rotation succeeds" false (toString e)
+    check "the database's key is the key file's" (← keyConsistent ctx.store path)
+    checkEq "and the server follows" (← Server.withCurrentRootKey ctx).rootKey
+      (← RootKey.load path)
+    check "every key opens under it"
+      ((← ctx.store.allKeys).all (RootKey.opensKey (← RootKey.load path)))
+  -- Many at once: rotations on their own connections, and server requests.
+  IO.FS.withTempDir fun dir => do
+    let clock ← IO.mkRef 1700000000
+    let ctx ← serverCtx dir clock
+    let path := ctx.config.rootKeyFile
+    Keys.ensure ctx.store ctx.rootKey .biscuitRoot 1
+    let alice ← ctx.store.addUser "alice" [] 1
+    let (cookie, _) ← sessionFor ctx alice
+    let rotations ← (List.range 4).mapM fun i => do
+      let s ← Store.Store.openAt ctx.config.database 1
+      IO.asTask (prio := .dedicated) (RootKey.rotate s path (10 + i))
+    let requests ← (List.range 4).mapM fun _ =>
+      IO.asTask (prio := .dedicated) (do
+        let mut codes : Array Nat := #[]
+        for _ in [0:10] do codes := codes.push (← get ctx "/account" cookie).status.toCode.toNat
+        return codes : IO (Array Nat))
+    let results ← rotations.mapM fun t => IO.wait t
+    let ids := results.filterMap fun (r : Except IO.Error RootKey.Rotation) => match r with
+      | .ok rot => some (rot.oldId, rot.newId)
+      | .error _ => none
+    checkEq "every rotation succeeds" ids.length 4
+    check "one after another: each starts from a key another one made, or the first"
+      (ids.all fun (o, _) => ids.any (·.2 == o) || o == Store.rootKeyId ctx.rootKey)
+    let served ← requests.mapM fun t => IO.wait t
+    check "the server answered every request meanwhile"
+      (served.all fun (r : Except IO.Error (Array Nat)) => match r with
+        | .ok codes => codes.all (· == 200)
+        | .error _ => false)
+    check "the database's key is the key file's" (← keyConsistent ctx.store path)
+    check "and opens every signing key"
+      ((← ctx.store.allKeys).all (RootKey.opensKey (← RootKey.load path)))
+  -- A rename that fails after the commit says what to do, and is finished.
+  IO.FS.withTempDir fun dir => do
+    let clock ← IO.mkRef 1700000000
+    let ctx ← serverCtx dir clock
+    let path := ctx.config.rootKeyFile
+    let key0 ← RootKey.load path
+    let ok ← failsWith (RootKey.rotate ctx.store path 2 (afterCommit := do
+        IO.FS.removeFile path
+        IO.FS.createDir path)) "run `pyle root-key check`, which finishes the rename"
+    check "a rename failing after the commit points to pyle root-key check" ok
+    IO.FS.removeDir path
+    IO.FS.writeBinFile path key0
+    let key ← RootKey.resolve ctx.store path 3
+    check "which finishes it" (key != key0 && (← keyConsistent ctx.store path))
+  -- An old key file that cannot be overwritten is replaced all the same.
+  IO.FS.withTempDir fun dir => do
+    let clock ← IO.mkRef 1700000000
+    let ctx ← serverCtx dir clock
+    let path := ctx.config.rootKeyFile
+    IO.setAccessRights path { user := { read := true } }
+    let rot ← RootKey.rotate ctx.store path 2
+    check "a 0400 key file is replaced, with a warning"
+      ((← keyConsistent ctx.store path) && rot.newId != rot.oldId)
 
 /-- Every test of this module. -/
 def hardeningTests : IO Unit := do
   rotationTests
   crashTests
+  rotationRaceTests
   rootKeyMigrationTests
   invitationHandleTests
   revokeTests

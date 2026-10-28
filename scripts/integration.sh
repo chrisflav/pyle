@@ -201,22 +201,27 @@ check $? "the audit log records the old and the new values"
 echo
 echo "== the root key file"
 KEY="$WORK/data/root.key"
+pending() { ls "$KEY".new-* 2>/dev/null; }
 cp "$KEY" "$WORK/key.current"
-head -c 32 /dev/urandom > "$KEY.new"
+head -c 32 /dev/urandom > "$KEY.new-0123456789abcdef"
 OUT="$("$PYLE" root-key check 2>&1)"
 [ $? -eq 0 ] && cmp -s "$KEY" "$WORK/key.current"
-check $? "a stray .new from a rotation that never committed is ignored" "$OUT"
+check $? "a stray pending key from a rotation that never committed is ignored" "$OUT"
 OUT="$("$PYLE" root-key rotate 2>&1)"
-check $? "and the next rotation replaces it" "$OUT"
-[ ! -e "$KEY.new" ] && ! cmp -s "$KEY" "$WORK/key.current"
-check $? "leaving only the new key"
-# Committed, not installed: the database records the key now at .new, and
-# the key file still holds the one before.
-mv "$KEY" "$KEY.new"
+check $? "and the next rotation removes it" "$OUT"
+[ -z "$(pending)" ] && ! cmp -s "$KEY" "$WORK/key.current"
+check $? "leaving only the new key" "$(pending)"
+grep -q "zeroed, as far as the filesystem allows" <<< "$OUT"
+check $? "saying the old key's zeroing is best effort" "$OUT"
+# Committed, not installed: the database records the key now pending under
+# its fingerprint, and the key file still holds the one before.
+FP="$("$PYLE" root-key check 2>&1 | sed -n 's/.*(fingerprint \([0-9a-f]*\)).*/\1/p')"
+[ -n "$FP" ]; check $? "pyle root-key check shows the fingerprint" "$FP"
+cp "$KEY" "$WORK/key.committed"
+mv "$KEY" "$KEY.new-$FP"
 cp "$WORK/key.current" "$KEY"
-cp "$KEY.new" "$WORK/key.committed"
 OUT="$("$PYLE" root-key check 2>&1)"
-[ $? -eq 0 ] && cmp -s "$KEY" "$WORK/key.committed" && [ ! -e "$KEY.new" ]
+[ $? -eq 0 ] && cmp -s "$KEY" "$WORK/key.committed" && [ -z "$(pending)" ]
 check $? "a rotation that committed and stopped is finished by the next command" "$OUT"
 grep -q "finished an interrupted root-key rotation" <<< "$OUT"
 check $? "saying so" "$OUT"

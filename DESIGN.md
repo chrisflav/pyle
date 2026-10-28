@@ -299,7 +299,18 @@ sign-in by each method, a session's lookup, the token endpoint for codes,
 refresh tokens and the device grant, `/userinfo` and the kleis attestation —
 so a token that survived, say in a restored backup, is refused all the same.
 `pyle user remove` ends the account's access and then deletes it, the rest
-going with it by `ON DELETE CASCADE`.
+going with it by `ON DELETE CASCADE`, and so do the pending invitations for
+its name or its address, which would otherwise make an account that services
+keying accounts by either take for the removed one.  Access tokens state the
+account's subject (its user handle, never reused) besides its name, and
+`/userinfo` answers only for the account with that subject; a token from
+before they did is answered only for an account that existed at its
+sign-in.
+
+None of this reaches a relying party's own sessions: pyle cannot end a
+session Zulip keeps of its own, and says so each time.  Deactivating the
+user there is the administrator's part, as is retiring the account in each
+service before its address is given to anyone else.
 
 ## 5. What services receive
 
@@ -513,41 +524,55 @@ the database has sealed).  Every process that needs the key gets it through
 one function, `RootKey.resolve`, which accepts the key file only if it
 matches.
 
-The rotation, with `new` standing for the key file's path with `.new`
-appended:
+The rotation holds an exclusive `flock` on the key file's path with `.lock`
+appended from its first step to its last.  With `new` standing for the
+pending file — the key file's path with `.new-` and the new key's
+fingerprint appended:
 
 1. resolve the current key (finishing an interrupted rotation first);
 2. in one `BEGIN IMMEDIATE` transaction, with `synchronous = FULL` so that
    the commit is on disk when it returns: check that the recorded fingerprint
-   is the current key's; write a fresh random key to `new` with `O_EXCL` and
-   mode 0600 and `fsync` it and its directory; re-seal every signing key and
-   every app secret, opening each result under the new key before writing
-   it, so that one that would not open aborts the whole transaction; delete
-   the recovery codes; record the new fingerprint and the audit entry;
-3. rename `new` over the key file, `fsync` the directory, and overwrite the
-   old key's bytes through a descriptor opened before the rename (and only if
-   that file still held them, so a key another process installed meanwhile is
-   never touched).
+   is the current key's; remove pending files left by rotations that never
+   committed; write a fresh random key to `new` with `O_EXCL` and mode 0600
+   and `fsync` it and its directory; re-seal every signing key and every app
+   secret, opening each result under the new key before writing it, so that
+   one that would not open aborts the whole transaction; delete the recovery
+   codes; record the new fingerprint and the audit entry;
+3. rename `new` over the key file, `fsync` the directory, and zero the old
+   key's bytes through a descriptor opened before the rename (only if that
+   file still held them).  The zeroing is best effort: a copy-on-write
+   filesystem, an SSD or a snapshot may keep the old blocks, and a key file
+   that is not writable is left alone with a warning.  Other copies of the old
+   key are the operator's to destroy.
 
-**Crash safety.**  The invariant is that one of the two files holds the key
-the database records, durably, at every moment:
+**Crash safety.**  The invariant is that one of the files holds the key the
+database records, durably, at every moment:
 
 - until the commit, the database records the old key and the key file holds
-  it; a `new` left behind is ignored, and the next rotation removes it, under
-  the write lock, where no other rotation can be between writing its `new`
-  and committing;
+  it; a `new` left behind is ignored, and the next rotation removes it;
 - from the commit until the rename, the database records the new key, which
-  `new` holds — its directory entry was synced before the commit — and
-  `resolve`, at the next start or command or request, renames it over the key
-  file as step 3 would have;
+  the pending file named by its fingerprint holds — its directory entry was
+  synced before the commit — and `resolve`, at the next start or command or
+  request, renames it over the key file as step 3 would have;
 - after the rename, the key file holds the new key.
 
 So no interruption loses the key, and no restart runs with a key the
-database is not sealed under: a key file that matches neither, with no `new`
-that does — the backup of one paired with the key of another — is refused
-with an error that says so.  Two processes finishing the same rotation at
-once both try the rename; one finds `new` gone and reads the key file
-instead.
+database is not sealed under: a key file that matches neither, with no
+pending file that does — the backup of one paired with the key of another —
+is refused with an error that says so.
+
+**Concurrency.**  Without the lock, a second rotation could finish the
+first one's rename, write a pending file of its own, have the first one's
+delayed rename install *that* key, and die before committing it: the
+database would record one key and the file hold another.  With the lock,
+rotations run one at a time, and a rename happens only under the lock,
+after checking that the database records the pending key and that the key
+file does not hold it already; and a pending file, being named by its key's
+fingerprint, can only install that key.  `resolve` takes the lock only to
+finish a rename; commands wait for it, the server does not — while a
+rotation holds it, the server reads the pending key and uses it without
+renaming anything, and the rotation installs it.  A process that dies
+holding the lock releases it.
 
 **A running server.**  The server keeps the key in memory, with its
 fingerprint.  Before each request it reads the recorded fingerprint (one

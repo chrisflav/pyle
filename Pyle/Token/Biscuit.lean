@@ -45,6 +45,10 @@ def date (t : Nat) : String := (Time.formatRfc3339 t).getD "1970-01-01T00:00:00Z
 structure Grant where
   /-- The user's name. -/
   user : String
+  /-- The account's OpenID Connect subject (its user handle in base64url),
+  which names the account for good where a name may be given again once the
+  account is removed. -/
+  subject : Option String := none
   /-- The authentication methods of the sign-in. -/
   amr : List String
   /-- The level of the sign-in, as its identifier. -/
@@ -68,7 +72,8 @@ def pyleAudience : String := "pyle"
 
 /-- The authority block of an access token expiring at `expires`. -/
 def authoritySource (g : Grant) (expires : Nat) : String :=
-  let facts := [s!"user({quote g.user});"] ++ g.amr.map (s!"amr({quote ·});") ++
+  let facts := [s!"user({quote g.user});"] ++
+    (g.subject.map fun s => [s!"subject({quote s});"]).getD [] ++ g.amr.map (s!"amr({quote ·});") ++
     (if g.acr.isEmpty then [] else [s!"acr({quote g.acr});"]) ++
     (g.accountAcr.map fun a => [s!"account_acr({quote a});"]).getD [] ++
     [s!"auth_time({date g.authTime});"] ++ g.groups.map (s!"group({quote ·});") ++

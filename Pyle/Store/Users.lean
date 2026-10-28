@@ -265,6 +265,8 @@ structure Revocation where
   families : Nat := 0
   /-- Codes withdrawn. -/
   codes : Nat := 0
+  /-- Pending invitations deleted, by a removal (`removeUserIn`). -/
+  invitations : Nat := 0
   deriving Inhabited, Repr
 
 /-- End the access of one account, or of every account: inside a
@@ -328,15 +330,24 @@ def Store.setUserDisabled (s : Store) (id : UserId) (disabled : Bool) (now : Nat
 
 /-- Remove an account and everything that is its: its access is ended first
 (`endAccessIn`), and the rest — credentials, authenticator apps, recovery
-codes, password, challenges — goes with the row, by `ON DELETE CASCADE`.  The
-account as it was, and what ending its access came to; `none` if there is no
-such account. -/
+codes, password, challenges — goes with the row, by `ON DELETE CASCADE`.
+Pending invitations for its name, or for its email address in any case, are
+deleted too: one redeemed afterwards would make a new account with the old
+one's name or address, which a service that keys accounts by either (Zulip,
+by address) would take for the removed one.  The account as it was, and what
+ending its access came to (`invitations` counting those deleted); `none` if
+there is no such account. -/
 def removeUserIn (c : SQLite) (id : UserId) (now : Nat) : IO (Option (User × Revocation)) := do
   let some u ← queryOne c s!"SELECT {userColumns} FROM users WHERE id = ?" #[id] readUser
     | return none
   let r ← endAccessIn c (some id) now
+  let byName ← exec c "DELETE FROM invitations WHERE user_name = ?" #[u.name]
+  let byEmail ← match u.email with
+    | some e =>
+      exec c "DELETE FROM invitations WHERE email IS NOT NULL AND lower(email) = lower(?)" #[e]
+    | none => pure 0
   discard <| exec c "DELETE FROM users WHERE id = ?" #[id]
-  return some (u, r)
+  return some (u, { r with invitations := byName + byEmail })
 
 /-- `removeUserIn`, in a transaction of its own. -/
 def Store.removeUser (s : Store) (id : UserId) (now : Nat) : IO (Option (User × Revocation)) :=

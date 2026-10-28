@@ -44,7 +44,7 @@ def tokenResponse (ctx : Ctx) (r : Req) (client : Store.Client) (user : Store.Us
     | return oauthError "invalid_grant" "the sign-in behind this grant states no level"
   let account ← Policy.accountLevel ctx user.id
   let access ← Token.issue ctx.store ctx.rootKey
-    { user := user.name, amr, acr := level.identifier, accountAcr := account.map (·.identifier),
+    { user := user.name, subject := some (subjectOf user), amr, acr := level.identifier, accountAcr := account.map (·.identifier),
       authTime, groups := user.groups, client := client.id,
       audience := [client.id, Token.pyleAudience], scopes := words scope } now expires
   let idToken ← if (words scope).contains "openid" then

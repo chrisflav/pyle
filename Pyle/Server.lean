@@ -72,7 +72,8 @@ context with a `rootKeyCache` compares the fingerprint it holds with the
 database's — one indexed read — and, when `pyle root-key rotate` has replaced
 the key since, reads the new one (`RootKey.resolve`, which also finishes a
 rotation that stopped before installing its key) and keeps it for the
-requests after. -/
+requests after.  It does not wait for the root key's lock: while a rotation
+holds it, the pending key is used as it is and the rotation installs it. -/
 def withCurrentRootKey (ctx : Ctx) : IO Ctx := do
   let some cache := ctx.rootKeyCache | return ctx
   let (held, key) ← cache.get
@@ -80,6 +81,7 @@ def withCurrentRootKey (ctx : Ctx) : IO Ctx := do
   | some recorded =>
     if recorded == held then return { ctx with rootKey := key }
     let key ← RootKey.resolve ctx.store ctx.config.rootKeyFile (← ctx.clock)
+      (locking := .tryOnly)
     cache.set (Store.rootKeyId key, key)
     IO.eprintln s!"pyle: the root key was replaced; now using {RootKey.showId recorded}"
     return { ctx with rootKey := key }
@@ -117,7 +119,7 @@ nothing to open, and no database is created. -/
 def openCtx (config : Config) (clock : IO Nat := systemClock) : IO Ctx := do
   restrictFileModes
   unless (← config.rootKeyFile.pathExists) ||
-      (← (RootKey.newPath config.rootKeyFile).pathExists) do
+      !(← RootKey.pendingFiles config.rootKeyFile).isEmpty do
     discard <| RootKey.load config.rootKeyFile
   let store ← Store.Store.openAt config.database (← clock)
   let rootKey ← RootKey.resolve store config.rootKeyFile (← clock)

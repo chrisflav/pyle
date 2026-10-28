@@ -120,9 +120,25 @@ refresh tokens and device grants are refused even if one survived, `/userinfo`
 refuses its access tokens, and forward authentication does not pass it.
 `pyle user enable <name>` lets it in again, with what it had.  `pyle user
 remove <name> --yes` deletes the account and everything that is its —
-authenticators, apps, recovery codes, password, sessions, tokens — and the
-audit log keeps its name and email address.  Each of these is one
-transaction with its audit entry.
+authenticators, apps, recovery codes, password, sessions, tokens — and every
+pending invitation for its name or its address, and the audit log keeps its
+name and email address.  Each of these is one transaction with its audit
+entry.
+
+> **These end access to pyle, not to the services behind it.**  They end
+> pyle's sessions and the tokens pyle issued; a session a user already has
+> at a relying party — Zulip, a wiki — is that service's, and lives on until
+> the service ends it.  Deactivate the user in each service too.  And `user
+> remove` frees the account's name and email address: an account given
+> either afterwards is, to a service that keys accounts by it, the removed
+> one (see the warning under [Usage](#usage)).  Retire the account in those
+> services before the address is used again.
+
+Access tokens name the account by its subject (its user handle) as well as
+its name, so a token of a removed account does not answer at `/userinfo` for
+a new account given the same name.  A token issued before pyle stated the
+subject is accepted there only if the account existed at the sign-in it
+descends from.
 
 Every reply pyle makes carries its security headers (a strict CSP with
 `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy: no-referrer`, and
@@ -719,9 +735,16 @@ pyle root-key rotate            # a new root key; the leaked one opens nothing a
 pyle sessions revoke --all      # end every session and refresh token
 ```
 
+(and end the sessions in the services behind pyle, which these do not reach),
+
 and take a fresh backup.  `root-key rotate` re-seals the signing keys and the
 authenticator apps' secrets under a new random key in one transaction, and
-overwrites the old key file; forward-authentication cookies made with the old
+zeroes the old key file's bytes — as far as the filesystem allows: a
+copy-on-write filesystem, an SSD, a snapshot or a volume backup may keep
+them, and a key file that is not writable (mode 0400) is left as it was, with
+a warning.  So destroy every other copy of the old key yourself, in backups
+too: a backup of the database together with the old key is the very leak
+this is for.  Forward-authentication cookies made with the old
 key stop verifying, so protected hosts send their users round the grant once
 more, and recovery codes are deleted, because their HMACs are keyed by the
 old key (each account page asks for new ones).  It cannot change what the
@@ -731,10 +754,12 @@ access tokens signed before keep verifying until they expire (an hour by
 default).  A running server picks up the new key with its next request; a
 request under way at that moment may fail once and can be retried, and an
 authenticator app being set up has to be begun again.  The steps are one
-transaction and one rename, so an interruption at any point leaves either
-the old key or the new one in force: the next `pyle` command or start
-finishes an interrupted rotation, and refuses a key file that belongs to
-neither (DESIGN.md §6.4).
+transaction and one rename, under a lock on `<rootKeyFile>.lock`, so an
+interruption at any point leaves either the old key or the new one in force:
+the next `pyle` command or start finishes an interrupted rotation from the
+pending file `<rootKeyFile>.new-<fingerprint>`, and refuses a key file that
+belongs to neither (DESIGN.md §6.4).  The key file's directory must be
+writable by pyle's user for the rotation, the lock and the pending file.
 
 ### Verifying access tokens in a service
 

@@ -31,35 +31,52 @@ matches; a database with nothing recorded yet — one migrated from before 9,
 or a new one — records the key it is opened with, after checking that the key
 opens what is sealed there.
 
-**Rotation** (`rotate`, `pyle root-key rotate`), with `new` the path with
-`.new` appended:
+**Rotation** (`rotate`, `pyle root-key rotate`), with `new` the pending file,
+the key file's path with `.new-` and the new key's fingerprint appended
+(`pendingPath`), all of it holding an exclusive `flock` on the key file's
+path with `.lock` appended:
 
 1. `resolve` the current key, which finishes an interrupted rotation first.
 2. Draw a new key.  In one `BEGIN IMMEDIATE` transaction (synchronous `FULL`,
    so that its commit is on disk when it returns): check that the recorded
-   fingerprint is the current key's; remove a stale `new` left by a rotation
-   that never committed; write the new key to `new` with `O_EXCL`, mode 0600,
-   and `fsync` it and its directory; re-seal every signing key and every app
-   secret, opening each result under the new key before it is written; delete
-   the recovery codes; record the new fingerprint and the audit entry.
+   fingerprint is the current key's; remove the pending files left by
+   rotations that never committed; write the new key to `new` with `O_EXCL`,
+   mode 0600, and `fsync` it and its directory; re-seal every signing key and
+   every app secret, opening each result under the new key before it is
+   written; delete the recovery codes; record the new fingerprint and the
+   audit entry.
 3. Rename `new` over the key file, `fsync` the directory, and overwrite the
-   old key's bytes through a descriptor opened before the rename.
+   old key's bytes through a descriptor opened before the rename — best
+   effort: a copy-on-write filesystem or an SSD may keep the old blocks, and
+   a key file that is not writable is left as it is, with a warning.
 
-**Crash safety.**  At every moment, one of the two files holds the key the
+**Crash safety.**  At every moment, one of the files holds the key the
 database records, and `resolve` finds it:
 
 * before the commit, the database still records the old key, which is still
   the key file: `new`, if it was written, is ignored, and the next rotation
   removes it;
 * after the commit and before the rename, the database records the new key,
-  which is in `new` — durable, since its directory was synced before the
-  commit — and not the key file: `resolve` renames `new` over the key file,
-  as step 3 would have;
+  which is in the pending file named by its fingerprint — durable, since its
+  directory was synced before the commit — and not the key file: `resolve`
+  renames it over the key file, as step 3 would have;
 * after the rename, the key file is the new key.
 
-A key file that matches neither, with no `new` that does, is refused with an
-error saying so: such a pair is a backup of one with the key of another, and
-running on would seal new secrets under a key nothing else can open.
+**Concurrency.**  The lock makes rotations, and the rename that finishes an
+interrupted one, one at a time.  Without it, a second rotation could finish
+the first one's rename, write a pending file of its own, and have the first
+one's delayed rename install that — a key no commit recorded — before dying
+itself.  With it, a rename happens only under the lock, after checking that
+the database records the pending key's fingerprint and the key file does not
+hold it yet; and a pending file can only hold the key its name says.  The
+server does not wait for the lock: when a rotation holds it, the server
+reads the pending key and uses it without renaming anything, and the
+rotation installs it.  A process that dies holding the lock releases it.
+
+A key file that matches neither, with no pending file that does, is refused
+with an error saying so: such a pair is a backup of one with the key of
+another, and running on would seal new secrets under a key nothing else can
+open.
 
 **A running server** keeps the key in memory.  `Server.route` compares the
 fingerprint it holds against the database's before each request, and calls
@@ -77,10 +94,6 @@ open Store
 /-- The length of a root key, in bytes. -/
 def bytes : Nat := 32
 
-/-- Where `rotate` writes the new key before it installs it: the key file's
-path with `.new` appended. -/
-def newPath (path : System.FilePath) : System.FilePath := ⟨path.toString ++ ".new"⟩
-
 /-- The directory holding a file, for `fsync`. -/
 def dirOf (path : System.FilePath) : System.FilePath :=
   match path.parent with
@@ -89,6 +102,30 @@ def dirOf (path : System.FilePath) : System.FilePath :=
 
 /-- A fingerprint as it is shown: its first eight bytes in hex. -/
 def showId (keyId : ByteArray) : String := LeanBiscuit.Bytes.toHex (keyId.extract 0 8)
+
+/-- What a pending key's file name starts with: the key file's with `.new-`. -/
+def pendingPrefix (path : System.FilePath) : String := (path.fileName.getD "root.key") ++ ".new-"
+
+/-- Where `rotate` writes a new key before it installs it: the key file's path
+with `.new-` and the key's fingerprint (`showId`) appended.  Naming it by
+its fingerprint means that what is installed for a fingerprint the database
+recorded can only be that key, never one a later rotation wrote. -/
+def pendingPath (path : System.FilePath) (keyId : ByteArray) : System.FilePath :=
+  dirOf path / (pendingPrefix path ++ showId keyId)
+
+/-- Every pending key file beside the key file. -/
+def pendingFiles (path : System.FilePath) : IO (List System.FilePath) := do
+  let some name := path.fileName | return []
+  let dir := dirOf path
+  unless ← dir.isDir do return []
+  let entries ← dir.readDir
+  return entries.toList.filterMap fun e =>
+    if e.fileName.startsWith (name ++ ".new-") then some e.path else none
+
+/-- The lock every process that writes the key file holds while it does:
+`rotate`, from before it resolves the current key until it has installed
+the new one, and `resolve` while it finishes an interrupted rotation. -/
+def lockPath (path : System.FilePath) : System.FilePath := ⟨path.toString ++ ".lock"⟩
 
 /-- Write a new random root key to `path`, readable only by its owner.  The
 file is created by one `open` with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
@@ -138,16 +175,35 @@ def checkOpens (store : Store) (rootKey : ByteArray) (path : System.FilePath) : 
 /-- The error for a key file that is not the database's. -/
 def mismatch (path : System.FilePath) (recorded : ByteArray) : IO.Error :=
   .userError s!"the root key {path} is not the one this database is sealed under \
-    (fingerprint {showId recorded}), and neither is {newPath path}; refusing to start.  \
-    Restore the key file that belongs to this database (from the backup made with it), \
-    or the database that belongs to this key"
+    (fingerprint {showId recorded}), and neither is {pendingPath path recorded}; refusing \
+    to start.  Restore the key file that belongs to this database (from the backup made \
+    with it), or the database that belongs to this key"
+
+/-- How `resolve` treats the root key's lock when it has a rotation to finish. -/
+inductive Locking where
+  /-- Wait for the lock: the commands. -/
+  | wait
+  /-- Do not wait: the server, between requests.  If a rotation holds the lock,
+  it is between its commit and its rename and will install the key itself;
+  `resolve` then uses the pending key as it is, without renaming anything. -/
+  | tryOnly
+  /-- The caller holds the lock already: `rotate`. -/
+  | held
+  deriving BEq, Repr
 
 /-- The root key the database is sealed under, from the key file — or from
-`newPath`, finishing a rotation that committed but did not install its key.
-Records the key's fingerprint in a database that has none.  Throws, saying
-why, when neither file is the database's key. -/
-def resolve (store : Store) (path : System.FilePath) (now : Nat) : IO ByteArray := do
-  let next := newPath path
+the pending file named by the recorded fingerprint, finishing a rotation that
+committed but did not install its key.  Records the key's fingerprint in a
+database that has none.  Throws, saying why, when neither file is the
+database's key.
+
+Reading needs no lock: the key file is only ever replaced by a `rename`, and
+a pending file holds the key its name says.  Installing one takes the lock
+(`locking`) and checks, under it, that the database still records that key
+and that the key file still does not hold it, so a rename never installs a
+key the database has moved on from. -/
+partial def resolve (store : Store) (path : System.FilePath) (now : Nat)
+    (locking : Locking := .wait) : IO ByteArray := do
   match ← store.recordedRootKey with
   | none =>
     let key ← load path
@@ -156,17 +212,32 @@ def resolve (store : Store) (path : System.FilePath) (now : Nat) : IO ByteArray 
     unless fp == rootKeyId key do throw (mismatch path fp)
     return key
   | some fp =>
-    let current ← tryLoad path
-    if let some k := current then
+    if let some k ← tryLoad path then
       if rootKeyId k == fp then return k
-    let some pending ← tryLoad next | throw (mismatch path fp)
-    unless rootKeyId pending == fp do throw (mismatch path fp)
-    -- A rotation committed and stopped before installing its key: finish it.
-    discard <| Sys.installFile next.toString path.toString (current.getD .empty)
-    let installed ← load path
-    unless rootKeyId installed == fp do throw (mismatch path fp)
-    IO.eprintln s!"pyle: finished an interrupted root-key rotation: {next} is now {path}"
-    return installed
+    let pending := pendingPath path fp
+    let some key ← tryLoad pending | throw (mismatch path fp)
+    unless rootKeyId key == fp do throw (mismatch path fp)
+    -- A rotation committed and has not installed its key (yet): finish it,
+    -- under the lock, if the database still records it then.
+    let finish : IO (Option ByteArray) := do
+      if (← store.recordedRootKey) != some fp then return none
+      let current ← tryLoad path
+      if current.map rootKeyId == some fp then return some key
+      unless (← tryLoad pending) == some key do return none
+      discard <| Sys.installFile pending.toString path.toString (current.getD .empty)
+      unless (← tryLoad path).map rootKeyId == some fp do throw (mismatch path fp)
+      IO.eprintln s!"pyle: finished an interrupted root-key rotation: {pending} is now {path}"
+      return some key
+    let outcome ← match locking with
+      | .held => some <$> finish
+      | .wait => Sys.withLock (lockPath path).toString true finish
+      | .tryOnly => Sys.withLock (lockPath path).toString false finish
+    match outcome with
+    | some (some k) => return k
+    -- The database moved on while this waited: start again from it.
+    | some none => resolve store path now locking
+    -- A rotation holds the lock and will install the key it committed.
+    | none => return key
 
 /-- What `rotate` did. -/
 structure Rotation where
@@ -217,8 +288,8 @@ def auditRecord (oldId newId : ByteArray) (r : Resealed) : Audit.Record :=
 
 /-- Where a test stops `rotate`, as a crash could. -/
 inductive Interruption where
-  /-- After the new key is written to `newPath`, before the transaction
-  commits, which then rolls back. -/
+  /-- After the new key is written to its pending file, before the
+  transaction commits, which then rolls back. -/
   | afterNew
   /-- After the commit, before the new key is installed. -/
   | afterCommit
@@ -231,22 +302,37 @@ def removeIfHolds (path : System.FilePath) (key : ByteArray) : IO Unit := do
 
 /-- Replace the root key of the database `store` and of the key file `path`
 (see the module documentation for the steps and why each crash leaves a
-working pair).  `interrupt` is for tests, to stop where a crash could. -/
+working pair).  Holds the root key's lock throughout, waiting for it if
+another rotation holds it.  `interrupt` is for tests, to stop where a crash
+could, and `afterCommit` runs between the commit and the rename, so a test
+can race something against that window. -/
 def rotate (store : Store) (path : System.FilePath) (now : Nat)
-    (interrupt : Option Interruption := none) : IO Rotation := do
-  let old ← resolve store path now
+    (interrupt : Option Interruption := none) (afterCommit : IO Unit := pure ()) :
+    IO Rotation := do
+  let some r ← Sys.withLock (lockPath path).toString true (rotateLocked store path now interrupt
+      afterCommit)
+    | throw (.userError "the root key's lock could not be taken")
+  return r
+where
+  /-- The rotation itself, with the lock held. -/
+  rotateLocked (store : Store) (path : System.FilePath) (now : Nat)
+      (interrupt : Option Interruption) (afterCommit : IO Unit) : IO Rotation := do
+  let old ← resolve store path now (locking := .held)
   let new ← Crypto.randomBytes bytes.toUSize
   let oldId := rootKeyId old
   let newId := rootKeyId new
-  let next := newPath path
-  let unfinished : IO.Error := .userError s!"the new root key was committed but {path} does \
-    not hold it yet; run `pyle root-key check` to install it from {next}"
+  let next := pendingPath path newId
+  let unfinished (why : String) : IO.Error := .userError s!"the rotation committed the new \
+    root key {showId newId}, but the key file {path} was not replaced ({why}); run \
+    `pyle root-key check`, which finishes the rename from {next}"
   store.run fun c => c.exec "PRAGMA synchronous = FULL"
   try
     let resealed ← try
         store.resealRootKey oldId newId now
           (prepare := do
-            if ← next.pathExists then IO.FS.removeFile next
+            -- Under the lock, with the key file the database's: every pending
+            -- file is from a rotation that never committed.
+            for stale in ← pendingFiles path do IO.FS.removeFile stale
             Sys.writeNewPrivate next.toString new
             Sys.fsyncDir (dirOf next).toString
             if interrupt == some .afterNew then
@@ -256,15 +342,21 @@ def rotate (store : Store) (path : System.FilePath) (now : Nat)
       catch e =>
         -- Committed after all (an error past the commit): the new key is the
         -- database's now, and `resolve` installs it.
-        if (← store.recordedRootKey) == some newId then throw unfinished
+        if (← store.recordedRootKey) == some newId then throw (unfinished s!"{e}")
         -- Rolled back: the new key sealed nothing and is of no use.  A test's
         -- interruption leaves it, as a crash would.
         if interrupt != some .afterNew then removeIfHolds next new
         throw e
     if interrupt == some .afterCommit then
       throw (.userError "interrupted after the commit")
-    discard <| Sys.installFile next.toString path.toString old
-    unless (← tryLoad path).map rootKeyId == some newId do throw unfinished
+    afterCommit
+    let code ← try Sys.installFile next.toString path.toString old
+      catch e => throw (unfinished s!"{e}")
+    unless (← tryLoad path).map rootKeyId == some newId do
+      throw (unfinished "it does not hold the new key")
+    if code == 2 then
+      IO.eprintln s!"pyle: warning: the old root key's bytes could not be overwritten (the \
+        file was not writable); delete every other copy of it all the same"
     return { oldId, newId, resealed }
   finally
     store.run fun c => c.exec "PRAGMA synchronous = NORMAL"

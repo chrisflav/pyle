@@ -12,7 +12,9 @@ the account has an address, and `groups` when it includes `groups`
 (`scopedClaims`, as in the ID token).  The access
 token is a biscuit, verified here as any service verifies one
 (`Token.verify`), for the audience `pyle`, which every access token pyle
-issues includes.  The account is read afresh, so a disabled one gets nothing.
+issues includes.  The account is read afresh, so a disabled one gets nothing,
+and must be the one the token was issued for (`tokenIsFor`): a token of a
+removed account does not answer for a new account given the same name.
 
 A missing or bad token is answered `401` with a `WWW-Authenticate` challenge,
 naming `invalid_token` when there was a token (RFC 6750 §3).
@@ -39,6 +41,17 @@ def bearerChallenge (invalid : Bool) : Reply :=
   (noStore (Reply.error .unauthorized (if invalid then "invalid_token" else "invalid_request")))
     |>.withHeader "WWW-Authenticate" challenge
 
+/-- Whether an access token speaks for this account, the one that has its
+name now.  A name can be given again after `pyle user remove`, so the name
+alone is not enough: a token that states the account's `subject` (its user
+handle, never reused) must state this account's, and a token from before
+pyle stated it is accepted only if the account already existed at the
+sign-in it descends from — an account created since is another one. -/
+def tokenIsFor (u : Store.User) (identity : Token.Identity) : Bool :=
+  match identity.subject with
+  | some s => s == subjectOf u
+  | none => identity.authTime.any (u.created ≤ ·)
+
 /-- The live account an access token presented to pyle speaks for. -/
 def bearerUser (ctx : Ctx) (r : Req) : IO (Except Reply (Store.User × Token.Identity)) := do
   let some t := bearerToken r | return .error (bearerChallenge false)
@@ -47,7 +60,8 @@ def bearerUser (ctx : Ctx) (r : Req) : IO (Except Reply (Store.User × Token.Ide
   | .ok identity =>
     match ← ctx.store.findUserByName identity.user with
     | some u =>
-      if u.disabled then return .error (bearerChallenge true) else return .ok (u, identity)
+      if u.disabled || !tokenIsFor u identity then return .error (bearerChallenge true)
+      else return .ok (u, identity)
     | none => return .error (bearerChallenge true)
 
 /-- `GET /userinfo` and `POST /userinfo`. -/

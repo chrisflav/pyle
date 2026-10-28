@@ -312,7 +312,7 @@ def codeFlowTests : IO Unit := withCtx fun ctx clock => do
   checkEq "a public client authenticates with none" t5.status.toCode 200
   -- A disabled account gets nothing more.
   let code6 ← obtainCode ctx cookie
-  discard <| ctx.store.setUserDisabled alice.id true
+  discard <| ctx.store.setUserDisabled alice.id true 1
   checkEq "a disabled account's code is refused" (jsonStr (← exchange ctx code6 secret) "error")
     (some "invalid_grant")
   checkEq "and its access token no longer reads userinfo"

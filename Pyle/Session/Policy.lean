@@ -597,7 +597,7 @@ def checkTotp (ctx : Ctx) (user : UserId) (code : String) (clientAddress : Strin
       if let some a := apps.find? (·.id == app) then
         if a.legacyAd then
           if let some (_, secret, _) := opened.find? (·.1 == app) then
-            discard <| ctx.store.resealTotpApp user app
+            discard <| ctx.store.resealTotpApp user app (Store.rootKeyId ctx.rootKey)
               (← SignIn.Secrets.sealTotpApp ctx.rootKey user app secret)
       return .ok ⟨user, .totp, false, false, s!"totp:{app}"⟩
     return .error (.wrong (← ctx.store.recordTotpFailure user now))

@@ -87,6 +87,11 @@ def Store.listSessions (s : Store) (user : UserId) : IO (Array SessionRow) :=
     s!"SELECT {sessionColumns} FROM sessions WHERE user_id = ? ORDER BY last_seen DESC"
     #[user] readSession
 
+/-- Every session, most recently used first: for `pyle sessions list`. -/
+def Store.listAllSessions (s : Store) : IO (Array SessionRow) :=
+  s.run fun c => query c
+    s!"SELECT {sessionColumns} FROM sessions ORDER BY last_seen DESC" #[] readSession
+
 /-- End one session.  The user is part of the condition, so one user cannot end
 another's session by naming its hash.  Whether it existed. -/
 def Store.deleteSession (s : Store) (user : UserId) (idHash : SecretHash) : IO Bool :=
@@ -143,12 +148,17 @@ structure Challenge where
   /-- For a registration, the kind of authenticator asked for: `passkey`,
   `security-key`, or empty for either. -/
   kind : String := ""
+  /-- For an invitation's registration, the user handle the browser was given
+  for the account it creates; none for a challenge begun before migration 9. -/
+  userHandle : Option ByteArray := none
 
 /-- Record a new challenge. -/
 def Store.addChallenge (s : Store) (ch : Challenge) : IO Unit := s.run fun c => do
   discard <| exec c
-    "INSERT INTO challenges (challenge, purpose, user_id, expires, kind) VALUES (?, ?, ?, ?, ?)"
-    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, ch.kind]
+    "INSERT INTO challenges (challenge, purpose, user_id, expires, kind, user_handle) \
+      VALUES (?, ?, ?, ?, ?, ?)"
+    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, ch.kind,
+      Value.opt ch.userHandle]
 
 /-- A challenge row as `consumeChallenge` deletes it: the stored purpose, the
 user it was issued to, and its expiry. -/
@@ -161,6 +171,8 @@ structure ChallengeRow where
   expires : Nat
   /-- The `kind` column. -/
   kind : String := ""
+  /-- The `user_handle` column. -/
+  userHandle : Option ByteArray := none
 
 /-- Whether a deleted challenge row may be used: the challenge `value`, if
 the row was there, was issued for `purpose`, and had not expired at `now`.
@@ -170,7 +182,8 @@ def challengeDecision (value : ByteArray) (purpose : ChallengePurpose) (now : Na
     Option ChallengeRow → Option Challenge
   | some r =>
     if r.purpose == purpose.toString && now < r.expires then
-      some { value, purpose, user := r.user.map (⟨·⟩), expires := r.expires, kind := r.kind }
+      some { value, purpose, user := r.user.map (⟨·⟩), expires := r.expires, kind := r.kind,
+             userHandle := r.userHandle }
     else none
   | none => none
 
@@ -190,10 +203,12 @@ a challenge uses it up, whatever happens next.  The test is
 def Store.consumeChallenge (s : Store) (value : ByteArray) (purpose : ChallengePurpose)
     (now : Nat) : IO (Option Challenge) := s.run fun c => do
   let row ← queryOne c
-    "DELETE FROM challenges WHERE challenge = ? RETURNING purpose, user_id, expires, kind"
+    "DELETE FROM challenges WHERE challenge = ? \
+      RETURNING purpose, user_id, expires, kind, user_handle"
     #[value] fun st => do
       return { purpose := ← colText st 0, user := ← colOpt colInt st 1,
-               expires := ← colNat st 2, kind := ← colText st 3 : ChallengeRow }
+               expires := ← colNat st 2, kind := ← colText st 3,
+               userHandle := ← colOpt colBlob st 4 : ChallengeRow }
   return challengeDecision value purpose now row
 
 /-- Remove every expired challenge; how many. -/

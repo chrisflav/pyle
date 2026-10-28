@@ -40,8 +40,14 @@ structure Ctx where
   store : Store.Store
   /-- The rate limiter for endpoints that check a factor. -/
   limiter : RateLimiter
-  /-- The root key (§6.3), for sealing secret columns. -/
+  /-- The root key (§6.3), for sealing secret columns: the one that was
+  current when the request arrived. -/
   rootKey : ByteArray
+  /-- For a server that should notice `pyle root-key rotate`: the fingerprint
+  and the key it holds, which `Server.route` compares against the database's
+  before each request and reloads when they differ.  `none` keeps `rootKey`
+  as it is, as tests do. -/
+  rootKeyCache : Option (IO.Ref (ByteArray × ByteArray)) := none
   /-- The current time in seconds since the Unix epoch.  A field rather than a
   call to the system clock so that tests can move time forward. -/
   clock : IO Nat

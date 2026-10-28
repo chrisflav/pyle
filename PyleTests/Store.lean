@@ -106,7 +106,7 @@ def userTests : IO Unit := withCtx fun ctx _ => do
     (← throws (s.findUserByName "alice\x00whatever"))
   check "and cannot be stored" (← throws (s.putClient (sampleClient "app\x00x")))
   checkEq "listed by name" ((← s.listUsers).map (·.name)) #["alice", "bob"]
-  check "disabled" (← s.setUserDisabled bob.id true)
+  check "disabled" (← s.setUserDisabled bob.id true 1).isSome
   checkEq "and reads back disabled" ((← s.findUser bob.id).map (·.disabled)) (some true)
 
 /-- Email addresses and display names: what is accepted, how it is stored,
@@ -283,7 +283,7 @@ def sampleCredential (user : UserId) (id : ByteArray) (userVerified : Bool := tr
 under the cap. -/
 def addApp (s : Store) (user : UserId) (name : String) (step : Option Nat := none)
     (sealFor : Int → IO ByteArray := fun _ => pure "sealed".toUTF8) : IO TotpApp := do
-  let some a ← s.addTotpApp user name step 5 sealFor
+  let some a ← s.addTotpApp user name step 5 .empty sealFor
     | throw (.userError "addApp: the app was refused")
   return a
 
@@ -372,7 +372,7 @@ def wayInTests : IO Unit := withCtx fun ctx _ => do
   s.addCredential (sampleCredential r.id "r0".toUTF8)
   s.addCredential (sampleCredential r.id "r1".toUTF8 (userVerified := false))
   s.addCredential (sampleCredential r.id "r2".toUTF8 (userVerified := false))
-  s.setRecoveryCodes r.id codes
+  s.setRecoveryCodes r.id .empty codes
   checkEq "the key that verifies cannot go, leaving touch-only keys and recovery codes"
     (← s.removeCredential r.id "r0".toUTF8) .wouldLockOut
   check "and is kept" ((← s.findCredential "r0".toUTF8).isSome)
@@ -380,7 +380,7 @@ def wayInTests : IO Unit := withCtx fun ctx _ => do
   s.addCredential (sampleCredential q.id "q1".toUTF8 (userVerified := false))
   s.addCredential (sampleCredential q.id "q2".toUTF8 (userVerified := false))
   s.setPassword q.id "phc" 1
-  s.setRecoveryCodes q.id codes
+  s.setRecoveryCodes q.id .empty codes
   checkEq "the password cannot go, leaving touch-only keys and recovery codes"
     (← s.removePassword q.id) .wouldLockOut
   check "though the account's level still counts the codes"
@@ -389,7 +389,7 @@ def wayInTests : IO Unit := withCtx fun ctx _ => do
   let y ← s.addUser "yan" [] 1
   for i in [0:maxTotpApps] do discard <| addApp s y.id s!"app {i}"
   check "a sixth app is refused"
-    ((← s.addTotpApp y.id "one more" none 9 fun _ => pure .empty).isNone)
+    ((← s.addTotpApp y.id "one more" none 9 .empty fun _ => pure .empty).isNone)
   checkEq "and not stored" (← s.listTotpApps y.id).size maxTotpApps
 
 /-- TOTP replay and lockout, and recovery codes. -/
@@ -446,7 +446,7 @@ def storedFactorTests : IO Unit := withCtx fun ctx _ => do
   let c ← addApp s u.id "new"
   check "ids are not reused" (c.id > b.id)
   let codes := ["a", "b", "c"].map (·.toUTF8)
-  s.setRecoveryCodes u.id codes
+  s.setRecoveryCodes u.id .empty codes
   checkEq "three unspent" (← s.unspentRecoveryCodes u.id) 3
   check "a code is spent once" (← s.spendRecoveryCode u.id "b".toUTF8 10)
   check "and not twice" (!(← s.spendRecoveryCode u.id "b".toUTF8 11))
@@ -639,8 +639,8 @@ def deviceTests : IO Unit := withCtx fun ctx _ => do
   let k (kid : String) (state : KeyState) : StoredKey :=
     { kid, algorithm := "ES256", state, sealedKey := "sealed".toUTF8,
       publicKey := "pub".toUTF8, created := 1 }
-  s.addKey (k "k1" .current)
-  s.addKey (k "k2" .next)
+  s.addKey (k "k1" .current) .empty
+  s.addKey (k "k2" .next) .empty
   check "a next key is promoted" (← s.promoteKey "k2")
   check "a key that is not next is not" (!(← s.promoteKey "k1"))
   let states := (← s.listKeys).toList.map fun k => (k.kid, k.state.toString)

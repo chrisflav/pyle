@@ -413,7 +413,7 @@ def totpMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
     (← s.run fun c => Store.query c
       "SELECT COUNT(*) FROM sqlite_master WHERE name = 'totp'" #[] (Store.colNat · 0)) #[0]
   -- The old associated data opens only the rows migration 6 made.
-  let some moved ← s.addTotpApp ⟨1⟩ "copy" none 9 fun _ => pure sealed
+  let some moved ← s.addTotpApp ⟨1⟩ "copy" none 9 .empty fun _ => pure sealed
     | check "a copy" false
   check "the old sealed secret moved into another of the user's apps does not open"
     ((SignIn.Secrets.openTotpApp rootKey ⟨1⟩ moved.id sealed moved.legacyAd).toOption.isNone &&
@@ -426,7 +426,7 @@ def totpMigrationTests : IO Unit := IO.FS.withTempDir fun dir => do
   let deeSecret ← Factor.Totp.generateSecret
   let deeOld ← Crypto.«seal» (SignIn.Secrets.totpKey rootKey) (SignIn.Secrets.userAd ⟨4⟩)
     deeSecret
-  let some dee ← s.addTotpApp ⟨4⟩ "dee's" none 9 fun _ => pure deeOld | check "dee's app" false
+  let some dee ← s.addTotpApp ⟨4⟩ "dee's" none 9 .empty fun _ => pure deeOld | check "dee's app" false
   checkEq "a new app can have its user's id" dee.id 4
   check "and refuses a secret sealed with the old associated data"
     ((SignIn.Secrets.openTotpApp rootKey ⟨4⟩ dee.id deeOld dee.legacyAd).toOption.isNone)
@@ -672,7 +672,7 @@ def addPageTests : IO Unit := withCtx fun ctx clock => do
   -- The recovery-codes page asks before replacing.
   let rec0 := (← getPage ctx "/account/add/recovery-codes" id).bodyText
   check "with no codes, nothing to replace" (containsStr rec0 "data-replace=\"false\"")
-  discard <| ctx.store.setRecoveryCodes u.id ["a".toUTF8]
+  discard <| ctx.store.setRecoveryCodes u.id .empty ["a".toUTF8]
   let rec1 := (← getPage ctx "/account/add/recovery-codes" id).bodyText
   check "with codes, it asks first" (containsStr rec1 "data-replace=\"true\"" &&
     containsStr rec1 "New codes replace them")

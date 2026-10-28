@@ -89,8 +89,12 @@ def Store.promoteKeyOf (s : Store) (algorithm kid : String) : IO Bool :=
 
 /-- Record a key as its algorithm's current one, if that algorithm has none
 yet: the first key, made when pyle first needs one.  Whether it was recorded;
-if two processes race, one key wins and the other is not stored. -/
-def Store.addFirstKey (s : Store) (k : StoredKey) : IO Bool := s.atomically fun c => do
+if two processes race, one key wins and the other is not stored.  `keyId` is
+the fingerprint of the root key it is sealed under, refused if that has been
+replaced (`requireRootKeyIn`). -/
+def Store.addFirstKey (s : Store) (k : StoredKey) (keyId : ByteArray) : IO Bool :=
+    s.atomically fun c => do
+  requireRootKeyIn c keyId
   let existing ← queryOne c
     "SELECT 1 FROM keys WHERE algorithm = ? AND state = 'current'" #[k.algorithm] (colInt · 0)
   if existing.isSome then return false
@@ -98,6 +102,74 @@ def Store.addFirstKey (s : Store) (k : StoredKey) : IO Bool := s.atomically fun 
     s!"INSERT INTO keys ({keyColumns}) VALUES (?, ?, 'current', ?, ?, ?)"
     #[k.kid, k.algorithm, k.sealedKey, k.publicKey, k.created]
   return true
+
+/-- Record a key sealed under the root key whose fingerprint is `keyId`;
+refused if that has been replaced (`requireRootKeyIn`). -/
+def Store.addKey (s : Store) (k : StoredKey) (keyId : ByteArray) : IO Unit :=
+  s.atomically fun c => do
+    requireRootKeyIn c keyId
+    discard <| exec c
+      s!"INSERT INTO keys ({keyColumns}) VALUES (?, ?, ?, ?, ?, ?)"
+      #[k.kid, k.algorithm, k.state.toString, k.sealedKey, k.publicKey, k.created]
+
+/-! ## Replacing the root key -/
+
+/-- What re-sealing under a new root key changed. -/
+structure Resealed where
+  /-- Signing keys re-sealed, retired ones included. -/
+  keys : Nat
+  /-- Authenticator apps whose secrets were re-sealed. -/
+  totpApps : Nat
+  /-- Recovery codes deleted: their HMACs are keyed by the old root key and
+  cannot be recomputed. -/
+  recoveryCodes : Nat
+  /-- Accounts that had recovery codes. -/
+  recoveryAccounts : Nat
+  deriving Repr, Inhabited
+
+/-- Move everything sealed under the root key whose fingerprint is `oldId` to
+the one whose fingerprint is `newId`, in one `BEGIN IMMEDIATE` transaction:
+
+1. check that `oldId` is the recorded fingerprint, and run `prepare` (which
+   writes the new key's file) with the write lock held;
+2. replace the sealed column of every signing key by `resealKey` of it, and
+   the secret of every authenticator app by `resealApp` of it, clearing its
+   `legacy_ad` flag — both callbacks re-seal under the new key and check that
+   the result opens, and throw otherwise, which rolls everything back;
+3. delete every recovery code;
+4. record `newId`, and let `record` add to the audit log in the same
+   transaction.
+
+Nothing sealed under the old key can be written meanwhile: every such write
+checks the fingerprint inside its own transaction, behind the same lock. -/
+def Store.resealRootKey (s : Store) (oldId newId : ByteArray) (now : Nat) (prepare : IO Unit)
+    (resealKey : StoredKey → IO ByteArray) (resealApp : TotpApp → IO ByteArray)
+    (record : SQLite → Resealed → IO Unit) : IO Resealed := s.atomically fun c => do
+  unless (← recordedRootKeyIn c) == some oldId do
+    throw (.userError "the database is not sealed under this root key")
+  prepare
+  let keys ← query c s!"SELECT {keyColumns} FROM keys" #[] readKeyRow
+  for k in keys do
+    discard <| exec c "UPDATE keys SET sealed = ? WHERE kid = ?" #[← resealKey k, k.kid]
+  let apps ← query c s!"SELECT {totpAppColumns} FROM totp_apps" #[] readTotpApp
+  for a in apps do
+    discard <| exec c "UPDATE totp_apps SET secret = ?, legacy_ad = 0 WHERE id = ?"
+      #[← resealApp a, a.id]
+  let accounts ← queryOne c "SELECT COUNT(DISTINCT user_id) FROM recovery_codes" #[]
+    (colNat · 0)
+  let codes ← exec c "DELETE FROM recovery_codes"
+  replaceRootKeyIn c newId now
+  let r : Resealed :=
+    { keys := keys.size, totpApps := apps.size, recoveryCodes := codes,
+      recoveryAccounts := accounts.getD 0 }
+  record c r
+  return r
+
+/-- Every signing key and every authenticator app, as stored: for checking
+that a root key opens what the database holds. -/
+def Store.sealedRows (s : Store) : IO (Array StoredKey × Array TotpApp) := s.run fun c => do
+  return (← query c s!"SELECT {keyColumns} FROM keys" #[] readKeyRow,
+    ← query c s!"SELECT {totpAppColumns} FROM totp_apps" #[] readTotpApp)
 
 /-! ## Refresh tokens by user and client -/
 

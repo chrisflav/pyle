@@ -5,6 +5,7 @@ import Pyle.SignIn.Routes
 import Pyle.Audit
 import Pyle.Sys
 import Pyle.Oidc.Routes
+import Pyle.RootKey
 
 /-!
 # The server
@@ -66,45 +67,97 @@ def routes : List Route := [
   .mk' .post "/logout" logout
 ] ++ SignIn.routes ++ Oidc.routes
 
-/-- Answer one request. -/
-def route (ctx : Ctx) (r : Req) : IO Reply := dispatch routes ctx r
+/-- How often a server whose key is not yet the key file's tries to install
+it, in seconds. -/
+def settleSeconds : Nat := 10
+
+/-- The context with the root key the database is sealed under now.  A
+context with a `rootKeyCache` compares the fingerprint it holds with the
+database's — one indexed read — and, when `pyle root-key rotate` has replaced
+the key since, reads the new one (`RootKey.resolve`, which also finishes a
+rotation that stopped before installing its key) and keeps it for the
+requests after.  It does not wait for the root key's lock: while a rotation
+holds it, the pending key is used as it is and the rotation installs it.
+
+A rotation can also die between its commit and its rename, after the server
+found the lock taken and took the pending key.  The fingerprints then agree,
+and nothing would ever install the key: the key file would stay the old one —
+and a backup of it with the database unrestorable — for as long as the server
+runs.  So while the key in use is not the key file's (`rootKeyUnsettled`
+holds when that was last tried), the server tries again to finish the
+rename, at most once every `settleSeconds`. -/
+def withCurrentRootKey (ctx : Ctx) : IO Ctx := do
+  let some cache := ctx.rootKeyCache | return ctx
+  let (held, key) ← cache.get
+  match ← ctx.store.recordedRootKey with
+  | some recorded =>
+    if recorded == held then
+      settle ctx key
+      return { ctx with rootKey := key }
+    let key ← RootKey.resolve ctx.store ctx.config.rootKeyFile (← ctx.clock)
+      (locking := .tryOnly)
+    cache.set (Store.rootKeyId key, key)
+    IO.eprintln s!"pyle: the root key was replaced; now using {RootKey.showId recorded}"
+    if let some unsettled := ctx.rootKeyUnsettled then
+      let onDisk ← RootKey.tryLoad ctx.config.rootKeyFile
+      let now ← ctx.clock
+      unsettled.set (if onDisk == some key then none else some now)
+    return { ctx with rootKey := key }
+  | none => return { ctx with rootKey := key }
+where
+  /-- Retry installing a key that is in use but not yet the key file's. -/
+  settle (ctx : Ctx) (key : ByteArray) : IO Unit := do
+    let some unsettled := ctx.rootKeyUnsettled | return
+    let some last ← unsettled.get | return
+    let now ← ctx.clock
+    if now < last + settleSeconds then return
+    unsettled.set (some now)
+    try
+      discard <| RootKey.resolve ctx.store ctx.config.rootKeyFile now (locking := .tryOnly)
+    catch e => IO.eprintln s!"pyle: installing the root key: {e}"
+    if (← RootKey.tryLoad ctx.config.rootKeyFile) == some key then
+      unsettled.set none
+      IO.eprintln "pyle: the root key file now holds the key in use"
+
+/-- Answer one request, under the current root key.  A root key that cannot
+be read any more is a `503` until it can. -/
+def route (ctx : Ctx) (r : Req) : IO Reply := do
+  let ctx ← try withCurrentRootKey ctx
+    catch e =>
+      IO.eprintln s!"pyle: the root key: {e}"
+      return withSecurityHeaders (hsts := ctx.config.issuer.startsWith "https://") <|
+        Reply.error .serviceUnavailable "unavailable" "the server cannot read its root key"
+  dispatch routes ctx r
 
 /-! ## Start-up -/
 
 /-- The length of the root key, in bytes. -/
-def rootKeyBytes : Nat := 32
+def rootKeyBytes : Nat := RootKey.bytes
 
-/-- Write a new random root key to `path`, readable only by its owner.  The
-file is created by one `open` with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
-0600 and written through that descriptor (`Sys.writeNewPrivate`), so it is
-never readable by anyone else, is not reached through a planted symbolic link,
-and an existing file is never replaced: losing the root key loses every secret
-sealed under it. -/
-def createRootKey (path : System.FilePath) : IO Unit := do
-  if let some dir := path.parent then
-    if !dir.toString.isEmpty then IO.FS.createDirAll dir
-  try Sys.writeNewPrivate path.toString (← Crypto.randomBytes rootKeyBytes.toUSize)
-  catch e => throw (.userError s!"cannot create the root key {path} (it must not exist): {e}")
+/-- Write a new random root key to `path`, readable only by its owner
+(`RootKey.create`). -/
+def createRootKey (path : System.FilePath) : IO Unit := RootKey.create path
 
 /-- Make every file the process creates from now on private to its owner
 (`umask 077`): the database and the journal files SQLite creates beside it. -/
 def restrictFileModes : IO Unit := discard <| Sys.umask 0o077
 
-/-- Read the root key, checking its length. -/
-def loadRootKey (path : System.FilePath) : IO ByteArray := do
-  let key ← try IO.FS.readBinFile path
-    catch e => throw (.userError s!"cannot read the root key {path}: {e}")
-  unless key.size == rootKeyBytes do
-    throw (.userError s!"{path} is not a root key ({key.size} bytes, expected {rootKeyBytes})")
-  return key
+/-- Read a root key file, checking its length (`RootKey.load`). -/
+def loadRootKey (path : System.FilePath) : IO ByteArray := RootKey.load path
 
-/-- Open the database (migrating it) and read the root key: everything a
-handler needs. -/
+/-- Open the database (migrating it) and the root key it is sealed under
+(`RootKey.resolve`): everything a handler needs.  Without a key file there is
+nothing to open, and no database is created. -/
 def openCtx (config : Config) (clock : IO Nat := systemClock) : IO Ctx := do
   restrictFileModes
-  let rootKey ← loadRootKey config.rootKeyFile
+  unless (← config.rootKeyFile.pathExists) ||
+      !(← RootKey.pendingFiles config.rootKeyFile).isEmpty do
+    discard <| RootKey.load config.rootKeyFile
   let store ← Store.Store.openAt config.database (← clock)
-  return { config, store, limiter := ← RateLimiter.new, rootKey, clock }
+  let rootKey ← RootKey.resolve store config.rootKeyFile (← clock)
+  return { config, store, limiter := ← RateLimiter.new, rootKey, clock,
+           rootKeyCache := some (← IO.mkRef (Store.rootKeyId rootKey, rootKey)),
+           rootKeyUnsettled := some (← IO.mkRef none) }
 
 /-! ## The `Std.Http` adapter -/
 

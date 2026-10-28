@@ -1,4 +1,5 @@
 import Pyle.Store.Schema
+import Pyle.Store.RootKey
 import Pyle.Crypto.Ffi
 import Pyle.Session.Acr
 
@@ -252,15 +253,105 @@ def Store.findUserByHandle (s : Store) (handle : ByteArray) : IO (Option User) :
 def Store.listUsers (s : Store) : IO (Array User) := s.run fun c =>
   query c s!"SELECT {userColumns} FROM users ORDER BY name" #[] readUser
 
-/-- Disable or re-enable an account.  Disabling also ends its sessions.
-Whether the account existed. -/
-def Store.setUserDisabled (s : Store) (id : UserId) (disabled : Bool) : IO Bool :=
-  s.atomically fun c => do
-    let n ← exec c "UPDATE users SET disabled = ? WHERE id = ?"
-      #[(if disabled then (1 : Nat) else 0 : Nat), id]
-    if disabled then
-      discard <| exec c "DELETE FROM sessions WHERE user_id = ?" #[id]
-    return n > 0
+/-- What ending access came to: how many sessions ended, how many
+refresh-token families were revoked, and how many codes not yet redeemed —
+authorization codes, approved device codes, forward-authentication codes —
+were withdrawn. -/
+structure Revocation where
+  /-- Sessions ended. -/
+  sessions : Nat := 0
+  /-- Refresh-token families revoked, those tied to a session and those not
+  (`offline_access`, the device grant) alike. -/
+  families : Nat := 0
+  /-- Codes withdrawn. -/
+  codes : Nat := 0
+  /-- Pending invitations deleted, by a removal (`removeUserIn`). -/
+  invitations : Nat := 0
+  deriving Inhabited, Repr
+
+/-- End the access of one account, or of every account: inside a
+transaction, withdraw the forward-authentication codes of its sessions, revoke
+every refresh-token family it holds (recording each in `revoked_families`, so
+nothing is ever added to it again), end its sessions, delete its
+authorization codes and deny its approved device codes, so that nothing
+already handed out leads to a new session or token.  Access tokens already
+issued are biscuits, checked offline, and live until they expire; `/userinfo`
+and the kleis attestation read the account afresh. -/
+def endAccessIn (c : SQLite) (user : Option UserId) (now : Nat) : IO Revocation := do
+  let forward ← match user with
+    | some u =>
+      exec c ("DELETE FROM forward_auth_codes WHERE session_hash IN " ++
+        "(SELECT id_hash FROM sessions WHERE user_id = ?)") #[u]
+    | none => exec c "DELETE FROM forward_auth_codes"
+  let families ← match user with
+    | some u =>
+      query c "SELECT DISTINCT family FROM refresh_tokens WHERE user_id = ?" #[u] (colBlob · 0)
+    | none => query c "SELECT DISTINCT family FROM refresh_tokens" #[] (colBlob · 0)
+  for f in families do
+    discard <| exec c
+      "INSERT OR IGNORE INTO revoked_families (family, revoked) VALUES (?, ?)" #[f, now]
+    discard <| exec c "DELETE FROM refresh_tokens WHERE family = ?" #[f]
+  -- Ending a session revokes the families tied to it as well (the trigger of
+  -- migration 4), tokens or no tokens.
+  let (sessions, codes, devices) ← match user with
+    | some u => do
+      let s ← exec c "DELETE FROM sessions WHERE user_id = ?" #[u]
+      let k ← exec c "DELETE FROM codes WHERE user_id = ?" #[u]
+      let d ← exec c
+        "UPDATE device_codes SET status = 'denied' WHERE status = 'approved' AND user_id = ?" #[u]
+      pure (s, k, d)
+    | none => do
+      let s ← exec c "DELETE FROM sessions"
+      let k ← exec c "DELETE FROM codes"
+      let d ← exec c "UPDATE device_codes SET status = 'denied' WHERE status = 'approved'"
+      pure (s, k, d)
+  return { sessions, families := families.size, codes := forward + codes + devices }
+
+/-- End the access of one account, or of everyone's (`endAccessIn`), in one
+transaction. -/
+def Store.endAccess (s : Store) (user : Option UserId) (now : Nat) : IO Revocation :=
+  s.atomically (endAccessIn · user now)
+
+/-- Disable or re-enable an account.  Disabling also ends its access
+(`endAccessIn`) in the same transaction.  `none` if there is no such
+account. -/
+def setUserDisabledIn (c : SQLite) (id : UserId) (disabled : Bool) (now : Nat) :
+    IO (Option Revocation) := do
+  let n ← exec c "UPDATE users SET disabled = ? WHERE id = ?"
+    #[(if disabled then (1 : Nat) else 0 : Nat), id]
+  if n == 0 then return none
+  if disabled then return some (← endAccessIn c (some id) now)
+  return some {}
+
+/-- `setUserDisabledIn`, in a transaction of its own. -/
+def Store.setUserDisabled (s : Store) (id : UserId) (disabled : Bool) (now : Nat) :
+    IO (Option Revocation) :=
+  s.atomically (setUserDisabledIn · id disabled now)
+
+/-- Remove an account and everything that is its: its access is ended first
+(`endAccessIn`), and the rest — credentials, authenticator apps, recovery
+codes, password, challenges — goes with the row, by `ON DELETE CASCADE`.
+Pending invitations for its name, or for its email address in any case, are
+deleted too: one redeemed afterwards would make a new account with the old
+one's name or address, which a service that keys accounts by either (Zulip,
+by address) would take for the removed one.  The account as it was, and what
+ending its access came to (`invitations` counting those deleted); `none` if
+there is no such account. -/
+def removeUserIn (c : SQLite) (id : UserId) (now : Nat) : IO (Option (User × Revocation)) := do
+  let some u ← queryOne c s!"SELECT {userColumns} FROM users WHERE id = ?" #[id] readUser
+    | return none
+  let r ← endAccessIn c (some id) now
+  let byName ← exec c "DELETE FROM invitations WHERE user_name = ?" #[u.name]
+  let byEmail ← match u.email with
+    | some e =>
+      exec c "DELETE FROM invitations WHERE email IS NOT NULL AND lower(email) = lower(?)" #[e]
+    | none => pure 0
+  discard <| exec c "DELETE FROM users WHERE id = ?" #[id]
+  return some (u, { r with invitations := byName + byEmail })
+
+/-- `removeUserIn`, in a transaction of its own. -/
+def Store.removeUser (s : Store) (id : UserId) (now : Nat) : IO (Option (User × Revocation)) :=
+  s.atomically (removeUserIn · id now)
 
 /-- Replace an account's groups.  Whether the account existed. -/
 def Store.setUserGroups (s : Store) (id : UserId) (groups : List String) : IO Bool :=
@@ -519,9 +610,13 @@ def maxTotpApps : Nat := 5
 `none` then.  The secret is sealed by `sealFor`, which is given the new row's
 id, so that the sealed secret can be bound to its row; the count, the row and
 its secret are written in one transaction.  `lastStep` is the step of the
-code that confirmed it, which is then used up. -/
+code that confirmed it, which is then used up.  `keyId` is the fingerprint of
+the root key `sealFor` seals under; the transaction refuses it if that is no
+longer the recorded one (`requireRootKeyIn`). -/
 def Store.addTotpApp (s : Store) (user : UserId) (name : String) (lastStep : Option Nat)
-    (now : Nat) (sealFor : Int → IO ByteArray) : IO (Option TotpApp) := s.atomically fun c => do
+    (now : Nat) (keyId : ByteArray) (sealFor : Int → IO ByteArray) : IO (Option TotpApp) :=
+    s.atomically fun c => do
+  requireRootKeyIn c keyId
   let n ← queryOne c "SELECT COUNT(*) FROM totp_apps WHERE user_id = ?" #[user] (colNat · 0)
   if n.getD 0 ≥ maxTotpApps then return none
   let some id ← queryOne c
@@ -557,9 +652,12 @@ def Store.removeTotpApp (s : Store) (user : UserId) (id : Int) (passwords : Bool
     exec c "DELETE FROM totp_apps WHERE id = ? AND user_id = ?" #[id, user]
 
 /-- Replace the secret of an app still sealed with the old associated data by
-one sealed for its row, and clear its `legacyAd` flag.  Whether it applied. -/
-def Store.resealTotpApp (s : Store) (user : UserId) (id : Int) (sealedSecret : ByteArray) :
-    IO Bool := s.run fun c => return (← exec c
+one sealed for its row, and clear its `legacyAd` flag.  Whether it applied;
+not if the root key it was sealed under (`keyId`) has been replaced since. -/
+def Store.resealTotpApp (s : Store) (user : UserId) (id : Int) (keyId sealedSecret : ByteArray) :
+    IO Bool := s.atomically fun c => do
+  if (← recordedRootKeyIn c).any (· != keyId) then return false
+  return (← exec c
       "UPDATE totp_apps SET secret = ?, legacy_ad = 0 \
         WHERE id = ? AND user_id = ? AND legacy_ad = 1" #[sealedSecret, id, user]) > 0
 
@@ -608,9 +706,11 @@ def Store.recordTotpFailure (s : Store) (user : UserId) (now : Nat)
 /-! ## Recovery codes -/
 
 /-- Replace a user's recovery codes with new digests (HMAC-SHA256 under a
-server key, computed by `Pyle.Factor`). -/
-def Store.setRecoveryCodes (s : Store) (user : UserId) (digests : List ByteArray) :
-    IO Unit := s.atomically fun c => do
+server key derived from the root key whose fingerprint is `keyId`, computed
+by `Pyle.Factor`).  Refused if that root key has been replaced since. -/
+def Store.setRecoveryCodes (s : Store) (user : UserId) (keyId : ByteArray)
+    (digests : List ByteArray) : IO Unit := s.atomically fun c => do
+  requireRootKeyIn c keyId
   discard <| exec c "DELETE FROM recovery_codes WHERE user_id = ?" #[user]
   for d in digests do
     discard <| exec c "INSERT INTO recovery_codes (user_id, digest) VALUES (?, ?)" #[user, d]

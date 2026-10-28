@@ -411,13 +411,6 @@ private def readKey (st : SQLite.Stmt) : IO StoredKey := do
   return { kid := ← colText st 0, algorithm := ← colText st 1, state,
            sealedKey := ← colBlob st 3, publicKey := ← colBlob st 4, created := ← colNat st 5 }
 
-/-- Record a key. -/
-def Store.addKey (s : Store) (k : StoredKey) : IO Unit := s.run fun c => do
-  discard <| exec c
-    "INSERT INTO keys (kid, algorithm, state, sealed, public_key, created) \
-      VALUES (?, ?, ?, ?, ?, ?)"
-    #[k.kid, k.algorithm, k.state.toString, k.sealedKey, k.publicKey, k.created]
-
 /-- Every key not retired, newest first. -/
 def Store.listKeys (s : Store) : IO (Array StoredKey) := s.run fun c =>
   query c "SELECT kid, algorithm, state, sealed, public_key, created FROM keys \

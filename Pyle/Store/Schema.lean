@@ -382,10 +382,38 @@ def migration8 : Migration where
     "ALTER TABLE invitations ADD COLUMN display_name TEXT"
   ]
 
+/-- Replacing the root key (DESIGN.md §6.3, `pyle root-key rotate`):
+
+* `root_key` holds one row: the fingerprint of the root key everything sealed
+  in the database is sealed under — an HKDF output of the key, never the key
+  itself (`Store.rootKeyId`) — and when it was recorded.  The migration
+  cannot know the key, so it leaves the table empty, and the first process
+  that opens the database with the key records it (`RootKey.resolve`).  From
+  then on a key file that does not match is refused, every write that seals
+  something checks in its own transaction that its key is still the recorded
+  one, and a rotation changes the row in the transaction that re-seals
+  everything;
+* `challenges.user_handle` is the WebAuthn user handle an invitation's
+  registration was begun with, so that finishing it does not derive the
+  handle again from a key that may have been replaced in between.
+  Challenges begun before this migration have none, and their handle is
+  derived as before. -/
+def migration9 : Migration where
+  version := 9
+  description := "root key fingerprint; invitation user handles"
+  statements := [
+    "CREATE TABLE root_key (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       fingerprint BLOB NOT NULL,
+       recorded INTEGER NOT NULL
+     ) STRICT",
+    "ALTER TABLE challenges ADD COLUMN user_handle BLOB"
+  ]
+
 /-- Every migration, in order.  Append only. -/
 def migrations : List Migration :=
   [migration1, migration2, migration3, migration4, migration5, migration6, migration7,
-   migration8]
+   migration8, migration9]
 
 /-- The version a fully migrated database is at. -/
 def schemaVersion : Nat := (migrations.map (·.version)).foldl max 0

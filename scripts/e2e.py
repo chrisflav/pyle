@@ -3,7 +3,9 @@
 
 `scripts/integration.sh` sets up a pyle and starts it; this drives it over real
 HTTP, as a browser with a passkey, as an OpenID Connect client, as a device and
-as a reverse proxy would.  It uses the standard library only, so the
+as a reverse proxy would.  Given `--pyle`, it then runs the administration
+commands against the running server -- `root-key rotate`, `sessions revoke`,
+`user disable` and `enable` -- and checks what each does to it.  It uses the standard library only, so the
 cryptography a browser and an authenticator bring along is written out here: an
 Ed25519 signer (RFC 8032, section 6) for the passkey and an ES256 verifier for
 the ID tokens.  Neither is constant-time, and neither needs to be: the keys are
@@ -21,6 +23,7 @@ import http.client
 import json
 import os
 import struct
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -500,7 +503,8 @@ def run(a):
     # The codes that confirmed the apps used up the current step; the next
     # one, which pyle accepts too, signs in.
     phone = Client("127.0.0.1", a.port, origin, "198.51.100.3")
-    tablet_code = totp(apps["tablet"][1], time.time() + 30)
+    tablet_time = time.time() + 30
+    tablet_code = totp(apps["tablet"][1], tablet_time)
     r = phone.post_json("/signin/codes", {"name": a.user, "totp": tablet_code,
                                           "recovery": codes[0], "return": "/account"})
     check(r.status == 200 and r.json().get("amr") == ["otp", "rec", "mfa"],
@@ -854,9 +858,160 @@ def run(a):
                          origin=False, cookies=False)
     check(r.status == 200, "while the device's tokens, not tied to the session, live on",
           repr(r))
+    device_refresh = r.json().get("refresh_token", "")
     r = browser.get("/end_session?" + q)
     check(r.status in (302, 303) and r.location == f"{bye}?state=x1",
           "without a session, logout goes straight back", repr(r) + " " + r.location)
+
+    # ------------------------------------------------------------ administration
+    if not a.pyle:
+        return
+
+    def pyle(*args):
+        p = subprocess.run([a.pyle, *args], capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def sign_in(client=browser):
+        r = client.post_json("/signin/webauthn/begin", {})
+        if r.status != 200:
+            return r
+        return client.post_json("/signin/webauthn/finish",
+                                {"credential": key.assert_(r.json()), "return": "/account"})
+
+    def forward_cookie():
+        begun = ask("/reports")
+        st = begun.cookie("__Host-pyle-forward-state")
+        back = browser.get(path_of(begun.location)).location
+        return ask(path_of(back), cookies=[f"__Host-pyle-forward-state={st}"]).cookie(
+            "__Host-pyle-forward")
+
+    def verifies(token):
+        try:
+            header, _, signed, sig = jwt_parts(token)
+            keys = rp.get("/jwks").json().get("keys", [])
+            jwk = next((k for k in keys if k.get("kid") == header.get("kid")), None)
+            return jwk is not None and es256_verify(int.from_bytes(unb64u(jwk["x"]), "big"),
+                                                    int.from_bytes(unb64u(jwk["y"]), "big"),
+                                                    signed, sig)
+        except (ValueError, KeyError):
+            return False
+
+    def userinfo(access_token):
+        return rp.get("/userinfo", headers={"Authorization": "Bearer " + access_token},
+                      cookies=False)
+
+    def refresh_device(rt):
+        return device.post_form("/token", {"grant_type": "refresh_token", "refresh_token": rt,
+                                           "client_id": a.public_client},
+                                origin=False, cookies=False)
+
+    section("pyle root-key rotate under the running server")
+    r = sign_in()
+    check(r.status == 200, "the passkey signs in again", repr(r))
+    fwd = forward_cookie()
+    check(bool(fwd), "a forward-auth cookie for the protected host")
+    r = browser.get(authorize_url("s6"))
+    r = token({"grant_type": "authorization_code", "code": query_of(r.location).get("code", ""),
+               "redirect_uri": a.redirect, "code_verifier": verifier})
+    before = r.json()
+    kid = jwt_parts(before.get("id_token", "x.e30.x"))[0].get("kid") \
+        if before.get("id_token") else None
+    check(r.status == 200 and kid, "an ID token and a refresh token before", repr(r))
+    with open(a.root_key, "rb") as f:
+        old_key = f.read()
+    rc, out = pyle("root-key", "rotate")
+    check(rc == 0, "pyle root-key rotate", out)
+    check("take a fresh backup now" in out, "and it asks for a fresh backup", out)
+    with open(a.root_key, "rb") as f:
+        new_key = f.read()
+    check(len(new_key) == 32 and new_key != old_key, "the key file holds a new key")
+    check(oct(os.stat(a.root_key).st_mode & 0o777) == "0o600", "mode 0600",
+          oct(os.stat(a.root_key).st_mode))
+    key_dir, key_name = os.path.split(a.root_key)
+    left = [n for n in os.listdir(key_dir) if n.startswith(key_name + ".new-")]
+    check(not left, "and nothing is left pending", repr(left))
+    r = browser.get("/account")
+    check(r.status == 200, "the session still works, without a restart", repr(r))
+    r = ask("/reports", cookies=[f"__Host-pyle-forward={fwd}"])
+    check(r.status == 302, "the forward-auth cookie from before no longer passes", repr(r))
+    fwd = forward_cookie()
+    r = ask("/reports", cookies=[f"__Host-pyle-forward={fwd}"])
+    check(r.status == 200, "a new one does", repr(r))
+    r = token({"grant_type": "refresh_token", "refresh_token": before.get("refresh_token", "")})
+    after = r.json()
+    check(r.status == 200, "the refresh token from before still rotates", repr(r))
+    check(jwt_parts(after.get("id_token", "x.e30.x"))[0].get("kid") == kid
+          if after.get("id_token") else False, "its ID token has the same kid")
+    check(verifies(after.get("id_token", "")), "and verifies against /jwks")
+    r = userinfo(before.get("access_token", ""))
+    check(r.status == 200, "the access token from before is still good at /userinfo", repr(r))
+    # The rotation deleted the recovery codes; new ones and the app's codes work.
+    late = Client("127.0.0.1", a.port, origin, "198.51.100.4")
+    t = max(time.time(), tablet_time + 30)
+    if t - time.time() > 25:
+        time.sleep(t - time.time() - 25)
+    tablet_now = totp(apps["tablet"][1], t)
+    r = late.post_json("/signin/codes", {"name": a.user, "totp": tablet_now,
+                                         "recovery": codes[3]})
+    check(r.status == 401, "a recovery code from before the rotation no longer signs in", repr(r))
+    r = browser.post_json("/account/recovery-codes", {})
+    fresh = r.json().get("codes", [])
+    check(r.status == 200 and len(fresh) == 10, "new recovery codes are made", repr(r))
+    r = late.post_json("/signin/codes", {"name": a.user, "totp": tablet_now,
+                                         "recovery": fresh[0]})
+    check(r.status == 200, "a code from the app, re-sealed, and a new recovery code sign in",
+          repr(r))
+    rc, out = pyle("root-key", "check")
+    check(rc == 0 and "is the root key of" in out, "pyle root-key check agrees", out)
+
+    section("pyle sessions revoke")
+    rc, out = pyle("sessions", "list", "--user", a.user)
+    check(rc == 0 and out.count(a.user) >= 2, "pyle sessions list --user lists her sessions", out)
+    rc, out = pyle("sessions", "revoke")
+    check(rc == 2, "pyle sessions revoke needs --all or --user", out)
+    rc, out = pyle("sessions", "revoke", "--user", a.user)
+    check(rc == 0 and "sessions" in out, "pyle sessions revoke --user", out)
+    check("deactivate the user there too" in out,
+          "and says it does not reach the services' own sessions", out)
+    r = browser.get("/account")
+    check(r.status in (302, 303), "her session is gone", repr(r))
+    r = late.get("/account")
+    check(r.status in (302, 303), "all of them", repr(r))
+    r = token({"grant_type": "refresh_token", "refresh_token": after.get("refresh_token", "")})
+    check(r.json().get("error") == "invalid_grant", "her session's refresh tokens are revoked",
+          repr(r))
+    r = refresh_device(device_refresh)
+    check(r.json().get("error") == "invalid_grant",
+          "and so are the device's, which were tied to no session", repr(r))
+    r = ask("/reports", cookies=[f"__Host-pyle-forward={fwd}"])
+    check(r.status == 302, "and the protected host's cookie", repr(r))
+    rc, out = pyle("sessions", "list", "--user", a.user)
+    check(rc == 0 and a.user not in out, "pyle sessions list shows none", out)
+
+    section("pyle user disable and enable")
+    r = sign_in()
+    check(r.status == 200, "she signs in again", repr(r))
+    r = browser.get(authorize_url("s7"))
+    r = token({"grant_type": "authorization_code", "code": query_of(r.location).get("code", ""),
+               "redirect_uri": a.redirect, "code_verifier": verifier})
+    granted = r.json()
+    check(r.status == 200, "and gets tokens", repr(r))
+    rc, out = pyle("user", "disable", a.user)
+    check(rc == 0 and "disabled" in out, "pyle user disable", out)
+    r = browser.get("/account")
+    check(r.status in (302, 303), "her session is gone", repr(r))
+    r = sign_in(Client("127.0.0.1", a.port, origin, "198.51.100.5"))
+    check(r.status == 401 and not r.cookie("__Host-pyle"), "the passkey signs nobody in", repr(r))
+    r = userinfo(granted.get("access_token", ""))
+    check(r.status == 401, "her access token is refused at /userinfo", repr(r))
+    r = token({"grant_type": "refresh_token", "refresh_token": granted.get("refresh_token", "")})
+    check(r.json().get("error") == "invalid_grant", "and her refresh token at /token", repr(r))
+    rc, out = pyle("user", "list")
+    check(rc == 0 and "(disabled)" in out, "pyle user list says she is disabled", out)
+    rc, out = pyle("user", "enable", a.user)
+    check(rc == 0, "pyle user enable", out)
+    r = sign_in()
+    check(r.status == 200, "and the passkey signs in again", repr(r))
 
 
 def main():
@@ -874,6 +1029,8 @@ def main():
     p.add_argument("--fa-other", required=True)
     p.add_argument("--fa-secret", required=True)
     p.add_argument("--counts", required=True)
+    p.add_argument("--pyle", help="the pyle binary, for the administration commands")
+    p.add_argument("--root-key", help="the root key file, to see it replaced")
     a = p.parse_args()
     try:
         run(a)

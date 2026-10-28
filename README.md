@@ -62,6 +62,14 @@ pyle user add carol --email carol@example.org --display-name "Carol Smith"
 pyle user set alice --email alice@example.org --display-name "Alice Liddell"
 pyle user set alice --no-email --no-display-name   # clear them again
 pyle user list                      # list the accounts, with addresses and display names
+pyle user disable alice             # no way in any more, and her sessions and tokens end
+pyle user enable alice              # and back
+pyle user remove alice --yes        # delete the account and everything that is its
+pyle sessions list [--user alice]   # the sessions, everyone's or one account's
+pyle sessions revoke --user alice   # end one account's sessions and refresh tokens
+pyle sessions revoke --all          # or everyone's
+pyle root-key rotate                # replace the root key (see "If a backup leaks")
+pyle root-key check                 # check the key file against the database
 pyle invite bob --group staff --ttl 7d   # print a link that creates bob's account
 pyle invite dan --email dan@example.org --display-name "Dan Brown"   # with both
 pyle audit verify                   # check the audit log's hash chain
@@ -94,6 +102,43 @@ b@x.org`); `user add` and `invite` record the address they were given.
 
 Keep a copy of the root key: the secrets sealed under it cannot be read
 without it.
+
+### Ending access, disabling and removing accounts
+
+`pyle sessions revoke --user <name>` ends every session of the account,
+revokes every refresh-token family it holds — those tied to a session and
+those that are not (`offline_access`, the device grant) — and withdraws the
+authorization codes, approved device codes and forward-authentication codes
+not yet redeemed; `--all` does it for every account.  Access tokens already
+issued are biscuits that services verify offline: they live until they
+expire (`accessTokenSeconds`, an hour by default), though `/userinfo` and the
+kleis attestation refuse a disabled or removed account's at once.
+
+`pyle user disable <name>` does the same and marks the account disabled: it
+cannot sign in by any method (passkey, security key, codes, password), its
+refresh tokens and device grants are refused even if one survived, `/userinfo`
+refuses its access tokens, and forward authentication does not pass it.
+`pyle user enable <name>` lets it in again, with what it had.  `pyle user
+remove <name> --yes` deletes the account and everything that is its —
+authenticators, apps, recovery codes, password, sessions, tokens — and every
+pending invitation for its name or its address, and the audit log keeps its
+name and email address.  Each of these is one transaction with its audit
+entry.
+
+> **These end access to pyle, not to the services behind it.**  They end
+> pyle's sessions and the tokens pyle issued; a session a user already has
+> at a relying party — Zulip, a wiki — is that service's, and lives on until
+> the service ends it.  Deactivate the user in each service too.  And `user
+> remove` frees the account's name and email address: an account given
+> either afterwards is, to a service that keys accounts by it, the removed
+> one (see the warning under [Usage](#usage)).  Retire the account in those
+> services before the address is used again.
+
+Access tokens name the account by its subject (its user handle) as well as
+its name, so a token of a removed account does not answer at `/userinfo` for
+a new account given the same name.  A token issued before pyle stated the
+subject is accepted there only if the account existed at the sign-in it
+descends from.
 
 Every reply pyle makes carries its security headers (a strict CSP with
 `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy: no-referrer`, and
@@ -227,6 +272,8 @@ A key is published from the moment it is announced as `next`, signs once it is
 `current`, and stays published as `previous`; `rotate` promotes the waiting
 next key and announces a fresh one.  So the first `rotate` only announces:
 run it, let clients and services fetch the new key, then run it again.
+`pyle root-key rotate` re-seals every signing key under the new root key and
+changes nothing else about them: the same key pairs, `kid`s and states.
 
 ## OpenID Connect
 
@@ -456,7 +503,9 @@ the proxy passes that request to pyle too, and pyle answers it — only for the
 browser holding the matching state cookie — by setting the host's own
 `__Host-pyle-forward` cookie and going back to the original path, which must
 begin with exactly one `/`.  The cookie is tied to the pyle session: signing
-out ends it.
+out ends it.  It is MACed under a key derived from the root key, so `pyle
+root-key rotate` ends every one of them at once; the browser goes round the
+grant again, unnoticed while its pyle session lives.
 
 ## Configuration for the protocols
 
@@ -603,6 +652,14 @@ say what they said before (`name` is still the account name) plus the new
 <name> --email …` before pointing a service that needs them at pyle.  An
 older pyle refuses the migrated database.
 
+Migration 9 adds a table for the fingerprint of the root key (an HKDF output
+of it, never the key) and the user handle with an invitation's challenge.
+The first pyle that opens the migrated database with its key records the
+fingerprint — after checking that the key opens what the database has sealed
+— and from then on every start refuses a key file that does not match.  So
+the first start after the upgrade must be with the right key file, which it
+will be unless the files were mixed up.
+
 ### Docker
 
 `docker/Dockerfile` builds an image with `pyle` alone, published as
@@ -619,7 +676,12 @@ docker run --rm -v pyle-data:/pyle/data -v "$PWD/config:/pyle/config:ro" \
 docker run -d --name pyle -p 127.0.0.1:8420:8420 \
   -v pyle-data:/pyle/data -v "$PWD/config:/pyle/config:ro" ghcr.io/chrisflav/pyle
 docker exec pyle pyle invite alice --group admin
+docker exec pyle pyle root-key rotate    # the running server follows at once
 ```
+
+Run the commands as the image's user, as `docker exec` does by default: a
+root key written by `docker exec -u root` would be root's, and the server
+could not read it.
 
 With Caddy on the host and the port published like this, pyle sees Caddy's
 connections coming from the bridge's gateway, not from `127.0.0.1`: put that
@@ -632,9 +694,11 @@ network with fixed addresses and name Caddy's.
 Two files are the whole state: the database and the root key.  The database
 holds the accounts, credentials, sessions, clients and the audit log; the
 root key encrypts the signing keys and the TOTP secrets inside it, so a
-database without its root key is useless.  Copy the root key once, offline,
-when it is made: it never changes.  Back the database up with SQLite rather
-than by copying the file under a running server, and keep the copy private:
+database without its root key is useless.  Copy the root key, offline, when
+it is made and again after every `pyle root-key rotate`: a database belongs
+to the key it was sealed under, and pyle refuses to start with any other.
+Back the database up with SQLite rather than by copying the file under a
+running server, and keep the copy private:
 
 ```sh
 umask 077
@@ -650,19 +714,52 @@ docker run --rm -v pyle-data:/pyle/data:ro -v /backup:/backup debian:bookworm-sl
 docker start pyle
 ```
 
-To restore, put both back, check them with `pyle audit verify`, and start
-the server.  A restored database brings back sessions and refresh tokens as
-they were.
+To restore, put both back — a database with the key from the same time —
+check them with `pyle root-key check` and `pyle audit verify`, and start the
+server.  A restored database brings back sessions and refresh tokens as they
+were; `pyle sessions revoke --all` ends them if that is not wanted.
 
 **If a backup leaks.**  The database alone gives away hashes (of sessions,
 refresh tokens, client secrets, recovery codes and passwords) and secrets
 sealed under the root key, none of them usable as they are.  The database
 *with* the root key gives away more: whoever has both can make
-forward-authentication cookies for every session still alive and read every
-TOTP secret, and can sign tokens with the keys they held.  `pyle keys rotate`
-replaces the signing keys, twice to retire the old ones, but nothing in pyle
-yet replaces the root key or ends every session at once (DESIGN.md §12): the
-remedy today is a fresh `pyle init` and new invitations.
+forward-authentication cookies for every session still alive, read every
+TOTP secret, search the recovery codes (50 bits each) against their HMACs,
+and sign tokens with the keys they held.  Then:
+
+```sh
+pyle keys rotate                # announce fresh signing keys (a waiting next one leaked too)
+pyle keys rotate                # make them current: the leaked ones only verify now…
+pyle keys rotate                # …and then retire them: what they sign no longer verifies
+pyle root-key rotate            # a new root key; the leaked one opens nothing any more
+pyle sessions revoke --all      # end every session and refresh token
+```
+
+(and end the sessions in the services behind pyle, which these do not reach),
+
+and take a fresh backup.  `root-key rotate` re-seals the signing keys and the
+authenticator apps' secrets under a new random key in one transaction, and
+zeroes the old key file's bytes — as far as the filesystem allows: a
+copy-on-write filesystem, an SSD, a snapshot or a volume backup may keep
+them, and a key file that is not writable (mode 0400) is left as it was, with
+a warning.  So destroy every other copy of the old key yourself, in backups
+too: a backup of the database together with the old key is the very leak
+this is for.  Forward-authentication cookies made with the old
+key stop verifying, so protected hosts send their users round the grant once
+more, and recovery codes are deleted, because their HMACs are keyed by the
+old key (each account page asks for new ones).  It cannot change what the
+leak already gave away: the TOTP secrets themselves are the same, re-sealed,
+so ask everyone to remove their authenticator apps and add them again, and
+access tokens signed before keep verifying until they expire (an hour by
+default).  A running server picks up the new key with its next request; a
+request under way at that moment may fail once and can be retried, and an
+authenticator app being set up has to be begun again.  The steps are one
+transaction and one rename, under a lock on `<rootKeyFile>.lock`, so an
+interruption at any point leaves either the old key or the new one in force:
+the next `pyle` command or start finishes an interrupted rotation from the
+pending file `<rootKeyFile>.new-<fingerprint>`, and refuses a key file that
+belongs to neither (DESIGN.md §6.4).  The key file's directory must be
+writable by pyle's user for the rotation, the lock and the pending file.
 
 ### Verifying access tokens in a service
 
@@ -679,7 +776,7 @@ def roots (keys : List String) : List PublicKey :=  -- each "ed25519/<hex>"
     return { algorithm := .ed25519, key := ← Bytes.ofHex? hex.toString }
 
 match Pyle.Token.verify (roots published) "wiki" now bearer "allow if group(\"staff\");" with
-| .ok who => -- who.user, who.groups, who.amr, who.client, who.authTime, who.scopes
+| .ok who => -- who.subject, who.user, who.groups, who.amr, who.client, who.authTime, who.scopes
 | .error why => -- 401
 ```
 
@@ -689,6 +786,11 @@ language verifies it with any biscuit library, giving the facts
 `time(<now>)` and `audience("<client id>")` and reading `user`, `group` and
 `amr` from the authority block only.  One that would rather not verify
 anything asks `GET /userinfo` with the token.
+
+Identify the user by the `subject` fact (`who.subject`, the account's
+stable handle, the same as the ID token's `sub`), not by `user`: a name is
+given again once `pyle user remove` frees it, and the next account of that
+name is someone else.  Tokens issued before pyle stated `subject` lack it.
 
 ### diff-reviewer, taxis and orchestra
 

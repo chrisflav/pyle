@@ -73,9 +73,10 @@ def Store.addChallengeCapped (s : Store) (ch : Challenge) (client : String)
     (colNat · 0)
   if mine.getD 0 ≥ perClient then return .clientFull
   discard <| exec c
-    "INSERT INTO challenges (challenge, purpose, user_id, expires, client_address, kind) \
-      VALUES (?, ?, ?, ?, ?, ?)"
-    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, client, ch.kind]
+    "INSERT INTO challenges (challenge, purpose, user_id, expires, client_address, kind, \
+      user_handle) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    #[ch.value, ch.purpose.toString, Value.opt ch.user, ch.expires, client, ch.kind,
+      Value.opt ch.userHandle]
   return .added
 
 /-- Whether an unspent recovery code with this digest exists, without

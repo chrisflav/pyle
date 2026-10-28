@@ -15,8 +15,21 @@ weakness in one use says nothing about another:
 | --- | --- |
 | `pyle totp v1` | sealing TOTP secrets, with the user and the app as associated data |
 | `pyle recovery-code v1` | the HMAC under which recovery codes are stored |
-| `pyle invitation-handle v1` | the WebAuthn user handle of an invited account |
+| `pyle invitation-handle v1` | the WebAuthn user handle of an invited account, for a registration begun before migration 9 |
 | `pyle decoy-credential v1` | the padding credential ids of a named sign-in |
+
+Two more keys come from the root key elsewhere: `Keys.sealingKey`, under
+`pyle signing-key v1`, seals the signing keys, and `ForwardAuth.macKey`,
+under `pyle forward-auth v1`, MACs the protected hosts' cookies.  The root
+key's fingerprint (`Store.rootKeyId`) has an `info` of its own too.
+
+When the root key is replaced (`RootKey.rotate`), every TOTP secret is
+re-sealed under the new one, in the transaction that records it.  Recovery
+codes cannot be: only their HMACs are stored, and whoever has the old key and
+a copy of the database can search all 2⁵⁰ codes against them, so a rotation
+deletes them and the account page asks for new ones.  A pending enrolment
+sealed under the old key no longer opens and has to be begun again, and the
+padding ids of a name change.
 
 The associated data of a sealed TOTP secret names its row: `totp `, the
 user's row id and the app's row id, in decimal (`appAd`).  A sealed secret

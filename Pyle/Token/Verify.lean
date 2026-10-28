@@ -13,6 +13,7 @@ and carries two checks of its own:
 
 ```
 user("alice");
+subject("q83vEjRWeJA…");
 amr("hwk"); amr("user");
 acr("phrh");
 account_acr("phrh");
@@ -44,8 +45,13 @@ open LeanBiscuit LeanBiscuit.Token
 
 /-- Who a verified token speaks for, read from its authority block. -/
 structure Identity where
-  /-- The user's name. -/
+  /-- The user's name.  A name can be given to a new account once the old one
+  is removed; `subject` cannot. -/
   user : String
+  /-- The account's OpenID Connect `sub`, the base64url of its user handle,
+  which is never given to another account.  `none` for a token issued before
+  pyle stated it. -/
+  subject : Option String := none
   /-- The authentication methods of the sign-in (RFC 8176). -/
   amr : List String
   /-- The assurance level of the sign-in, as its identifier: `phrh`, `phr` or
@@ -109,7 +115,8 @@ def verify (roots : List PublicKey) (service : String) (now : Nat) (token : Stri
   let some authority := biscuit.blocks.head? | throw "the token has no authority block"
   let some user := (stringFacts biscuit.symbols authority "user").head?
     | throw "the token names no user"
-  return { user, amr := stringFacts biscuit.symbols authority "amr",
+  return { user, subject := (stringFacts biscuit.symbols authority "subject").head?,
+           amr := stringFacts biscuit.symbols authority "amr",
            acr := (stringFacts biscuit.symbols authority "acr").head?,
            accountAcr := (stringFacts biscuit.symbols authority "account_acr").head?,
            groups := stringFacts biscuit.symbols authority "group",

@@ -22,9 +22,14 @@ the page then sends the person on to `/signin` to sign in with it, so that
 the session comes from an assertion like every other (`Policy`).
 
 The account's WebAuthn user handle has to be in the creation options, before
-the account exists.  It is derived from the registration challenge under a
-key of its own (`Secrets.invitationHandle`), so nothing needs remembering
-between `begin` and `finish`.
+the account exists.  `begin` draws 32 random bytes for it and records them
+with the registration challenge (`Challenge.userHandle`, migration 9), and
+`finish` creates the account with the handle its challenge carries.  A
+challenge begun before migration 9 carries none; its handle was derived from
+the challenge under a key of its own (`Secrets.invitationHandle`) and is
+derived again.  Recording it means a root-key rotation between `begin` and
+`finish` cannot give the account a handle other than the one its passkey
+holds.
 -/
 
 namespace Pyle
@@ -94,10 +99,10 @@ def beginInvitation : Handler := fun ctx r =>
   limited ctx r .invitationUsed none fun lim attempt => do
     let some (_, inv) ← invitationOf ctx r | return noInvitation
     lim.succeed attempt
-    let ch ← match ← newChallenge ctx r .register none with
+    let handle ← Crypto.randomBytes 32
+    let ch ← match ← newChallenge ctx r .register none (userHandle := some handle) with
       | .ok ch => pure ch
       | .error rep => return rep
-    let handle := Secrets.invitationHandle ctx.rootKey ch
     return .json (creationOptions ctx ch handle inv.userName [] "required" "required")
 
 /-- `POST /invite/<token>/finish`: register the passkey, creating the account
@@ -125,7 +130,7 @@ def finishInvitation : Handler := fun ctx r => do
     | .error why => refuse why
     | .ok c =>
       let now ← ctx.clock
-      let handle := Secrets.invitationHandle ctx.rootKey challenge
+      let handle := ch.userHandle.getD (Secrets.invitationHandle ctx.rootKey challenge)
       match ← ctx.store.redeemInvitation h handle
           (fun u => credentialRow c u name reg.transports now) now with
       | .error why =>

@@ -310,7 +310,7 @@ def totpConfirm : Handler := fun ctx r => withStepUp ctx r fun s j => do
     let n := (← ctx.store.listTotpApps u.id).size
     let name := appName ((strField j "name").filter (!·.trimAscii.isEmpty) <|>
       (if p.name.isEmpty then none else some p.name)) n
-    let some app ← ctx.store.addTotpApp u.id name (some step) now
+    let some app ← ctx.store.addTotpApp u.id name (some step) now (Store.rootKeyId ctx.rootKey)
         (Secrets.sealTotpApp ctx.rootKey u.id · p.secret)
       | Audit.log ctx r .register .refused (userName := some u.name) (factor := some "totp")
           (detail := s!"already {maxTotpApps} authenticator apps")
@@ -368,7 +368,8 @@ def totpRemove : Handler := fun ctx r => withStepUp ctx r fun s j => do
 def recoveryCodes : Handler := fun ctx r => withStepUp ctx r fun s _ => do
   let codes ← Factor.RecoveryCode.generate
   let key := Secrets.recoveryKey ctx.rootKey
-  ctx.store.setRecoveryCodes s.user (codes.map (Factor.RecoveryCode.digest key))
+  ctx.store.setRecoveryCodes s.user (Store.rootKeyId ctx.rootKey)
+    (codes.map (Factor.RecoveryCode.digest key))
   Audit.log ctx r .register .success (userName := ← userName ctx s.user)
     (factor := some "recovery") (detail := "recovery codes replaced")
   return .json (Json.mkObj [("codes", toJson codes)])

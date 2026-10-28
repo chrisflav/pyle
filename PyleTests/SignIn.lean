@@ -240,7 +240,7 @@ secret. -/
 def giveTotpApp (ctx : Ctx) (u : Store.User) (name : String := "Authenticator app") :
     IO (Store.TotpApp × ByteArray) := do
   let secret ← Factor.Totp.generateSecret
-  let some app ← ctx.store.addTotpApp u.id name none (← ctx.clock)
+  let some app ← ctx.store.addTotpApp u.id name none (← ctx.clock) (Store.rootKeyId ctx.rootKey)
       (SignIn.Secrets.sealTotpApp ctx.rootKey u.id · secret)
     | throw (.userError "giveTotpApp: the app was refused")
   return (app, secret)
@@ -364,10 +364,10 @@ def passkeyTests : IO Unit := withCtx fun ctx clock => do
   let cross ← postJson ctx "/signin/webauthn/begin" emptyObj (origin := "https://evil.example")
   checkEq "a cross-origin begin is refused" cross.status.toCode 403
   -- A disabled account.
-  discard <| ctx.store.setUserDisabled alice.id true
+  discard <| ctx.store.setUserDisabled alice.id true 1
   let disabled ← signInVia ctx k
   checkEq "a disabled account cannot sign in" disabled.status.toCode 401
-  discard <| ctx.store.setUserDisabled alice.id false
+  discard <| ctx.store.setUserDisabled alice.id false 1
   let ok ← signInVia ctx k
   checkEq "re-enabled, it can" ok.status.toCode 200
   let summary ← auditSummary ctx
@@ -468,7 +468,7 @@ def codeTests : IO Unit :=
   let secret ← giveTotp ctx dave
   ctx.store.setPassword dave.id (← Factor.Password.hash "correct horse battery") 1
   let codes ← Factor.RecoveryCode.generate
-  ctx.store.setRecoveryCodes dave.id
+  ctx.store.setRecoveryCodes dave.id .empty
     (codes.map (Factor.RecoveryCode.digest (SignIn.Secrets.recoveryKey ctx.rootKey)))
   let signIn (fields : List (String × Json)) (client : String := "198.51.100.7") :=
     postJson ctx "/signin/codes" (Json.mkObj ([("name", Json.str "dave")] ++ fields))
@@ -718,7 +718,7 @@ def totpLockTests : IO Unit := withCtx fun ctx clock => do
   check "wrong recovery codes do not count as TOTP failures"
     ((← ctx.store.totpLock nia.id) == {})
   let codes ← Factor.RecoveryCode.generate
-  ctx.store.setRecoveryCodes nia.id
+  ctx.store.setRecoveryCodes nia.id .empty
     (codes.map (Factor.RecoveryCode.digest (SignIn.Secrets.recoveryKey ctx.rootKey)))
   let bad ← postJson ctx "/signin/codes" (Json.mkObj [("name", "nia"),
     ("recovery", codes.headD ""), ("totp", wrong)])

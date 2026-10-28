@@ -285,6 +285,33 @@ relays both codes can register a passkey of their own.  §12 keeps this open.
 Sessions are listed to their user, with the device and the time last used, and
 can be ended individually.
 
+**Ending access from outside.**  An administrator ends one account's access,
+or everyone's, with `pyle sessions revoke`: in one transaction the sessions
+are deleted, every refresh-token family the account holds is revoked —
+those tied to a session (which ending the session revokes anyway) and those
+that are not, from `offline_access` and the device grant — and the codes not
+yet redeemed are withdrawn: authorization codes, approved device codes (the
+device is then told `access_denied`) and forward-authentication codes.  What
+it cannot reach are access tokens already issued, which services verify
+offline and which live until they expire.  `pyle user disable` does the same
+and marks the account disabled, which every way in checks again for itself —
+sign-in by each method, a session's lookup, the token endpoint for codes,
+refresh tokens and the device grant, `/userinfo` and the kleis attestation —
+so a token that survived, say in a restored backup, is refused all the same.
+`pyle user remove` ends the account's access and then deletes it, the rest
+going with it by `ON DELETE CASCADE`, and so do the pending invitations for
+its name or its address, which would otherwise make an account that services
+keying accounts by either take for the removed one.  Access tokens state the
+account's subject (its user handle, never reused) besides its name, and
+`/userinfo` answers only for the account with that subject; a token from
+before they did is answered only for an account that existed at its
+sign-in.
+
+None of this reaches a relying party's own sessions: pyle cannot end a
+session Zulip keeps of its own, and says so each time.  Deactivating the
+user there is the administrator's part, as is retiring the account in each
+service before its address is given to anyone else.
+
 ## 5. What services receive
 
 ### 5.1 OpenID Connect
@@ -473,6 +500,97 @@ data and clears the flag.  Signing keys rotate: the JWKS publishes the
 current key and the previous one, and a biscuit root key rotation is announced to services
 before it takes effect.
 
+Nothing uses the root key itself: each purpose derives its own key with HKDF
+(`info` in brackets).  What depends on it, all of it:
+
+| | how | when the root key is replaced |
+| --- | --- | --- |
+| signing keys, `keys.sealed`, retired ones too | sealed (`pyle signing-key v1`) | re-sealed: same key pair, `kid` and state |
+| authenticator-app secrets, `totp_apps.secret` | sealed (`pyle totp v1`) | re-sealed for their row; `legacy_ad` cleared |
+| recovery codes, `recovery_codes.digest` | HMAC (`pyle recovery-code v1`) | deleted: they cannot be recomputed |
+| forward-authentication cookies | HMAC (`pyle forward-auth v1`) | stop verifying; the grant issues new ones |
+| a secret being enrolled, held by the browser | sealed (`pyle totp v1`) | no longer opens; the enrolment begins again |
+| an invitation's user handle, for a registration begun before migration 9 | HMAC (`pyle invitation-handle v1`) | recorded with the challenge since migration 9 |
+| the padding credential ids of a named sign-in | HMAC (`pyle decoy-credential v1`) | change |
+| the database's record of the key, `root_key` | HKDF (`pyle root-key fingerprint v1`) | replaced |
+
+### 6.4 Replacing the root key
+
+`pyle root-key rotate` exists for the day the root key may have leaked
+together with a copy of the database.  The database records the fingerprint
+of the key it is sealed under (migration 9; a database from before records
+the key it is first opened with, once that key has been seen to open what
+the database has sealed).  Every process that needs the key gets it through
+one function, `RootKey.resolve`, which accepts the key file only if it
+matches.
+
+The rotation holds an exclusive `flock` on the key file's path with `.lock`
+appended from its first step to its last.  With `new` standing for the
+pending file — the key file's path with `.new-` and the new key's
+fingerprint appended:
+
+1. resolve the current key (finishing an interrupted rotation first);
+2. in one `BEGIN IMMEDIATE` transaction, with `synchronous = FULL` so that
+   the commit is on disk when it returns: check that the recorded fingerprint
+   is the current key's; remove pending files left by rotations that never
+   committed; write a fresh random key to `new` with `O_EXCL` and mode 0600
+   and `fsync` it and its directory; re-seal every signing key and every app
+   secret, opening each result under the new key before writing it, so that
+   one that would not open aborts the whole transaction; delete the recovery
+   codes; record the new fingerprint and the audit entry;
+3. rename `new` over the key file, `fsync` the directory, and zero the old
+   key's bytes through a descriptor opened before the rename (only if that
+   file still held them).  The zeroing is best effort: a copy-on-write
+   filesystem, an SSD or a snapshot may keep the old blocks, and a key file
+   that is not writable is left alone with a warning.  Other copies of the old
+   key are the operator's to destroy.
+
+**Crash safety.**  The invariant is that one of the files holds the key the
+database records, durably, at every moment:
+
+- until the commit, the database records the old key and the key file holds
+  it; a `new` left behind is ignored, and the next rotation removes it;
+- from the commit until the rename, the database records the new key, which
+  the pending file named by its fingerprint holds — its directory entry was
+  synced before the commit — and `resolve`, at the next start or command or
+  request, renames it over the key file as step 3 would have;
+- after the rename, the key file holds the new key.
+
+So no interruption loses the key, and no restart runs with a key the
+database is not sealed under: a key file that matches neither, with no
+pending file that does — the backup of one paired with the key of another —
+is refused with an error that says so.
+
+**Concurrency.**  Without the lock, a second rotation could finish the
+first one's rename, write a pending file of its own, have the first one's
+delayed rename install *that* key, and die before committing it: the
+database would record one key and the file hold another.  With the lock,
+rotations run one at a time, and a rename happens only under the lock,
+after checking that the database records the pending key and that the key
+file does not hold it already; and a pending file, being named by its key's
+fingerprint, can only install that key.  `resolve` takes the lock only to
+finish a rename; commands wait for it, the server does not — while a
+rotation holds it, the server reads the pending key and uses it without
+renaming anything, and the rotation installs it.  A process that dies
+holding the lock releases it.
+
+**A running server.**  The server keeps the key in memory, with its
+fingerprint.  Before each request it reads the recorded fingerprint (one
+indexed read) and, when it has changed, calls `resolve` again, which may
+finish the rotation itself.  A request that took the old key just before
+the commit may still try to seal with it; so every write that seals or keys
+something under the root key — a signing key, an app's secret, recovery-code
+digests — checks the recorded fingerprint inside its own transaction and
+fails when it is not its key's.  SQLite's write lock orders that check
+against the rotation's transaction: the write either commits first and is
+re-sealed by the rotation, or comes after and fails.
+
+What a rotation cannot do is undo a leak: the TOTP secrets and the signing
+keys are the same as before, only sealed anew.  The remedy for a leaked
+backup is therefore the rotation together with rotating the signing keys
+until the leaked ones are retired, ending every session and refresh-token
+family (`pyle sessions revoke --all`), and new authenticator apps.
+
 ## 7. Abuse resistance
 
 - **Enumeration.**  Discoverable passkeys mean sign-in starts without a
@@ -505,10 +623,11 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 | `totp_lock` | user, failed codes, locked until |
 | `recovery_codes` | user, HMAC, spent-at |
 | `sessions` | id hash, user, amr, auth_time, created, last seen, client hints |
-| `challenges` | challenge, purpose, user, expiry, for a registration the kind asked for — deleted on first use |
+| `challenges` | challenge, purpose, user, expiry, for a registration the kind asked for and for an invitation's the user handle given — deleted on first use |
 | `clients` | OIDC clients: id, secret hash, redirect URIs, allowed scopes, minimum level |
 | `codes`, `refresh_tokens` | hashes only, with the binding fields of §5.1 |
 | `keys` | encrypted signing keys, state (next/current/previous) |
+| `root_key` | one row: the fingerprint of the root key the database is sealed under, never the key (§6.4) |
 | `audit` | §7 |
 
 Session ids, codes and refresh tokens are stored as SHA-256 hashes, so reading
@@ -522,6 +641,8 @@ its last accepted step kept, and its failures and lock moved to the account.
 Migration 7 records with a registration challenge the kind of authenticator
 it was asked for.  Migration 8 adds the optional email address and display
 name to `users` and `invitations`, with a unique index on `lower(email)`.
+Migration 9 adds `root_key`, empty until the first process that holds the
+key records it (§6.4), and the user handle of an invitation's challenge.
 
 ## 9. Properties worth verifying
 
@@ -717,6 +838,8 @@ Pyle/
   Http/        routes, cookies, CSRF, rate limiting
   Proofs/      Decisions, SingleUse, Cose: the theorems of §9 that need no private access
   Audit.lean
+  RootKey.lean reading the root key, and replacing it (§6.4)
+  Admin.lean   ending access, disabling and removing accounts (§4)
 web/           sign-in and account pages (no framework needed; a few hundred lines)
 ```
 
@@ -788,11 +911,12 @@ deployment.
   parties to send, and otherwise states the session's own level, which tells a
   service more.  If REFEDS relying parties that use `acr_values` turn up, the
   voluntary request may have to be answered the same way.
-- **Replacing the root key, and ending every session.**  The root key never
-  changes, and there is no way to end every session at once.  So the
-  database together with the root key — a leaked backup, a stolen disk — is
-  beyond repair from within pyle: with both, an attacker can make
-  forward-authentication cookies for every live session and read every TOTP
-  secret, and `keys rotate` changes neither.  Wanted: re-sealing the secret
-  columns under a new root key, a new forward-auth MAC key with it, and a
-  command that ends every session and refresh-token family.
+- **What a leaked root key leaves behind.**  Replacing the root key (§6.4)
+  and ending every session (§4) were open here and are done.  Still open:
+  the TOTP secrets a leak gave away stay valid until each user replaces their
+  apps, which pyle can only ask for; recovery codes are deleted by a rotation
+  rather than carried over, since they cannot be re-keyed — the cost is that
+  every account has to make new ones; and the padding credential ids of a
+  named sign-in change with the key, so someone who asked for a name's
+  allow-list before and after a rotation can tell its real credentials from
+  the padding.

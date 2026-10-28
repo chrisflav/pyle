@@ -74,6 +74,13 @@ inductive Event where
   | deviceDecision
   /-- An invitation redeemed. -/
   | invitationUsed
+  /-- An account removed, with everything that was its. -/
+  | userRemoved
+  /-- Sessions and refresh-token families ended by an administrator, an
+  account's or everyone's. -/
+  | sessionsRevoked
+  /-- The root key replaced and everything sealed under it re-sealed. -/
+  | rootKeyRotated
   deriving BEq, Repr, Inhabited
 
 /-- The name stored for an event. -/
@@ -92,6 +99,9 @@ def Event.toString : Event → String
   | .refreshReuse => "refresh-reuse"
   | .deviceDecision => "device-decision"
   | .invitationUsed => "invitation-used"
+  | .userRemoved => "user-removed"
+  | .sessionsRevoked => "sessions-revoked"
+  | .rootKeyRotated => "root-key-rotated"
 
 instance : ToString Event := ⟨Event.toString⟩
 
@@ -226,9 +236,11 @@ def sanitise (r : Record) : Record :=
     clientAddress := clean 64 r.clientAddress
     detail := clean maxDetailLength r.detail }
 
-/-- Append a record at time `now`, after `sanitise`.  Reading the last hash and inserting the
-next entry are one transaction, so concurrent appends cannot fork the chain. -/
-def append (s : Store) (now : Nat) (r : Record) : IO Entry := s.atomically fun c => do
+/-- Append a record at time `now`, after `sanitise`, on a connection that is
+already inside a transaction — for an administrative change that is to be
+recorded in the transaction that makes it.  `append` is this in a
+transaction of its own. -/
+def appendIn (c : SQLite) (now : Nat) (r : Record) : IO Entry := do
   let r := sanitise r
   let last ← queryOne c "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1" #[]
     fun st => return (← colNat st 0, ← colBlob st 1)
@@ -245,6 +257,10 @@ def append (s : Store) (now : Nat) (r : Record) : IO Entry := s.atomically fun c
     #[e.seq, e.time, e.event, Value.opt e.userName, Value.opt e.factor, e.clientAddress,
       e.outcome, e.detail, e.prev, e.hash]
   return e
+
+/-- Append a record at time `now`, after `sanitise`.  Reading the last hash and inserting the
+next entry are one transaction, so concurrent appends cannot fork the chain. -/
+def append (s : Store) (now : Nat) (r : Record) : IO Entry := s.atomically (appendIn · now r)
 
 /-- Append a record about a request, at the context's time, from the
 request's client address. -/

@@ -15,6 +15,7 @@ import PyleTests.ForwardAuth
 import PyleTests.EndToEnd
 import PyleTests.Assurance
 import PyleTests.QrCode
+import PyleTests.Hardening
 
 /-!
 # The test driver
@@ -44,4 +45,5 @@ def main : IO UInt32 := do
   endToEndTests
   assuranceTests
   qrCodeTests
+  hardeningTests
   report

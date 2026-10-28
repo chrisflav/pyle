@@ -107,7 +107,7 @@ def lifecycleTests : IO Unit := withCtx fun ctx clock => do
   checkEq "one is left" (← Session.list ctx alice.id).size 1
   checkEq "ending all" (← Session.terminateAll ctx alice.id) 1
   check "bob's is untouched" ((← Session.current ctx (withCookie bid)).isSome)
-  discard <| ctx.store.setUserDisabled bob.id true
+  discard <| ctx.store.setUserDisabled bob.id true 1
   check "a disabled account has no session" ((← Session.current ctx (withCookie bid)).isNone)
 
 /-- Signing in replaces the request's session. -/

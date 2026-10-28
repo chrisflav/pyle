@@ -27,7 +27,10 @@ from the root key with HKDF-SHA256 and the info `"pyle signing-key v1"`, with
 its `kid` as associated data, so a sealed key moved to another row no longer
 opens.  The `kid` is the key's RFC 7638 thumbprint, a function of its public
 half, and opening a key checks that the public key it yields is the one the row
-records.
+records.  A new key is stored only while the root key it was sealed under is
+still the database's (`Store.requireRootKeyIn`); replacing the root key
+re-seals every key, retired ones too, keeping its `kid` and its key pair
+(`RootKey.rotate`).
 
 **First use.**  An algorithm with no current key gets one the first time it is
 needed (`current`), recorded only if no other process recorded one first.
@@ -111,7 +114,7 @@ def ensure (store : Store) (rootKey : ByteArray) (use : Use) (now : Nat) : IO Un
   let keys ← published store use
   unless keys.any (·.state == .current) do
     let k ← SigningKey.generate use.algorithm
-    discard <| store.addFirstKey (← toStored rootKey k .current now)
+    discard <| store.addFirstKey (← toStored rootKey k .current now) (rootKeyId rootKey)
 
 /-- The current key of a use and its `kid`, generating the first one if there
 is none yet. -/
@@ -141,7 +144,7 @@ def rotate (store : Store) (rootKey : ByteArray) (use : Use) (now : Nat) : IO Ro
     | none => pure none
   let k ← SigningKey.generate use.algorithm
   let sk ← toStored rootKey k .next now
-  store.addKey sk
+  store.addKey sk (rootKeyId rootKey)
   return { promoted, announced := sk.kid }
 
 end Keys

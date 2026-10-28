@@ -47,6 +47,10 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
 * `pyle invite <name> [--group <group>]… [--ttl <7d>] [--email <e>]
   [--display-name <n>]` prints a link that creates the account `<name>` with
   its first way in, and with that address and display name.
+* Group names (`--group`, for `user add` and `invite`) are 1 to 64 letters,
+  digits, `-`, `_` and `.`, starting with a letter or digit
+  (`Config.validGroupName`); members of `adminGroup` (`admin`) may use the
+  administration pages under `/admin`.
 * `pyle audit verify` checks the audit log's hash chain.
 * `pyle client add <id> --redirect <uri>… [--public] [--scope <s>]… [--name <n>]
   [--rs256] [--post-logout <uri>]… [--min-acr <level>]` registers an OpenID
@@ -472,6 +476,12 @@ def main (args : List String) : IO UInt32 := do
       (!takesClear && (noEmail || noDisplayName)) then
     IO.eprintln "pyle: --email and --display-name are for user add, user set and invite; \
       --no-email and --no-display-name for user set only"
+    return 2
+  -- Groups reach Remote-Groups, datalog and tokens: only names of the plain
+  -- alphabet are given out.
+  if let some g := groups.find? (!Config.validGroupName ·) then
+    IO.eprintln s!"pyle: '{g}' is not a group name (letters, digits, '-', '_' and '.', at \
+      most 64, starting with a letter or digit)"
     return 2
   try
     match args with

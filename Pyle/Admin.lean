@@ -73,5 +73,30 @@ def removeUser (store : Store) (u : User) (now : Nat) : IO (Option Revocation) :
           {r.invitations} pending invitations for the name or address deleted" }
     return some r
 
+/-! ## Administrators
+
+Who may use the administration pages: an enabled account in the configured
+`adminGroup`.  The pages refuse to leave a deployment without one — the last
+enabled administrator cannot be disabled, removed or taken out of the group,
+by someone else or by themselves — so that the pages never lock everyone out
+of themselves.  The command line is not held to this: it is how a deployment
+that has lost its administrators gets one back. -/
+
+/-- Whether an account is an administrator: enabled, and in `group`. -/
+def isAdministrator (group : String) (u : User) : Bool :=
+  !u.disabled && u.groups.contains group
+
+/-- The enabled accounts in `group`, on a connection (inside the transaction
+that is about to change one of them). -/
+def administratorsIn (c : SQLite) (group : String) : IO (List User) := do
+  let users ← query c s!"SELECT {userColumns} FROM users WHERE disabled = 0" #[] readUser
+  return users.toList.filter (isAdministrator group)
+
+/-- Whether an administrator other than `u` would be left: true when `u` is
+not one now, and otherwise when another enabled account is in `group`. -/
+def leavesAnotherAdministrator (c : SQLite) (group : String) (u : UserId) : IO Bool := do
+  let admins ← administratorsIn c group
+  return !admins.any (·.id == u) || admins.any (·.id != u)
+
 end Admin
 end Pyle

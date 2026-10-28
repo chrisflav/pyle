@@ -6,6 +6,7 @@ import Pyle.Audit
 import Pyle.Sys
 import Pyle.Oidc.Routes
 import Pyle.RootKey
+import Pyle.Admin.Routes
 
 /-!
 # The server
@@ -31,6 +32,9 @@ The endpoints so far:
 * `SignIn.routes` — the sign-in, account and invitation pages and their
   endpoints (`Pyle.SignIn.Routes`).
 * the protocols of DESIGN.md §5, listed in `Pyle.Oidc.Routes`.
+* `Admin.routes` — the administration pages under `/admin` and their
+  endpoints (`Pyle.Admin.Routes`).  Every path under `/admin` is a `404` for
+  anyone but an administrator (`Admin.hiddenFrom`), whatever it names.
 -/
 
 namespace Pyle
@@ -65,7 +69,7 @@ def logout : Http.Handler := fun ctx r => do
 def routes : List Route := [
   .mk' .get "/healthz" healthz,
   .mk' .post "/logout" logout
-] ++ SignIn.routes ++ Oidc.routes
+] ++ SignIn.routes ++ Oidc.routes ++ Admin.routes
 
 /-- How often a server whose key is not yet the key file's tries to install
 it, in seconds. -/
@@ -127,6 +131,9 @@ def route (ctx : Ctx) (r : Req) : IO Reply := do
       IO.eprintln s!"pyle: the root key: {e}"
       return withSecurityHeaders (hsts := ctx.config.issuer.startsWith "https://") <|
         Reply.error .serviceUnavailable "unavailable" "the server cannot read its root key"
+  -- Under /admin, someone who is not an administrator gets what a path that
+  -- names nothing gets, before a route could answer 405 or refuse the Origin.
+  if ← Admin.hiddenFrom ctx r then return ← dispatch [] ctx r
   dispatch routes ctx r
 
 /-! ## Start-up -/

@@ -47,6 +47,19 @@ def Store.setClientSettings (s : Store) (id : String) (cs : ClientSettings) : IO
       WHERE id = ?"
     #[cs.idTokenAlg, encodeList cs.postLogoutRedirectUris, cs.minAcr.identifier, id]) > 0
 
+/-- Change what can change about a client without registering it again — its
+name, redirect URIs, scopes, post-logout addresses and minimum level — in one
+statement.  Its id, secret, ID-token algorithm and the grants it holds stay as
+they are.  The values are stored as given: `Oidc.updateClient` checks them.
+Whether the client exists. -/
+def Store.updateClient (s : Store) (id name : String)
+    (redirectUris scopes postLogout : List String) (minAcr : Acr) : IO Bool :=
+  s.run fun c => return (← exec c
+    "UPDATE clients SET name = ?, redirect_uris = ?, scopes = ?, post_logout_redirect_uris = ?, \
+      min_acr = ? WHERE id = ?"
+    #[name, encodeList redirectUris, encodeList scopes, encodeList postLogout, minAcr.identifier,
+      id]) > 0
+
 /-! ## Keys by algorithm -/
 
 /-- Read a key row selected as `keyColumns` lists. -/

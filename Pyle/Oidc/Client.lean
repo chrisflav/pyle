@@ -60,6 +60,17 @@ def validRedirectUri (uri : String) : Bool :=
 (`--scope email`), as `offline_access` and `kleis` are. -/
 def defaultScopes : List String := ["openid", "profile", "groups"]
 
+/-- Check what a client is registered or changed with: at least one redirect
+URI, each of them and each post-logout address acceptable
+(`validRedirectUri`), and scopes that include `openid`.  Throws the reason. -/
+def checkClientUris (redirectUris postLogout scopes : List String) : IO Unit := do
+  if redirectUris.isEmpty then throw (.userError "a client needs at least one redirect URI")
+  for u in redirectUris ++ postLogout do
+    unless validRedirectUri u do
+      throw (.userError s!"'{u}' is not an acceptable redirect URI (absolute, no fragment, \
+        http only for the loopback)")
+  unless scopes.contains "openid" do throw (.userError "a client's scopes include openid")
+
 /-- Register a client, or replace the one with the same identifier.  Returns
 the new secret for a confidential client — to be shown once, as it is stored
 only as a hash — and `none` for a public one. -/
@@ -67,21 +78,27 @@ def registerClient (store : Store) (id name : String) (redirectUris scopes : Lis
     (isPublic : Bool) (settings : ClientSettings) (now : Nat) : IO (Option String) := do
   unless validClientId id do
     throw (.userError s!"'{id}' is not a valid client id (letters, digits, '-', '_', '.')")
-  if redirectUris.isEmpty then throw (.userError "a client needs at least one redirect URI")
-  for u in redirectUris ++ settings.postLogoutRedirectUris do
-    unless validRedirectUri u do
-      throw (.userError s!"'{u}' is not an acceptable redirect URI (absolute, no fragment, \
-        http only for the loopback)")
+  let scopes := if scopes.isEmpty then defaultScopes else scopes
+  checkClientUris redirectUris settings.postLogoutRedirectUris scopes
   unless settings.idTokenAlg == "ES256" || settings.idTokenAlg == "RS256" do
     throw (.userError "ID tokens are signed with ES256 or RS256")
-  let scopes := if scopes.isEmpty then defaultScopes else scopes
-  unless scopes.contains "openid" do throw (.userError "a client's scopes include openid")
   let secret ← if isPublic then pure none else some <$> randomToken
   let client : Client :=
     { id, name, secretHash := secret.map tokenHash, redirectUris, scopes, created := now }
   store.putClient client
   discard <| store.setClientSettings id settings
   return secret
+
+/-- Change a registered client's name, redirect URIs, scopes, post-logout
+addresses and minimum level, checked as `registerClient` checks them (no
+scopes means the defaults).  Its id, secret and ID-token algorithm stay, and
+so do the grants it holds: a scope taken away still reaches refresh-token
+families granted before.  Whether the client exists. -/
+def updateClient (store : Store) (id name : String)
+    (redirectUris scopes postLogout : List String) (minAcr : Acr) : IO Bool := do
+  let scopes := if scopes.isEmpty then defaultScopes else scopes
+  checkClientUris redirectUris postLogout scopes
+  store.updateClient id name redirectUris scopes postLogout minAcr
 
 /-- How a request authenticated its client. -/
 inductive ClientAuth where

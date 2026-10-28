@@ -297,6 +297,47 @@ def invitationTests : IO Unit := withCtx fun ctx clock => do
   checkEq "an expired invitation is 404" (← getPage ctx path2).status.toCode 404
   checkEq "and cannot begin" (← postJson ctx (path2 ++ "/begin") emptyObj).status.toCode 404
 
+/-- An invitation with an email address and a display name: `pyle invite
+--email --display-name` refuses a bad or taken address, and the account the
+link creates has both, which its account page shows and does not offer to
+change. -/
+def inviteWithEmailTests : IO Unit := withCtx fun ctx clock => do
+  group "web: invitations with an email address"
+  let now ← clock.get
+  let invite (name : String) (email displayName : Option String) :=
+    SignIn.createInvitation ctx.store ctx.config.issuer name [] 3600 now (email := email)
+      (displayName := displayName)
+  discard <| ctx.store.addUser "taken" [] 1 (email := some "Taken@example.org")
+  check "a bad address is refused" (← throws (invite "pat" (some "pat at example.org") none))
+  check "so is one another account has, in any case"
+    (← throws (invite "pat" (some "taken@EXAMPLE.org") none))
+  check "and a bad display name" (← throws (invite "pat" none (some "\x1b[31m")))
+  check "none of which leaves an invitation" ((← ctx.store.run fun c =>
+    Store.query c "SELECT 1 FROM invitations" #[] (Store.colInt · 0)).isEmpty)
+  let url ← invite "pat" (some " Pat@Example.org ") (some "Pat <O'Hara>")
+  let path := (url.drop ctx.config.issuer.length).toString
+  let k ← SoftKey.new
+  let b ← postJson ctx (path ++ "/begin") emptyObj
+  let r ← postJson ctx (path ++ "/finish") (Json.mkObj [("credential", ← k.create (replyJson b))])
+  checkEq "the passkey registers" r.status.toCode 201
+  let some u ← ctx.store.findUserByName "pat" | check "the account exists" false
+  checkEq "with the invitation's address, trimmed, and display name"
+    (u.email, u.displayName) (some "Pat@Example.org", some "Pat <O'Hara>")
+  let some cookie := sessionCookieOf (← signInVia ctx k) | check "pat signs in" false
+  let page := (← getPage ctx "/account" cookie).bodyText
+  check "the account page shows the address"
+    (containsStr page "<span id=\"email\">Pat@Example.org</span>")
+  check "and the display name, escaped"
+    (containsStr page "<span id=\"display-name\">Pat &lt;O&#39;Hara&gt;</span>")
+  check "as set by the administrator" (containsStr page "set by your administrator")
+  check "with nothing to change them" (!containsStr page "<input id=\"email\"" &&
+    !containsStr page "name=\"email\"")
+  let some taken ← ctx.store.findUserByName "taken" | check "the other account" false
+  let (cookie2, _) ← sessionFor ctx taken
+  let page2 := (← getPage ctx "/account" cookie2).bodyText
+  check "an account without a display name shows its name and says so"
+    (containsStr page2 "<span id=\"display-name\">taken <span class=\"meta\">(no display name set)")
+
 /-- What the account page says about how well an account is protected. -/
 def safetyTests : IO Unit := do
   group "web: account safety"
@@ -322,6 +363,7 @@ def webTests : IO Unit := do
   assetTests
   pageEscapeTests
   invitationTests
+  inviteWithEmailTests
   safetyTests
 
 end PyleTests

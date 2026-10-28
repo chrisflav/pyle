@@ -55,7 +55,9 @@ def validRedirectUri (uri : String) : Bool :=
       (uriHost uri).any fun h => h == "localhost" || h == "127.0.0.1" || h == "[::1]") &&
     (scheme != "https" || (uriHost uri).any (!·.isEmpty))
 
-/-- The scopes a client gets when it is registered without naming any. -/
+/-- The scopes a client gets when it is registered without naming any.  Not
+`email`: a client that is to learn addresses is registered with it named
+(`--scope email`), as `offline_access` and `kleis` are. -/
 def defaultScopes : List String := ["openid", "profile", "groups"]
 
 /-- Register a client, or replace the one with the same identifier.  Returns

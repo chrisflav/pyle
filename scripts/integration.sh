@@ -160,6 +160,42 @@ USERS="$("$PYLE" user list 2>&1)"
 # Her passkey, and the one of her two authenticator apps the run left.
 grep -q "^alice	groups: admin	authenticators: 2" <<< "$USERS"
 check $? "pyle user list shows alice, her passkey and her authenticator app" "$USERS"
+grep -q "^alice	.*	email: -	display name: -" <<< "$USERS"
+check $? "and no email address or display name yet" "$USERS"
+OUT="$("$PYLE" user set alice --email Alice@Example.org --display-name "Alice Example" 2>&1)"
+check $? "pyle user set alice --email --display-name" "$OUT"
+USERS="$("$PYLE" user list 2>&1)"
+grep -q "^alice	.*	email: Alice@Example.org	display name: Alice Example$" <<< "$USERS"
+check $? "pyle user list shows them" "$USERS"
+OUT="$("$PYLE" user add bob --email alice@example.ORG 2>&1)"
+[ $? -ne 0 ] && grep -q "already used by the account 'alice'" <<< "$OUT"
+check $? "another account cannot have her address in another case" "$OUT"
+OUT="$("$PYLE" user set alice --email a@b.org --no-email 2>&1)"
+[ $? -eq 2 ]; check $? "--email and --no-email together are refused" "$OUT"
+OUT="$("$PYLE" user set alice --email not-an-address 2>&1)"
+[ $? -ne 0 ] && grep -q "not an acceptable email address" <<< "$OUT"
+check $? "so is an address without an @" "$OUT"
+OUT="$("$PYLE" user set alice --no-display-name 2>&1)"
+check $? "pyle user set alice --no-display-name" "$OUT"
+grep -q "^alice	.*	email: Alice@Example.org	display name: -$" <<< "$("$PYLE" user list 2>&1)"
+check $? "clears only the display name"
+OUT="$("$PYLE" user set alice --email "alice@exÄmple.org" 2>&1)"
+[ $? -ne 0 ] && grep -q "email addresses must be ASCII" <<< "$OUT"
+check $? "a non-ASCII address is refused" "$OUT"
+OUT="$("$PYLE" user set alice --email alice@new.example.org --display-name $'Al‮ice' 2>&1)"
+[ $? -ne 0 ] && grep -q "^alice	.*	email: Alice@Example.org	display name: -$" \
+  <<< "$("$PYLE" user list 2>&1)"
+check $? "a bad display name beside a good address changes neither" "$OUT"
+for ARGS in "user add bob --no-email" "invite bob --no-display-name" \
+    "user list --email a@b.org" "client list --display-name x"; do
+  OUT="$("$PYLE" $ARGS 2>&1)"
+  [ $? -eq 2 ]; check $? "pyle $ARGS is refused" "$OUT"
+done
+"$PYLE" user set alice --email alice@new.example.org > /dev/null 2>&1
+cat "$WORK"/data/pyle.db* | grep -aqF "email: none -> Alice@Example.org" &&
+  cat "$WORK"/data/pyle.db* | grep -aqF "email: Alice@Example.org -> alice@new.example.org" &&
+  cat "$WORK"/data/pyle.db* | grep -aqF 'display name: "Alice Example" -> none'
+check $? "the audit log records the old and the new values"
 kill -0 "$PYLE_PID" 2>/dev/null
 check $? "the server is still running"
 # Only the oversized body above may have failed a connection.

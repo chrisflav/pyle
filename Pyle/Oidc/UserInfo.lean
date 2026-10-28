@@ -6,8 +6,10 @@ import Pyle.Token.Biscuit
 
 `GET` or `POST /userinfo` (OpenID Connect Core §5.3) with an access token in
 the `Authorization: Bearer` header (RFC 6750 §2.1) answers the claims about
-its user: `sub`, and `name` and `groups` when the token's scope includes
-`profile` and `groups` (`scopedClaims`, as in the ID token).  The access
+its user: `sub`, `name` and `preferred_username` when the token's scope
+includes `profile`, `email` and `email_verified` when it includes `email` and
+the account has an address, and `groups` when it includes `groups`
+(`scopedClaims`, as in the ID token).  The access
 token is a biscuit, verified here as any service verifies one
 (`Token.verify`), for the audience `pyle`, which every access token pyle
 issues includes.  The account is read afresh, so a disabled one gets nothing.

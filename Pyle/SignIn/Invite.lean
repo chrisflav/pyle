@@ -50,18 +50,26 @@ def parseDuration (s : String) : Option Nat := do
   return n * scale
 
 /-- Issue an invitation for a new account, valid for `ttl` seconds; the URL to
-hand to the person.  Fails if the name is invalid or already taken.  Only the
-token's hash is stored. -/
+hand to the person.  The account it creates gets `email` and `displayName`,
+if given (`normalizeEmail`, `normalizeDisplayName`).  Fails if the name is
+invalid or already taken, or the address invalid or already another
+account's; an address taken between now and the redemption makes the
+redemption fail.  Only the token's hash is stored. -/
 def createInvitation (store : Store) (issuer name : String) (groups : List String)
-    (ttl now : Nat) (createdBy : String := "cli") : IO String := do
+    (ttl now : Nat) (createdBy : String := "cli") (email displayName : Option String := none) :
+    IO String := do
   unless validUserName name do
     throw (.userError s!"'{name}' is not a valid user name (lower-case letters, digits, \
       '-', '_' and '.', at most 64)")
+  let (email, displayName) ← normalizeContact email displayName
   if (← store.findUserByName name).isSome then
     throw (.userError s!"there is already a user named '{name}'")
+  if let some e := email then
+    if let some owner ← store.run (emailOwner · e) then throw (emailTaken e owner)
   let token ← Crypto.randomBytes invitationTokenBytes.toUSize
   store.addInvitation (.of token)
-    { userName := name, groups, createdBy, created := now, expires := now + ttl }
+    { userName := name, groups, createdBy, created := now, expires := now + ttl, email,
+      displayName }
   return s!"{issuer}/invite/{b64 token}"
 
 /-- The hash of the token a request's path names, if it is one. -/

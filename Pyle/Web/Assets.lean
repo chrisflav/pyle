@@ -516,6 +516,7 @@ a.back { display: inline-block; margin-bottom: 0.75rem; }
 }
 .page-head h1 { margin: 0; }
 .page-head .signed-in { margin: 0; }
+.page-head .account-details { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.9rem; }
 a.nudge-link { font-weight: 600; }
 .lead { color: var(--muted); margin: 0 0 1.5rem; }
 .signed-in { color: var(--muted); }

@@ -302,6 +302,25 @@ pyle is an OpenID Provider for the authorization-code flow, and only that:
 - discovery (`/.well-known/openid-configuration`), JWKS, `userinfo`, and
   RP-initiated logout.
 
+**Claims about the user.**  The ID token and `userinfo` release the same
+claims for the same scope: `profile` gives `name` — the account's display
+name, or its account name if it has none — and `preferred_username`, always
+the account name; `email` gives `email` and `email_verified` for an account
+with an address, and neither for one without; `groups` gives `groups`.
+`email_verified` is always `true`: addresses are set by an administrator
+(`pyle user add`/`user set --email`, or an invitation), never by the user,
+and pyle sends no mail, so "verified" means vouched for by whoever runs pyle.
+Two accounts cannot share an address, compared ignoring case, so a service
+that matches accounts by `email` cannot be handed someone else's; addresses
+are printable ASCII, since pyle folds ASCII case only and services fold
+Unicode case.  Moving an address between accounts does hand one account
+another's identity in such services, so the audit log records every change
+with the old and the new address.  Display names refuse control and format
+characters (bidirectional and zero-width controls), line separators and
+non-ASCII spaces.  `email` is
+not among a client's default scopes; it is granted only to clients registered
+with it.
+
 ID tokens are JWTs, since that is what every OIDC client library expects.  Which
 algorithm they are signed with is an open question (§12).
 
@@ -479,7 +498,8 @@ SQLite, one file, through `leansqlite`, which bundles the amalgamation.  (The
 
 | Table | Contents |
 | --- | --- |
-| `users` | id, handle (random 32 bytes, the WebAuthn user handle), name, groups |
+| `users` | id, handle (random 32 bytes, the WebAuthn user handle), name, groups, email address (optional, unique ignoring case), display name (optional) |
+| `invitations` | token hash, the account's name, groups, email address and display name, expiry |
 | `webauthn_credentials` | credential id, user, COSE public key, sign count, flags (and whether it has verified the user), AAGUID, transports, name, created/last used |
 | `totp_apps` | id (never reused), user, name, encrypted secret, last accepted step, created/last used, whether the secret still has the old associated data |
 | `totp_lock` | user, failed codes, locked until |
@@ -500,7 +520,8 @@ Migration 6 replaced the one-per-user `totp` table with `totp_apps` and
 "Authenticator app", flagged as sealed with the old associated data (§6.3),
 its last accepted step kept, and its failures and lock moved to the account.
 Migration 7 records with a registration challenge the kind of authenticator
-it was asked for.
+it was asked for.  Migration 8 adds the optional email address and display
+name to `users` and `invitations`, with a unique index on `lower(email)`.
 
 ## 9. Properties worth verifying
 

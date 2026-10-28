@@ -5,7 +5,9 @@
 HTTP, as a browser with a passkey, as an OpenID Connect client, as a device and
 as a reverse proxy would.  Given `--pyle`, it then runs the administration
 commands against the running server -- `root-key rotate`, `sessions revoke`,
-`user disable` and `enable` -- and checks what each does to it.  It uses the standard library only, so the
+`user disable` and `enable` -- and checks what each does to it, and then
+works the administration pages under `/admin` as the administrator and as an
+account that is not one.  It uses the standard library only, so the
 cryptography a browser and an authenticator bring along is written out here: an
 Ed25519 signer (RFC 8032, section 6) for the passkey and an ES256 verifier for
 the ID tokens.  Neither is constant-time, and neither needs to be: the keys are
@@ -1012,6 +1014,70 @@ def run(a):
     check(rc == 0, "pyle user enable", out)
     r = sign_in()
     check(r.status == 200, "and the passkey signs in again", repr(r))
+
+    section("the administration pages")
+    # She signed in with her passkey just now: an administrator, at phrh, fresh.
+    r = browser.get("/admin")
+    check(r.status == 200 and f">{a.user}</a>" in r.text, "an administrator sees the accounts",
+          repr(r))
+    check("/admin/assets/admin.js" in r.text, "and the page loads the administration script")
+    r = browser.get("/admin/assets/admin.js")
+    check(r.status == 200 and "adminAct" in r.text, "which is served to her", repr(r))
+    r = browser.get("/account")
+    check('id="admin-link"' in r.text, "her account page links to the pages")
+    nothing = mallory.get("/nothing-here")
+    for path in ("/admin", "/admin/keys", "/admin/assets/admin.js", "/admin/nowhere"):
+        r = mallory.get(path)
+        check(r.status == 404 and r.body == nothing.body,
+              f"without a session, {path} is the 404 of nothing", repr(r))
+    r = mallory.post_json("/admin/users/disable", {"name": a.user})
+    check(r.status == 404 and r.body == nothing.body, "and so is a change", repr(r))
+    r = browser.post_json("/admin/users/disable", {"name": a.user},
+                          headers={"Origin": "http://evil.example"})
+    check(r.status == 403, "her browser's change from another origin is refused", repr(r))
+    r = browser.post_json("/admin/users/disable", {"name": a.user})
+    check(r.status == 409 and r.json().get("error") == "last_administrator",
+          "she cannot disable the last administrator, herself", repr(r))
+    r = browser.post_json("/admin/invitations/create",
+                          {"name": "carol", "groups": ["staff"], "ttl": "1h"})
+    url = r.json().get("url", "")
+    check(r.status == 201 and url.startswith(a.issuer + "/invite/"),
+          "she makes an invitation, and gets its link once", repr(r))
+    token = url.rsplit("/", 1)[-1]
+    r = browser.get("/admin/invitations")
+    check(r.status == 200 and "<td>carol</td>" in r.text and token not in r.text,
+          "the pending list shows it without its token", repr(r))
+    carol = Client("127.0.0.1", a.port, origin, "198.51.100.6")
+    carol_key = Passkey(rp_id, origin)
+    r = carol.post_json(path_of(url) + "/begin", {})
+    r = carol.post_json(path_of(url) + "/finish",
+                        {"credential": carol_key.create(r.json()), "name": "carol's phone"})
+    check(r.status == 201, "the link creates carol's account", repr(r))
+    r = carol.post_json("/signin/webauthn/begin", {})
+    r = carol.post_json("/signin/webauthn/finish",
+                        {"credential": carol_key.assert_(r.json()), "return": "/account"})
+    check(r.status == 200, "carol signs in with her passkey", repr(r))
+    r = carol.get("/admin")
+    check(r.status == 404 and r.body == nothing.body,
+          "and, not an administrator, gets the 404 of nothing", repr(r))
+    r = carol.post_json("/admin/users/disable", {"name": a.user})
+    check(r.status == 404, "for a change too", repr(r))
+    check('id="admin-link"' not in carol.get("/account").text,
+          "her account page does not mention the pages")
+    r = browser.post_json("/admin/users/disable", {"name": "carol"})
+    check(r.status == 200 and r.json().get("sessions") == 1,
+          "alice disables carol, ending her session", repr(r))
+    r = carol.get("/account")
+    check(r.status in (302, 303), "carol's session is gone", repr(r))
+    r = browser.post_json("/admin/users/remove", {"name": "carol", "confirm": "carol"})
+    check(r.status == 200, "and removes her account", repr(r))
+    rc, out = pyle("user", "list")
+    check(rc == 0 and "carol" not in out, "pyle user list agrees", out)
+    r = browser.post_json("/admin/audit/verify", {})
+    check(r.status == 200 and r.json().get("ok") is True, "she checks the audit chain", repr(r))
+    r = browser.get("/admin/audit")
+    check(r.status == 200 and "unbroken chain" in r.text and "user-removed" in r.text,
+          "the audit page shows the removal, and the check", repr(r))
 
 
 def main():

@@ -60,28 +60,70 @@ def validRedirectUri (uri : String) : Bool :=
 (`--scope email`), as `offline_access` and `kleis` are. -/
 def defaultScopes : List String := ["openid", "profile", "groups"]
 
-/-- Register a client, or replace the one with the same identifier.  Returns
-the new secret for a confidential client — to be shown once, as it is stored
-only as a hash — and `none` for a public one. -/
-def registerClient (store : Store) (id name : String) (redirectUris scopes : List String)
-    (isPublic : Bool) (settings : ClientSettings) (now : Nat) : IO (Option String) := do
-  unless validClientId id do
-    throw (.userError s!"'{id}' is not a valid client id (letters, digits, '-', '_', '.')")
+/-- Check what a client is registered or changed with: at least one redirect
+URI, each of them and each post-logout address acceptable
+(`validRedirectUri`), and scopes that include `openid` and are all ones pyle
+knows (`scopesSupported`).  Throws the reason. -/
+def checkClient (redirectUris postLogout scopes : List String) : IO Unit := do
   if redirectUris.isEmpty then throw (.userError "a client needs at least one redirect URI")
-  for u in redirectUris ++ settings.postLogoutRedirectUris do
+  for u in redirectUris ++ postLogout do
     unless validRedirectUri u do
       throw (.userError s!"'{u}' is not an acceptable redirect URI (absolute, no fragment, \
         http only for the loopback)")
+  for s in scopes do
+    unless scopesSupported.contains s do
+      throw (.userError s!"'{s}' is not a scope pyle knows (it knows \
+        {", ".intercalate scopesSupported})")
+  unless scopes.contains "openid" do throw (.userError "a client's scopes include openid")
+
+/-- The client and settings a registration stores, checked
+(`validClientId`, `checkClient`, the ID-token algorithm), with its new
+secret: none for a public client, and otherwise to be shown once, as only
+its hash is stored.  No scopes means `defaultScopes`. -/
+def newClient (id name : String) (redirectUris scopes : List String) (isPublic : Bool)
+    (settings : ClientSettings) (now : Nat) : IO (Client × Option String) := do
+  unless validClientId id do
+    throw (.userError s!"'{id}' is not a valid client id (letters, digits, '-', '_', '.')")
+  let scopes := if scopes.isEmpty then defaultScopes else scopes
+  checkClient redirectUris settings.postLogoutRedirectUris scopes
   unless settings.idTokenAlg == "ES256" || settings.idTokenAlg == "RS256" do
     throw (.userError "ID tokens are signed with ES256 or RS256")
-  let scopes := if scopes.isEmpty then defaultScopes else scopes
-  unless scopes.contains "openid" do throw (.userError "a client's scopes include openid")
   let secret ← if isPublic then pure none else some <$> randomToken
-  let client : Client :=
-    { id, name, secretHash := secret.map tokenHash, redirectUris, scopes, created := now }
+  return ({ id, name, secretHash := secret.map tokenHash, redirectUris, scopes, created := now },
+    secret)
+
+/-- Register a client, or replace the one with the same identifier — what
+`pyle client add` does, so that registering a client again gives it a new
+secret.  Returns the new secret for a confidential client — to be shown
+once, as it is stored only as a hash — and `none` for a public one. -/
+def registerClient (store : Store) (id name : String) (redirectUris scopes : List String)
+    (isPublic : Bool) (settings : ClientSettings) (now : Nat) : IO (Option String) := do
+  let (client, secret) ← newClient id name redirectUris scopes isPublic settings now
   store.putClient client
   discard <| store.setClientSettings id settings
   return secret
+
+/-- Register a client only if its id is not taken, checked as
+`registerClient` checks it, the check and the insertion in one transaction
+(`Store.addClient`): what the administration pages do, which never replace a
+client.  `none` if the id is taken; otherwise the secret, as for
+`registerClient`. -/
+def addClient (store : Store) (id name : String) (redirectUris scopes : List String)
+    (isPublic : Bool) (settings : ClientSettings) (now : Nat) : IO (Option (Option String)) := do
+  let (client, secret) ← newClient id name redirectUris scopes isPublic settings now
+  if ← store.addClient client settings then return some secret
+  return none
+
+/-- Change a registered client's name, redirect URIs, scopes, post-logout
+addresses and minimum level, checked as `registerClient` checks them.  The
+scopes are taken as given: no scopes is refused (they must include
+`openid`), rather than read as the defaults.  Its id, secret and ID-token
+algorithm stay, and so do the grants it holds: a scope taken away still
+reaches refresh-token families granted before.  Whether the client exists. -/
+def updateClient (store : Store) (id name : String)
+    (redirectUris scopes postLogout : List String) (minAcr : Acr) : IO Bool := do
+  checkClient redirectUris postLogout scopes
+  store.updateClient id name redirectUris scopes postLogout minAcr
 
 /-- How a request authenticated its client. -/
 inductive ClientAuth where

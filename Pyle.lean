@@ -6,6 +6,10 @@ import Pyle.Store.Schema
 import Pyle.Store.RootKey
 import Pyle.RootKey
 import Pyle.Admin
+import Pyle.Admin.Endpoints
+import Pyle.Admin.Assets
+import Pyle.Admin.Pages
+import Pyle.Admin.Routes
 import Pyle.Store.Users
 import Pyle.Store.Sessions
 import Pyle.Store.Oidc

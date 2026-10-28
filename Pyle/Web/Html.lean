@@ -39,9 +39,11 @@ def htmlReply (body : String) (status : Std.Http.Status := .ok) : Reply :=
 `data-` attributes (without the prefix), and `content` is the inside of
 `main`, already HTML.  `back`, if given, is a link above the heading: its
 address and its text.  `aside`, if not empty, is HTML set beside the heading,
-on the right. -/
+on the right.  `scripts` are further scripts of this origin, loaded after
+`/assets/pyle.js`, whose functions they may use. -/
 def page (pageName title : String) (attrs : List (String × String)) (content : String)
-    (back : Option (String × String) := none) (aside : String := "") : String :=
+    (back : Option (String × String) := none) (aside : String := "")
+    (scripts : List String := []) : String :=
   let heading := if aside.isEmpty then s!"<h1>{escape title}</h1>\n" else
     s!"<div class=\"page-head\">\n<h1>{escape title}</h1>\n{aside}\n</div>\n"
   let data := attrs.foldl (init := "") fun acc (k, v) => acc ++ s!" data-{k}=\"{escape v}\""
@@ -52,7 +54,9 @@ def page (pageName title : String) (attrs : List (String × String)) (content : 
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" ++
   s!"<title>{escape title} · pyle</title>\n" ++
   "<link rel=\"stylesheet\" href=\"/assets/pyle.css\">\n" ++
-  "<script src=\"/assets/pyle.js\" defer></script>\n</head>\n" ++
+  "<script src=\"/assets/pyle.js\" defer></script>\n" ++
+  String.join (scripts.map fun s => s!"<script src=\"{escape s}\" defer></script>\n") ++
+  "</head>\n" ++
   s!"<body data-page=\"{escape pageName}\"{data}>\n<main>\n{backLink}{heading}" ++
   content ++
   "\n<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n</main>\n</body>\n</html>"

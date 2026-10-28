@@ -81,6 +81,20 @@ inductive Event where
   | sessionsRevoked
   /-- The root key replaced and everything sealed under it re-sealed. -/
   | rootKeyRotated
+  /-- A client registered from the administration pages. -/
+  | clientAdded
+  /-- A client's name, addresses, scopes or minimum level changed. -/
+  | clientChanged
+  /-- A client removed, with its codes and tokens. -/
+  | clientRemoved
+  /-- An invitation issued from the administration pages. -/
+  | invitationIssued
+  /-- An invitation withdrawn before it was used. -/
+  | invitationRevoked
+  /-- Signing keys rotated. -/
+  | keysRotated
+  /-- The audit log's hash chain checked from the administration pages. -/
+  | auditVerified
   deriving BEq, Repr, Inhabited
 
 /-- The name stored for an event. -/
@@ -102,6 +116,13 @@ def Event.toString : Event → String
   | .userRemoved => "user-removed"
   | .sessionsRevoked => "sessions-revoked"
   | .rootKeyRotated => "root-key-rotated"
+  | .clientAdded => "client-added"
+  | .clientChanged => "client-changed"
+  | .clientRemoved => "client-removed"
+  | .invitationIssued => "invitation-issued"
+  | .invitationRevoked => "invitation-revoked"
+  | .keysRotated => "keys-rotated"
+  | .auditVerified => "audit-verified"
 
 instance : ToString Event := ⟨Event.toString⟩
 
@@ -273,6 +294,21 @@ def log (ctx : Http.Ctx) (req : Http.Req) (event : Event) (outcome : Outcome)
 /-- Every entry, in order. -/
 def entries (s : Store) : IO (Array Entry) := s.run fun c =>
   query c s!"SELECT {entryColumns} FROM audit ORDER BY seq" #[] readEntry
+
+/-- The newest entries, newest first: `limit` of them after skipping the
+`offset` newest. -/
+def recent (s : Store) (limit offset : Nat) : IO (Array Entry) := s.run fun c =>
+  query c s!"SELECT {entryColumns} FROM audit ORDER BY seq DESC LIMIT ? OFFSET ?"
+    #[limit, offset] readEntry
+
+/-- The newest entry for an event, if there is one. -/
+def lastOf (s : Store) (event : Event) : IO (Option Entry) := s.run fun c =>
+  queryOne c s!"SELECT {entryColumns} FROM audit WHERE event = ? ORDER BY seq DESC LIMIT 1"
+    #[event.toString] readEntry
+
+/-- How many entries there are. -/
+def count (s : Store) : IO Nat := s.run fun c => do
+  return (← queryOne c "SELECT count(*) FROM audit" #[] (colNat · 0)).getD 0
 
 /-- Verify the whole stored chain. -/
 def verify (s : Store) : IO (Except String Nat) :=

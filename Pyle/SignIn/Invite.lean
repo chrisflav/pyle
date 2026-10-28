@@ -54,15 +54,23 @@ def parseDuration (s : String) : Option Nat := do
   guard (n > 0)
   return n * scale
 
-/-- Issue an invitation for a new account, valid for `ttl` seconds; the URL to
-hand to the person.  The account it creates gets `email` and `displayName`,
-if given (`normalizeEmail`, `normalizeDisplayName`).  Fails if the name is
+/-- The longest an invitation may live: ninety days.  A link is a way into an
+account nobody has yet, and the bound also keeps its expiry a time the
+database can hold. -/
+def maxInvitationSeconds : Nat := 90 * 86400
+
+/-- Issue an invitation for a new account, valid for `ttl` seconds, at most
+`maxInvitationSeconds`; the URL to hand to the person.  The account it
+creates gets `email` and `displayName`, if given (`normalizeEmail`,
+`normalizeDisplayName`).  Fails if the lifetime is too long, the name is
 invalid or already taken, or the address invalid or already another
 account's; an address taken between now and the redemption makes the
 redemption fail.  Only the token's hash is stored. -/
 def createInvitation (store : Store) (issuer name : String) (groups : List String)
     (ttl now : Nat) (createdBy : String := "cli") (email displayName : Option String := none) :
     IO String := do
+  if ttl > maxInvitationSeconds then
+    throw (.userError s!"an invitation lives at most {maxInvitationSeconds / 86400} days")
   unless validUserName name do
     throw (.userError s!"'{name}' is not a valid user name (lower-case letters, digits, \
       '-', '_' and '.', at most 64)")

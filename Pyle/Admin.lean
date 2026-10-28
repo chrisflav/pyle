@@ -73,5 +73,41 @@ def removeUser (store : Store) (u : User) (now : Nat) : IO (Option Revocation) :
           {r.invitations} pending invitations for the name or address deleted" }
     return some r
 
+/-! ## Administrators
+
+Who may use the administration pages: an enabled account in the configured
+`adminGroup`.  The pages refuse to leave a deployment without one who can use
+them — the last enabled administrator able to sign in at `phr` cannot be
+disabled, removed or taken out of the group while the account changed is an
+administrator, by someone else or by themselves — so that the pages never
+lock everyone out of themselves.  The command line is not held to this: it is how a deployment
+that has lost its administrators gets one back. -/
+
+/-- Whether an account is an administrator: enabled, and in `group`. -/
+def isAdministrator (group : String) (u : User) : Bool :=
+  !u.disabled && u.groups.contains group
+
+/-- The enabled accounts in `group`, on a connection (inside the transaction
+that is about to change one of them). -/
+def administratorsIn (c : SQLite) (group : String) : IO (List User) := do
+  let users ← query c s!"SELECT {userColumns} FROM users WHERE disabled = 0" #[] readUser
+  return users.toList.filter (isAdministrator group)
+
+/-- Whether an administrator other than `u` who can use the pages would be
+left: true when `u` is not an administrator now, and otherwise when another
+enabled account in `group` has what it takes to sign in at `phr` (a
+credential that verifies the user, by `Capabilities.level`), since the pages
+need a `phr` session.  An administrator with only an authenticator app and
+recovery codes could not get in, and does not count.  `passwords` is whether
+the deployment allows them, as for every reading of an account's level. -/
+def leavesAnotherAdministrator (c : SQLite) (group : String) (passwords : Bool) (u : UserId) :
+    IO Bool := do
+  let admins ← administratorsIn c group
+  if !admins.any (·.id == u) then return true
+  for a in admins do
+    if a.id != u then
+      if ((← capabilitiesIn c a.id passwords).level).any (·.satisfies .phr) then return true
+  return false
+
 end Admin
 end Pyle

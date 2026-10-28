@@ -21,7 +21,8 @@ One JSON file, read at startup by every command:
   "trustedProxies": ["127.0.0.1"],
   "allowPasswords": false,
   "attestationRoots": [],
-  "aaguidAllowList": []
+  "aaguidAllowList": [],
+  "adminGroup": "admin"
 }
 ```
 
@@ -120,9 +121,24 @@ structure Config where
   doing so, and without the secret anyone who reaches it can ask pyle about
   any session cookie they hold. -/
   forwardAuthSecret : Option String := none
+  -- Administration (the pages under `/admin`).
+  /-- The group whose enabled members may use the administration pages, from
+  a session at `phr` or better.  `admin` unless configured; a group name
+  (`Config.validGroupName`). -/
+  adminGroup : String := "admin"
   deriving Repr, Inhabited
 
 namespace Config
+
+/-- Whether a group name is acceptable: 1 to 64 characters from ASCII letters,
+digits, `-`, `_` and `.`, starting with a letter or digit.  Groups appear in
+`Remote-Groups` (joined with commas), in datalog facts and in tokens, and a
+narrow alphabet keeps every one of those encodings trivial. -/
+def validGroupName (g : String) : Bool :=
+  let cs := g.toList
+  !cs.isEmpty && cs.length ≤ 64 &&
+    cs.all (fun c => c.isAlphanum || c == '-' || c == '_' || c == '.') &&
+    (cs.head?.any Char.isAlphanum)
 
 /-- The keys a configuration file may contain. -/
 def knownKeys : List String :=
@@ -131,7 +147,7 @@ def knownKeys : List String :=
    "allowPasswords", "attestationRoots", "aaguidAllowList",
    "accessTokenSeconds", "idTokenSeconds", "refreshTokenSeconds", "deviceCodeSeconds",
    "devicePollSeconds", "attestationSeconds", "kleisMinAcr", "forwardAuthHosts",
-   "forwardAuthCookieSeconds", "forwardAuthSecret"]
+   "forwardAuthCookieSeconds", "forwardAuthSecret", "adminGroup"]
 
 /-- A required string field. -/
 private def reqStr (j : Json) (k : String) : Except String String :=
@@ -299,6 +315,10 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
       if src.policies.isEmpty then
         throw s!"the forward-auth policy for '{host}' has no allow or deny policy"
     | .error e => throw s!"the forward-auth policy for '{host}' is not datalog: {e}"
+  let adminGroup ← opt j "adminGroup" "admin" asStr "a string"
+  unless validGroupName adminGroup do
+    throw "'adminGroup' must be a group name (letters, digits, '-', '_' and '.', at most 64, \
+      starting with a letter or digit)"
   let resolve (p : String) : System.FilePath :=
     let fp : System.FilePath := p
     if fp.isAbsolute then fp else base / fp
@@ -308,7 +328,7 @@ def ofJson (j : Json) (base : System.FilePath := ".") : Except String Config := 
            allowPasswords, attestationRoots := attestationRoots.map resolve, aaguidAllowList,
            accessTokenSeconds, idTokenSeconds, refreshTokenSeconds, deviceCodeSeconds,
            devicePollSeconds, attestationSeconds, kleisMinAcr, forwardAuthHosts, forwardAuthMinAcr,
-           forwardAuthCookieSeconds, forwardAuthSecret }
+           forwardAuthCookieSeconds, forwardAuthSecret, adminGroup }
 
 /-- Read and check a configuration file. -/
 def load (path : System.FilePath) : IO Config := do

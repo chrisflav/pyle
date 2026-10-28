@@ -477,5 +477,28 @@ def Store.consumeInvitation (s : Store) (tokenHash : SecretHash) (now : Nat) :
     #[tokenHash] readInvitation
   return row.filter (now < ·.expires)
 
+/-- The invitations not yet used and not expired at `now`, newest first, each
+with the hash of its token: what the administration pages list and withdraw
+them by.  The hash names an invitation without being one: only the token
+opens `/invite/<token>`, and the token is never stored. -/
+def Store.listInvitations (s : Store) (now : Nat) : IO (Array (SecretHash × Invitation)) :=
+  s.run fun c => query c
+    s!"SELECT token_hash, {invitationColumns} FROM invitations WHERE expires > ? \
+      ORDER BY created DESC, user_name" #[now]
+    fun st => do
+      let h := SecretHash.ofStored (← colBlob st 0)
+      let i : Invitation :=
+        { userName := ← colText st 1, groups := ← colList st 2, createdBy := ← colText st 3,
+          created := ← colNat st 4, expires := ← colNat st 5,
+          email := ← colOpt colText st 6, displayName := ← colOpt colText st 7 }
+      return (h, i)
+
+/-- Withdraw an invitation by the hash of its token, used or expired or not:
+the invitation as it was, if there was one. -/
+def Store.revokeInvitation (s : Store) (tokenHash : SecretHash) : IO (Option Invitation) :=
+  s.run fun c => queryOne c
+    s!"DELETE FROM invitations WHERE token_hash = ? RETURNING {invitationColumns}"
+    #[tokenHash] readInvitation
+
 end Store
 end Pyle

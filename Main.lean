@@ -46,8 +46,15 @@ reads the configuration file named by `--config`, or `$PYLE_CONFIG`, or
   a rotation that stopped before installing its key.
 * `pyle invite <name> [--group <group>]… [--ttl <7d>] [--email <e>]
   [--display-name <n>]` prints a link that creates the account `<name>` with
-  its first way in, and with that address and display name.
+  its first way in, and with that address and display name.  `--ttl` is at
+  most `90d`.
+* Group names (`--group`, for `user add` and `invite`) are 1 to 64 letters,
+  digits, `-`, `_` and `.`, starting with a letter or digit
+  (`Config.validGroupName`); members of `adminGroup` (`admin`) may use the
+  administration pages under `/admin`.
 * `pyle audit verify` checks the audit log's hash chain.
+* `pyle client add` replaces a client already registered under the id, with a
+  new secret; scopes must be ones pyle knows (`Oidc.scopesSupported`).
 * `pyle client add <id> --redirect <uri>… [--public] [--scope <s>]… [--name <n>]
   [--rs256] [--post-logout <uri>]… [--min-acr <level>]` registers an OpenID
   Connect client and prints its secret, once.  `--min-acr` is the lowest level
@@ -405,6 +412,10 @@ def invite (path : System.FilePath) (name : String) (groups : List String)
       | none =>
         IO.eprintln s!"pyle: '{t}' is not a lifetime (a number followed by d, h, m or s)"
         return 2
+  if seconds > SignIn.maxInvitationSeconds then
+    IO.eprintln s!"pyle: an invitation lives at most {SignIn.maxInvitationSeconds / 86400} days \
+      (--ttl 90d)"
+    return 2
   let config ← Config.load path
   let store ← Store.Store.openAt config.database (← Http.systemClock)
   let now ← Http.systemClock
@@ -472,6 +483,12 @@ def main (args : List String) : IO UInt32 := do
       (!takesClear && (noEmail || noDisplayName)) then
     IO.eprintln "pyle: --email and --display-name are for user add, user set and invite; \
       --no-email and --no-display-name for user set only"
+    return 2
+  -- Groups reach Remote-Groups, datalog and tokens: only names of the plain
+  -- alphabet are given out.
+  if let some g := groups.find? (!Config.validGroupName ·) then
+    IO.eprintln s!"pyle: '{g}' is not a group name (letters, digits, '-', '_' and '.', at \
+      most 64, starting with a letter or digit)"
     return 2
   try
     match args with

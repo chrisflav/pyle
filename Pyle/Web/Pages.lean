@@ -2,6 +2,7 @@ import Pyle.SignIn.Invite
 import Pyle.Account.Endpoints
 import Pyle.Web.Html
 import Pyle.Web.Assets
+import Pyle.Admin
 
 /-!
 # The pages
@@ -350,9 +351,12 @@ def account : Handler := fun ctx r => withAccount ctx r "/account" fun s u => do
   let added := r.queryParams.toOption.bind (lookupOnce · "added")
   let groups := if u.groups.isEmpty then "" else
     s!" <span class=\"meta\">· groups: {escape (", ".intercalate u.groups)}</span>"
+  -- Only administrators are told the administration pages exist.
+  let adminLink := if !Admin.isAdministrator ctx.config.adminGroup u then "" else
+    "\n<p class=\"admin-link\"><a id=\"admin-link\" href=\"/admin\">Administration</a></p>"
   return htmlReply (page "account" "Your account" [] (← accountContent ctx s u added)
     (aside := s!"<div class=\"who\">\n<p class=\"signed-in\">Signed in as \
-      <strong>{escape u.name}</strong>{groups}</p>\n{contactDetails u}\n</div>"))
+      <strong>{escape u.name}</strong>{groups}</p>\n{contactDetails u}{adminLink}\n</div>"))
 
 /-! ## Adding a way to sign in -/
 

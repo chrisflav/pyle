@@ -600,7 +600,37 @@ input.code { width: 10rem; letter-spacing: 0.15em; }
 .buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 1rem; }
 .buttons button { margin: 0; }
 /* White in either scheme: a phone camera reads dark modules on light. */
-img.qr { display: block; width: 100%; max-width: 14rem; height: auto; background: #fff; padding: 0.5rem; border-radius: 0.35rem; }"##
+img.qr { display: block; width: 100%; max-width: 14rem; height: auto; background: #fff; padding: 0.5rem; border-radius: 0.35rem; }
+/* The administration pages: wide tables, tabs, and forms with more fields. */
+body[data-page^="admin"] main { max-width: 72rem; }
+nav.tabs { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; margin: 0 0 1.5rem; }
+nav.tabs a[aria-current="page"] { font-weight: 600; color: var(--fg); text-decoration: none; }
+textarea, select {
+  width: 100%;
+  padding: 0.55rem 0.6rem;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+}
+select { width: auto; min-width: 10rem; }
+label.check { display: flex; gap: 0.5rem; align-items: center; font-weight: 400; }
+label.check input { width: auto; }
+table.list { width: 100%; min-width: 48rem; border-collapse: collapse; font-size: 0.9rem; }
+table.list th, table.list td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+table.list th { white-space: nowrap; }
+button.danger { color: #fff; background: #a3262a; }
+.page-head .admin-link { margin: 0.25rem 0 0; }
+.pager { display: flex; gap: 1rem; align-items: baseline; }
+"##
 
 /-- A reply with an asset. -/
 def asset (body contentType : String) : Reply :=

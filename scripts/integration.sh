@@ -192,10 +192,15 @@ for ARGS in "user add bob --no-email" "invite bob --no-display-name" \
   OUT="$("$PYLE" $ARGS 2>&1)"
   [ $? -eq 2 ]; check $? "pyle $ARGS is refused" "$OUT"
 done
+for G in "a,b" "a b" "-x"; do
+  OUT="$("$PYLE" invite bob --group "$G" 2>&1)"
+  [ $? -eq 2 ] && grep -q "is not a group name" <<< "$OUT"
+  check $? "pyle invite --group '$G' is refused" "$OUT"
+done
 "$PYLE" user set alice --email alice@new.example.org > /dev/null 2>&1
-cat "$WORK"/data/pyle.db* | grep -aqF "email: none -> Alice@Example.org" &&
-  cat "$WORK"/data/pyle.db* | grep -aqF "email: Alice@Example.org -> alice@new.example.org" &&
-  cat "$WORK"/data/pyle.db* | grep -aqF 'display name: "Alice Example" -> none'
+grep -aqF "email: none -> Alice@Example.org" "$WORK"/data/pyle.db* &&
+  grep -aqF "email: Alice@Example.org -> alice@new.example.org" "$WORK"/data/pyle.db* &&
+  grep -aqF 'display name: "Alice Example" -> none' "$WORK"/data/pyle.db*
 check $? "the audit log records the old and the new values"
 
 echo
@@ -247,10 +252,10 @@ check $? "and she is gone"
 OUT="$("$PYLE" user list --yes 2>&1)"
 [ $? -eq 2 ]; check $? "--yes elsewhere is refused" "$OUT"
 for EVENT in root-key-rotated sessions-revoked user-removed; do
-  cat "$WORK"/data/pyle.db* | grep -aqF "$EVENT"
+  grep -aqF "$EVENT" "$WORK"/data/pyle.db*
   check $? "the audit log records $EVENT"
 done
-cat "$WORK"/data/pyle.db* | grep -aqF "email: alice@new.example.org; "
+grep -aqF "email: alice@new.example.org; " "$WORK"/data/pyle.db*
 check $? "the removal is recorded with her address"
 
 kill -0 "$PYLE_PID" 2>/dev/null
